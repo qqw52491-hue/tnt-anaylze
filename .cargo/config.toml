@@ -1,0 +1,4 @@
+[env]
+LIBCLANG_PATH = "/opt/homebrew/opt/llvm/lib"
+DYLD_FALLBACK_LIBRARY_PATH = "/opt/homebrew/opt/opencv/lib:/opt/homebrew/opt/llvm/lib"
+PKG_CONFIG_PATH = "/opt/homebrew/opt/opencv/lib/pkgconfig"

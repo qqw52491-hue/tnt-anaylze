@@ -1,0 +1,8 @@
+/target
+*.py
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.webp
