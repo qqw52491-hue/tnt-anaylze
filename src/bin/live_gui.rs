@@ -227,7 +227,7 @@ fn main() -> opencv::Result<()> {
         locked_px_per_unit: None,
         map_locked: true,
         auto_detect: true,
-        is_fixed_angle: false,
+        is_fixed_angle: true,
     }));
 
     let scale = if t_w > 600 { 1.0 } else { 2.0 };
@@ -393,6 +393,7 @@ fn main() -> opencv::Result<()> {
     highgui::set_window_property(window_name, highgui::WND_PROP_TOPMOST, 1.0)?;
     highgui::wait_key(100)?;
 
+    let mut wind_input_buf = String::new();
     loop {
         let full_img = match imgcodecs::imread(full_path, imgcodecs::IMREAD_COLOR) {
             Ok(m) if !m.empty() => Some(m),
@@ -586,13 +587,18 @@ fn main() -> opencv::Result<()> {
         
         draw_btn(&mut canvas, btn_wind_m1, "-1.0", false)?;
         draw_btn(&mut canvas, btn_wind_m01, "-0.1", false)?;
-        let wind_str = format!("风: {:.1}", st.wind);
-        let _ = imgproc::put_text(&mut canvas, &wind_str, core::Point::new(rect_wind_text.x, rect_wind_text.y + 20), imgproc::FONT_HERSHEY_SIMPLEX, 0.4, core::Scalar::new(0.0, 255.0, 255.0, 0.0), 1, imgproc::LINE_AA, false);
+        
+        let wind_str = if !wind_input_buf.is_empty() {
+            format!("缓冲: {}_", wind_input_buf)
+        } else {
+            format!("风: {:.1}", st.wind)
+        };
+        let _ = imgproc::put_text(&mut canvas, &wind_str, core::Point::new(rect_wind_text.x - 10, rect_wind_text.y + 20), imgproc::FONT_HERSHEY_SIMPLEX, 0.45, core::Scalar::new(0.0, 255.0, 255.0, 0.0), 1, imgproc::LINE_AA, false);
         draw_btn(&mut canvas, btn_wind_p01, "+0.1", false)?;
         draw_btn(&mut canvas, btn_wind_p1, "+1.0", false)?;
 
-        let hint_txt = "提示: 键盘数字或方向键可直接调角度";
-        let _ = imgproc::put_text(&mut canvas, hint_txt, core::Point::new(map_w_display + 20, 370), imgproc::FONT_HERSHEY_SIMPLEX, 0.4, core::Scalar::new(180.0, 180.0, 180.0, 0.0), 1, imgproc::LINE_AA, false);
+        let hint_txt = "提示: 敲数字后 [回车]=风速, [空格]=角度";
+        let _ = imgproc::put_text(&mut canvas, hint_txt, core::Point::new(map_w_display + 5, 385), imgproc::FONT_HERSHEY_SIMPLEX, 0.4, core::Scalar::new(180.0, 255.0, 180.0, 0.0), 1, imgproc::LINE_AA, false);
 
         highgui::imshow(window_name, &canvas)?;
         if first_show {
@@ -603,6 +609,24 @@ fn main() -> opencv::Result<()> {
         let key = highgui::wait_key(100)?;
         if key == 27 || key == 'q' as i32 {
             break;
+        } else if key == 13 || key == 10 { // Enter: Set Wind
+            if !wind_input_buf.is_empty() {
+                if let Ok(w) = wind_input_buf.parse::<f64>() {
+                    let mut st = app_state.lock().unwrap();
+                    st.wind = w;
+                }
+                wind_input_buf.clear();
+            }
+        } else if key == 32 { // Space: Set Angle
+            if !wind_input_buf.is_empty() {
+                if let Ok(a) = wind_input_buf.parse::<f64>() {
+                    let mut st = app_state.lock().unwrap();
+                    st.current_angle = a.clamp(0.0, 180.0);
+                }
+                wind_input_buf.clear();
+            }
+        } else if key == 8 || key == 127 { // Backspace
+            wind_input_buf.pop();
         } else if key == 'm' as i32 || key == 'M' as i32 {
             let mut st = app_state.lock().unwrap();
             st.is_fixed_angle = !st.is_fixed_angle;
@@ -622,20 +646,15 @@ fn main() -> opencv::Result<()> {
             let mut st = app_state.lock().unwrap();
             if let Some(p) = st.manual_p1.as_mut() { p.x += 1; }
             if let Some(e) = st.manual_e1.as_mut() { e.x += 1; }
-        } else if (48..=57).contains(&key) {
-            let digit = key - 48;
-            if let Ok(mut m_state) = app_state.lock() {
-                let next_val = m_state.current_angle * 10.0 + digit as f64;
-                if m_state.current_angle == 45.0 || next_val > 180.0 {
-                    m_state.current_angle = digit as f64;
-                } else {
-                    m_state.current_angle = next_val;
-                }
-            }
         } else if key == 65362 || key == 0x260000 || key == 82 { // Up arrow
             if let Ok(mut m_state) = app_state.lock() { m_state.current_angle = (m_state.current_angle + 1.0).min(180.0); }
         } else if key == 65364 || key == 0x280000 || key == 84 { // Down arrow
             if let Ok(mut m_state) = app_state.lock() { m_state.current_angle = (m_state.current_angle - 1.0).max(0.0); }
+        } else if key > 0 {
+            let ch = (key & 0xFF) as u8 as char;
+            if ch.is_ascii_digit() || ch == '.' || ch == '-' {
+                wind_input_buf.push(ch);
+            }
         }
     }
 
