@@ -274,11 +274,20 @@ fn main() -> opencv::Result<()> {
 
     let crop_path = "/tmp/tnt_selected_area.png";
 
-    // 调起 macOS 原生选区截图工具 (就像微信截图 Cmd+Shift+A 相同体验)
-    let status = Command::new("screencapture")
-        .arg("-i")
-        .arg(crop_path)
-        .status();
+    // 调起原生选区截图工具
+    #[cfg(target_os = "macos")]
+    let status = Command::new("screencapture").arg("-i").arg(crop_path).status();
+
+    #[cfg(target_os = "linux")]
+    let status = Command::new("sh")
+        .arg("-c")
+        .arg("grim -g \"$(slurp)\" /tmp/tnt_selected_area.png")
+        .status()
+        .or_else(|_| Command::new("gnome-screenshot").arg("-a").arg("-f").arg(crop_path).status())
+        .or_else(|_| Command::new("scrot").arg("-s").arg(crop_path).status());
+
+    #[cfg(target_os = "windows")]
+    let status = Ok(std::process::ExitStatus::default());
 
     if status.is_err() || !std::path::Path::new(crop_path).exists() {
         println!("⚠️ 未完成选区或取消了截图，程序退出。");
@@ -314,14 +323,31 @@ fn main() -> opencv::Result<()> {
     loop {
         frame_count += 1;
 
-        // 1. 截取全屏
-        let _ = Command::new("screencapture")
-            .arg("-x")
-            .arg(full_path)
-            .status();
-
-        let full_img = match imgcodecs::imread(full_path, imgcodecs::IMREAD_COLOR) {
-            Ok(m) if !m.empty() => m,
+        // 1. 截取全屏 (改为 xcap 内存直取，无损、无缩放)
+        let full_img = match xcap::Monitor::all() {
+            Ok(monitors) if !monitors.is_empty() => {
+                let monitor = &monitors[0]; // 默认抓取主显示器
+                match monitor.capture_image() {
+                    Ok(image) => {
+                        let width = image.width() as i32;
+                        let height = image.height() as i32;
+                        unsafe {
+                            let mut mat = core::Mat::new_rows_cols(height, width, core::CV_8UC4).unwrap();
+                            let ptr = mat.data_bytes_mut().unwrap().as_mut_ptr();
+                            std::ptr::copy_nonoverlapping(image.as_raw().as_ptr(), ptr, image.as_raw().len());
+                            
+                            // xcap 拿到的是 RGBA，OpenCV 默认是 BGR，需要转换
+                            let mut bgr_mat = core::Mat::default();
+                            let _ = imgproc::cvt_color(&mat, &mut bgr_mat, imgproc::COLOR_RGBA2BGR, 0, core::AlgorithmHint::ALGO_HINT_DEFAULT);
+                            bgr_mat
+                        }
+                    },
+                    _ => {
+                        thread::sleep(Duration::from_millis(300));
+                        continue;
+                    }
+                }
+            },
             _ => {
                 thread::sleep(Duration::from_millis(300));
                 continue;

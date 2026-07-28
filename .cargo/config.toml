@@ -1,4 +1,10 @@
 [env]
-LIBCLANG_PATH = "/opt/homebrew/opt/llvm/lib"
-DYLD_FALLBACK_LIBRARY_PATH = "/opt/homebrew/opt/opencv/lib:/opt/homebrew/opt/llvm/lib"
-PKG_CONFIG_PATH = "/opt/homebrew/opt/opencv/lib/pkgconfig"
+# ========== macOS 配置 ==========
+# 如果你回到 Mac 上编译，请把下面这三行的注释解开，并把 Linux 的注释掉：
+# LIBCLANG_PATH = "/opt/homebrew/opt/llvm/lib"
+# DYLD_FALLBACK_LIBRARY_PATH = "/opt/homebrew/opt/opencv/lib:/opt/homebrew/opt/llvm/lib"
+# PKG_CONFIG_PATH = "/opt/homebrew/opt/opencv/lib/pkgconfig"
+
+# ========== Linux (Arch/CachyOS) 配置 ==========
+# 当前为 Linux 生效的配置：
+LIBCLANG_PATH = "/usr/lib"

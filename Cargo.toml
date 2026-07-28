@@ -7,4 +7,5 @@ default-run = "tnt-comput"
 [dependencies]
 image = "0.25"
 imageproc = "0.25"
-opencv = "0.99.1"
+opencv = { version = "0.99.1", features = ["clang-runtime"] }
+xcap = "0.9.7"

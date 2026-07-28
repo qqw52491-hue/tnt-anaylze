@@ -32,6 +32,7 @@ struct AppState {
     map_locked: bool,
     auto_detect: bool,
     is_fixed_angle: bool,
+    exit_requested: bool,
 }
 
 use tnt_comput::physics::*;
@@ -202,7 +203,17 @@ fn is_inside(x: i32, y: i32, rect: core::Rect) -> bool {
 fn main() -> opencv::Result<()> {
     println!("👉 [步骤 1/2] 请务必【只框选左上角的小地图区域】(你框选什么，GUI就显示什么，请不要截全屏!)...");
     let crop_path = "/tmp/tnt_selected_area.png";
+    #[cfg(target_os = "macos")]
     let _ = Command::new("screencapture").arg("-i").arg(crop_path).status();
+    #[cfg(target_os = "linux")]
+    let _ = Command::new("sh")
+        .arg("-c")
+        .arg("grim -g \"$(slurp)\" /tmp/tnt_selected_area.png")
+        .status()
+        .or_else(|_| Command::new("gnome-screenshot").arg("-a").arg("-f").arg(crop_path).status())
+        .or_else(|_| Command::new("scrot").arg("-s").arg(crop_path).status());
+    #[cfg(target_os = "windows")]
+    let _ = Ok::<_, std::io::Error>(());
 
     let initial_img = match imgcodecs::imread(crop_path, imgcodecs::IMREAD_COLOR) {
         Ok(m) if !m.empty() => m,
@@ -228,6 +239,7 @@ fn main() -> opencv::Result<()> {
         map_locked: true,
         auto_detect: true,
         is_fixed_angle: true,
+        exit_requested: false,
     }));
 
     let scale = if t_w > 600 { 1.0 } else { 2.0 };
@@ -238,6 +250,8 @@ fn main() -> opencv::Result<()> {
     
     let btn_lock_ruler = core::Rect::new(map_w_display + 20, 80, 230, 40);
     let btn_draw_ruler = core::Rect::new(map_w_display + 20, 130, 230, 35);
+    
+    let btn_exit = core::Rect::new(map_w_display + 150, 5, 100, 30);
     
     // New feature buttons
     let btn_auto_detect = core::Rect::new(map_w_display + 20, 175, 110, 30);
@@ -319,6 +333,7 @@ fn main() -> opencv::Result<()> {
             else if is_inside(x, y, btn_wind_m01) { st.wind -= 0.1; }
             else if is_inside(x, y, btn_wind_p01) { st.wind += 0.1; }
             else if is_inside(x, y, btn_wind_p1) { st.wind += 1.0; }
+            else if is_inside(x, y, btn_exit) { st.exit_requested = true; }
             // Map click
             else if x < map_w_display {
                 let pt = core::Point::new(x, y);
@@ -369,17 +384,37 @@ fn main() -> opencv::Result<()> {
         }
     })))?;
 
-    let full_path = "/tmp/tnt_fullscreen.png";
-    let temp_path = "/tmp/tnt_temp.png";
     let is_running = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let r_clone = is_running.clone();
-    let fp = full_path.to_string();
-    let tp = temp_path.to_string();
+    
+    let shared_frame = Arc::new(std::sync::Mutex::new(None::<core::Mat>));
+    let shared_frame_clone = shared_frame.clone();
+
     thread::spawn(move || {
         while r_clone.load(std::sync::atomic::Ordering::Relaxed) {
-            let _ = Command::new("screencapture").arg("-x").arg(&tp).status();
-            let _ = std::fs::rename(&tp, &fp);
-            thread::sleep(Duration::from_millis(100));
+            if let Ok(monitors) = xcap::Monitor::all() {
+                if let Some(monitor) = monitors.first() {
+                    if let Ok(image) = monitor.capture_image() {
+                        let width = image.width() as i32;
+                        let height = image.height() as i32;
+                        unsafe {
+                            if let Ok(mut mat) = core::Mat::new_rows_cols(height, width, core::CV_8UC4) {
+                                if let Ok(data_bytes) = mat.data_bytes_mut() {
+                                    std::ptr::copy_nonoverlapping(image.as_raw().as_ptr(), data_bytes.as_mut_ptr(), image.as_raw().len());
+                                    
+                                    let mut bgr_mat = core::Mat::default();
+                                    if imgproc::cvt_color(&mat, &mut bgr_mat, imgproc::COLOR_RGBA2BGR, 0, core::AlgorithmHint::ALGO_HINT_DEFAULT).is_ok() {
+                                        if let Ok(mut lock) = shared_frame_clone.lock() {
+                                            *lock = Some(bgr_mat);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            thread::sleep(Duration::from_millis(30)); // ~30 fps
         }
     });
 
@@ -395,9 +430,9 @@ fn main() -> opencv::Result<()> {
 
     let mut wind_input_buf = String::new();
     loop {
-        let full_img = match imgcodecs::imread(full_path, imgcodecs::IMREAD_COLOR) {
-            Ok(m) if !m.empty() => Some(m),
-            _ => None,
+        let full_img = {
+            let lock = shared_frame.lock().unwrap();
+            lock.as_ref().and_then(|m| m.try_clone().ok())
         };
 
         let mut max_val = 0.0;
@@ -599,6 +634,9 @@ fn main() -> opencv::Result<()> {
 
         let hint_txt = "提示: 敲数字后 [回车]=风速, [空格]=角度";
         let _ = imgproc::put_text(&mut canvas, hint_txt, core::Point::new(map_w_display + 5, 385), imgproc::FONT_HERSHEY_SIMPLEX, 0.4, core::Scalar::new(180.0, 255.0, 180.0, 0.0), 1, imgproc::LINE_AA, false);
+        
+        imgproc::rectangle(&mut canvas, btn_exit, core::Scalar::new(0.0, 0.0, 220.0, 0.0), -1, imgproc::LINE_8, 0)?;
+        imgproc::put_text(&mut canvas, "X EXIT", core::Point::new(btn_exit.x + 15, btn_exit.y + 20), imgproc::FONT_HERSHEY_SIMPLEX, 0.6, core::Scalar::new(255.0, 255.0, 255.0, 0.0), 2, imgproc::LINE_AA, false)?;
 
         highgui::imshow(window_name, &canvas)?;
         if first_show {
@@ -607,7 +645,9 @@ fn main() -> opencv::Result<()> {
         }
 
         let key = highgui::wait_key(100)?;
-        if key == 27 || key == 'q' as i32 {
+        let is_visible = highgui::get_window_property(window_name, highgui::WND_PROP_VISIBLE).unwrap_or(1.0);
+        let exit_req = app_state.lock().unwrap().exit_requested;
+        if key == 27 || key == 'q' as i32 || is_visible < 1.0 || exit_req {
             break;
         } else if key == 13 || key == 10 { // Enter: Set Wind
             if !wind_input_buf.is_empty() {
@@ -659,6 +699,5 @@ fn main() -> opencv::Result<()> {
     }
 
     is_running.store(false, std::sync::atomic::Ordering::Relaxed);
-    highgui::destroy_all_windows()?;
-    Ok(())
+    std::process::exit(0);
 }
