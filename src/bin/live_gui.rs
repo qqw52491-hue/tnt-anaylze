@@ -194,28 +194,153 @@ fn is_inside(x: i32, y: i32, rect: core::Rect) -> bool {
     x >= rect.x && x <= rect.x + rect.width && y >= rect.y && y <= rect.y + rect.height
 }
 
+fn to_binary_r_channel(img: &core::Mat, thresh: f64) -> opencv::Result<core::Mat> {
+    let mut bgr = core::Vector::<core::Mat>::new();
+    core::split(img, &mut bgr)?;
+    let r = bgr.get(2)?;
+    let mut binary = core::Mat::default();
+    imgproc::threshold(&r, &mut binary, thresh, 255.0, imgproc::THRESH_BINARY)?;
+    Ok(binary)
+}
+
+fn load_digit_templates() -> Vec<Vec<core::Mat>> {
+    let target_size = core::Size::new(8, 12);
+    let mut templates: Vec<Vec<core::Mat>> = vec![vec![]; 10];
+    if let Ok(entries) = std::fs::read_dir("src/templates") {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().unwrap_or_default() != "png" { continue; }
+            let name = path.file_stem().unwrap().to_str().unwrap();
+            if let Some(digit_char) = name.chars().next() {
+                if let Some(digit) = digit_char.to_digit(10) {
+                    if let Ok(tpl) = imgcodecs::imread(path.to_str().unwrap(), imgcodecs::IMREAD_GRAYSCALE) {
+                        if !tpl.empty() {
+                            let mut resized_tpl = core::Mat::default();
+                            let _ = imgproc::resize(&tpl, &mut resized_tpl, target_size, 0.0, 0.0, imgproc::INTER_NEAREST);
+                            let mut binary = core::Mat::default();
+                            let _ = imgproc::threshold(&resized_tpl, &mut binary, 127.0, 255.0, imgproc::THRESH_BINARY);
+                            templates[digit as usize].push(binary);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    templates
+}
+
+fn recognize_digits_from_roi(roi: &core::Mat, templates: &[Vec<core::Mat>]) -> opencv::Result<Option<i32>> {
+    let thresh = 90.0;
+    let target_size = core::Size::new(8, 12);
+    let mask = to_binary_r_channel(roi, thresh)?;
+
+    let mut contours = core::Vector::<core::Vector<core::Point>>::new();
+    imgproc::find_contours(&mask, &mut contours, imgproc::RETR_EXTERNAL,
+        imgproc::CHAIN_APPROX_SIMPLE, core::Point::new(0, 0))?;
+
+    let mut rects = Vec::new();
+    for i in 0..contours.len() {
+        let c = contours.get(i)?;
+        let rect = opencv::geometry::bounding_rect(&c)?;
+        if rect.width >= 2 && rect.height >= 4 {
+            rects.push(rect);
+        }
+    }
+    rects.sort_by_key(|r| r.x);
+
+    let mut final_digits = Vec::new();
+    for rect in rects {
+        let digit_roi = core::Mat::roi(&mask, rect)?;
+        let mut roi_resized = core::Mat::default();
+        imgproc::resize(&digit_roi, &mut roi_resized, target_size, 0.0, 0.0, imgproc::INTER_NEAREST)?;
+        let mut roi_bin = core::Mat::default();
+        imgproc::threshold(&roi_resized, &mut roi_bin, 127.0, 255.0, imgproc::THRESH_BINARY)?;
+
+        let mut best_score = i32::MAX;
+        let mut best_digit = -1i32;
+
+        for i in 0..=9usize {
+            let vars = &templates[i];
+            if vars.is_empty() { continue; }
+            for tpl in vars {
+                let mut diff = core::Mat::default();
+                core::bitwise_xor(&roi_bin, tpl, &mut diff, &core::no_array())?;
+                let score = core::count_non_zero(&diff)?;
+                if score < best_score {
+                    best_score = score;
+                    best_digit = i as i32;
+                }
+            }
+        }
+        if best_digit >= 0 && best_score < 45 {
+            final_digits.push(best_digit.to_string());
+        }
+    }
+
+    if final_digits.is_empty() {
+        Ok(None)
+    } else {
+        let val_str = final_digits.join("");
+        Ok(val_str.parse::<i32>().ok())
+    }
+}
+
+fn get_slurp_geometry() -> Option<(i32, i32, i32, i32)> {
+    let output = Command::new("slurp").output().ok()?;
+    let geo_str = String::from_utf8(output.stdout).ok()?;
+    let parts: Vec<&str> = geo_str.trim().split_whitespace().collect();
+    if parts.len() == 2 {
+        let xy: Vec<i32> = parts[0].split(',').filter_map(|s| s.parse().ok()).collect();
+        let wh: Vec<i32> = parts[1].split('x').filter_map(|s| s.parse().ok()).collect();
+        if xy.len() == 2 && wh.len() == 2 {
+            return Some((xy[0], xy[1], wh[0], wh[1]));
+        }
+    }
+    None
+}
+
 fn main() -> opencv::Result<()> {
-    println!("👉 [步骤 1/2] 请务必【只框选左上角的小地图区域】(你框选什么，GUI就显示什么，请不要截全屏!)...");
-    let crop_path = "/tmp/tnt_selected_area.png";
+    let digit_templates = load_digit_templates();
+
+    println!("👉 [步骤 1/2] 请在屏幕上框选【左上角小地图】区域...");
+    let map_crop_path = "/tmp/tnt_selected_map.png";
     #[cfg(target_os = "macos")]
-    let _ = Command::new("screencapture").arg("-i").arg(crop_path).status();
+    let _ = Command::new("screencapture").arg("-i").arg(map_crop_path).status();
     #[cfg(target_os = "linux")]
     let _ = Command::new("sh")
         .arg("-c")
-        .arg("grim -g \"$(slurp)\" /tmp/tnt_selected_area.png")
+        .arg("grim -g \"$(slurp)\" /tmp/tnt_selected_map.png")
         .status()
-        .or_else(|_| Command::new("gnome-screenshot").arg("-a").arg("-f").arg(crop_path).status())
-        .or_else(|_| Command::new("scrot").arg("-s").arg(crop_path).status());
+        .or_else(|_| Command::new("gnome-screenshot").arg("-a").arg("-f").arg(map_crop_path).status())
+        .or_else(|_| Command::new("scrot").arg("-s").arg(map_crop_path).status());
     #[cfg(target_os = "windows")]
     let _ = Ok::<_, std::io::Error>(());
 
-    let initial_img = match imgcodecs::imread(crop_path, imgcodecs::IMREAD_COLOR) {
+    let initial_img = match imgcodecs::imread(map_crop_path, imgcodecs::IMREAD_COLOR) {
         Ok(m) if !m.empty() => m,
         _ => return Ok(()),
     };
     let t_w = initial_img.cols();
     let t_h = initial_img.rows();
     let template = initial_img.try_clone()?;
+
+    println!("👉 [步骤 2/2] 请在屏幕上框选【右下角/角度/力度/数值】区域...");
+    let power_geo = get_slurp_geometry();
+    let power_crop_path = "/tmp/tnt_selected_power.png";
+    if let Some((x, y, w, h)) = power_geo {
+        let _ = Command::new("sh")
+            .arg("-c")
+            .arg(format!("grim -g \"{},{} {}x{}\" {}", x, y, w, h, power_crop_path))
+            .status();
+    } else {
+        #[cfg(target_os = "linux")]
+        let _ = Command::new("sh")
+            .arg("-c")
+            .arg("grim -g \"$(slurp)\" /tmp/tnt_selected_power.png")
+            .status();
+    }
+
+    let power_template = imgcodecs::imread(power_crop_path, imgcodecs::IMREAD_COLOR).ok().filter(|m| !m.empty());
 
     let window_name = "TNT Assistant HUD";
     highgui::named_window(window_name, highgui::WINDOW_AUTOSIZE)?;
@@ -431,6 +556,7 @@ fn main() -> opencv::Result<()> {
         let mut max_val = 0.0;
         let mut max_loc = core::Point::new(0, 0);
         let mut img = None;
+        let mut power_recognized_val: Option<i32> = None;
 
         if let Some(ref f_img) = full_img {
             if template.cols() <= f_img.cols() && template.rows() <= f_img.rows() {
@@ -449,6 +575,39 @@ fn main() -> opencv::Result<()> {
             if last_valid_loc.x + t_w <= f_img.cols() && last_valid_loc.y + t_h <= f_img.rows() {
                 if let Ok(roi) = core::Mat::roi(f_img, core::Rect::new(last_valid_loc.x, last_valid_loc.y, t_w, t_h)) {
                     img = roi.try_clone().ok();
+                }
+            }
+
+            // 【双区域识别】：同步实时监控右下角/力度/角度/数值 ROI
+            let power_roi_mat = if let Some((px, py, pw, ph)) = power_geo {
+                if px + pw <= f_img.cols() && py + ph <= f_img.rows() {
+                    core::Mat::roi(f_img, core::Rect::new(px, py, pw, ph)).ok().and_then(|r| r.try_clone().ok())
+                } else {
+                    None
+                }
+            } else if let Some(ref p_tpl) = power_template {
+                if p_tpl.cols() <= f_img.cols() && p_tpl.rows() <= f_img.rows() {
+                    let mut p_match_result = core::Mat::default();
+                    if imgproc::match_template(f_img, p_tpl, &mut p_match_result, imgproc::TM_CCOEFF_NORMED, &core::no_array()).is_ok() {
+                        let mut p_max_val = 0.0;
+                        let mut p_max_loc = core::Point::new(0, 0);
+                        let _ = core::min_max_loc(&p_match_result, None, Some(&mut p_max_val), None, Some(&mut p_max_loc), &core::no_array());
+                        if p_max_val > 0.25 {
+                            core::Mat::roi(f_img, core::Rect::new(p_max_loc.x, p_max_loc.y, p_tpl.cols(), p_tpl.rows())).ok().and_then(|r| r.try_clone().ok())
+                        } else { None }
+                    } else { None }
+                } else { None }
+            } else { None };
+
+            if let Some(ref p_mat) = power_roi_mat {
+                if let Ok(Some(val)) = recognize_digits_from_roi(p_mat, &digit_templates) {
+                    power_recognized_val = Some(val);
+                    // 【角度自动同步】：识别到的数值自动更新为当前面板的锁定角度 current_angle！
+                    if val >= 10 && val <= 90 {
+                        if let Ok(mut m_state) = app_state.lock() {
+                            m_state.current_angle = val as f64;
+                        }
+                    }
                 }
             }
         }
@@ -561,6 +720,11 @@ fn main() -> opencv::Result<()> {
                     format!("推荐角度: {:.0}°   力度: {:.1}", final_angle, force)
                 };
                 let _ = imgproc::put_text(&mut canvas, &res_txt, core::Point::new(map_w_display + 15, y_offset + 15), imgproc::FONT_HERSHEY_SIMPLEX, 0.6, core::Scalar::new(0.0, 255.0, 0.0, 0.0), 2, imgproc::LINE_AA, false);
+
+                if let Some(pval) = power_recognized_val {
+                    let power_txt = format!("右下角实时读数: {}", pval);
+                    let _ = imgproc::put_text(&mut canvas, &power_txt, core::Point::new(map_w_display + 15, y_offset + 38), imgproc::FONT_HERSHEY_SIMPLEX, 0.55, core::Scalar::new(0.0, 255.0, 255.0, 0.0), 2, imgproc::LINE_AA, false);
+                }
                 
                 y_offset += 100;
                 
@@ -580,6 +744,14 @@ fn main() -> opencv::Result<()> {
             let warn_text = format!("Waiting for minimap... (score: {:.2})", max_val);
             imgproc::put_text(&mut canvas, &warn_text, core::Point::new(50, 50), imgproc::FONT_HERSHEY_SIMPLEX, 0.8, core::Scalar::new(0.0, 0.0, 255.0, 0.0), 2, imgproc::LINE_AA, false)?;
         }
+
+        let pval_str = if let Some(val) = power_recognized_val {
+            format!("右下角动态读数: {}", val)
+        } else {
+            "右下角动态读数: 监听中...".to_string()
+        };
+        let pval_rect = core::Rect::new(map_w_display + 20, 395, 230, 30);
+        let _ = draw_btn(&mut canvas, pval_rect, &pval_str, power_recognized_val.is_some());
 
         draw_btn(&mut canvas, btn_p1, "我方 (My)", st.edit_mode == EditMode::P1)?;
         draw_btn(&mut canvas, btn_e1, "敌方 (Enemy)", st.edit_mode == EditMode::E1)?;
