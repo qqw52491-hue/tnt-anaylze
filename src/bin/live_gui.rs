@@ -43,13 +43,10 @@ fn compute_fixed_trajectory(dx_units: f64, dy_units: f64, angle_deg: f64, wind: 
     if is_reverse { eff_angle = 180.0 - eff_angle; }
     
     let wind_power = wind * (if is_reverse { -1.0 } else { 1.0 });
-    let mut dist = dx_units.abs();
+    let dist = dx_units.abs();
     
-    // 取消高低差的计算，只使用X距
-    let mut eff_dist = dist;
-    if eff_dist < 0.0 { eff_dist = 0.0; }
-    
-    let final_power = calc_power(eff_angle, eff_dist, wind_power);
+    // 调用全新的底层物理引擎，同时传入高低差 dy_units
+    let final_power = power_for_angle(eff_angle, dist, dy_units, wind_power).unwrap_or(100.0);
     (final_power.clamp(1.0, 100.0), angle_deg)
 }
 
@@ -59,14 +56,11 @@ fn compute_trajectory(dx_units: f64, dy_units: f64, angle_deg: f64, wind: f64) -
     if is_reverse { eff_angle = 180.0 - eff_angle; }
     
     let wind_power = wind * (if is_reverse { -1.0 } else { 1.0 });
-    let mut dist = dx_units.abs();
+    let dist = dx_units.abs();
     
-    // 取消高低差的计算，只使用X距
-    let mut eff_dist = dist;
-    if eff_dist < 0.0 { eff_dist = 0.0; }
-    
-    let base_power = calc_power(eff_angle, eff_dist, 0.0);
-    let mut final_angle = calc_angle(eff_dist, base_power, wind_power, eff_angle);
+    // 使用新的 power_for_angle 和 calc_angle 传递 dy_units
+    let base_power = power_for_angle(eff_angle, dist, dy_units, 0.0).unwrap_or(100.0);
+    let mut final_angle = calc_angle(dist, dy_units, base_power, wind_power, eff_angle);
     
     final_angle = final_angle.clamp(15.0, 89.0);
     
@@ -224,7 +218,6 @@ fn main() -> opencv::Result<()> {
     let template = initial_img.try_clone()?;
 
     let window_name = "TNT Assistant HUD";
-    highgui::start_window_thread()?;
     highgui::named_window(window_name, highgui::WINDOW_AUTOSIZE)?;
 
     let app_state = Arc::new(Mutex::new(AppState {
