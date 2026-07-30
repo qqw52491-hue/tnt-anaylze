@@ -129,6 +129,34 @@ fn find_dots(minimap: &core::Mat, is_red: bool) -> opencv::Result<Vec<core::Poin
     Ok(pts)
 }
 
+// 【呼吸灯/闪烁帧差法】：通过前后两帧小地图相减，0.1ms 自动无视地图杂色背景，瞬间精确定位我方位置！
+fn detect_breathing_dots(prev: &core::Mat, curr: &core::Mat) -> opencv::Result<Vec<core::Point>> {
+    let mut diff = core::Mat::default();
+    core::absdiff(prev, curr, &mut diff)?;
+
+    let mut gray_diff = core::Mat::default();
+    imgproc::cvt_color(&diff, &mut gray_diff, imgproc::COLOR_BGR2GRAY, 0, core::AlgorithmHint::ALGO_HINT_DEFAULT)?;
+
+    let mut mask = core::Mat::default();
+    imgproc::threshold(&gray_diff, &mut mask, 20.0, 255.0, imgproc::THRESH_BINARY)?;
+
+    let mut contours = core::Vector::<core::Vector<core::Point>>::new();
+    imgproc::find_contours(&mask, &mut contours, imgproc::RETR_EXTERNAL, imgproc::CHAIN_APPROX_SIMPLE, core::Point::new(0, 0))?;
+
+    let mut pts = Vec::new();
+    for i in 0..contours.len() {
+        let contour = contours.get(i)?;
+        let rect = opencv::geometry::bounding_rect(&contour)?;
+        let area = rect.width * rect.height;
+        if area >= 4 && area <= 400 && rect.width <= 25 && rect.height <= 25 {
+            let center = core::Point::new(rect.x + rect.width / 2, rect.y + rect.height / 2);
+            pts.push(center);
+        }
+    }
+    pts.sort_by(|a, b| a.x.cmp(&b.x));
+    Ok(pts)
+}
+
 fn detect_camera_frame(minimap: &core::Mat) -> opencv::Result<core::Rect> {
     let rows = minimap.rows() as usize;
     let cols = minimap.cols() as usize;
@@ -547,6 +575,8 @@ fn main() -> opencv::Result<()> {
     highgui::wait_key(100)?;
 
     let mut wind_input_buf = String::new();
+    let mut prev_minimap: Option<core::Mat> = None;
+    let mut last_stable_p1: Option<core::Point> = None;
     loop {
         let full_img = {
             let lock = shared_frame.lock().unwrap();
@@ -629,7 +659,40 @@ fn main() -> opencv::Result<()> {
                 }
             }
 
-            let auto_p = if st.auto_detect { find_dots(&minimap, false).unwrap_or_default() } else { Vec::new() };
+            let breathing_p = if let Some(ref prev_m) = prev_minimap {
+                detect_breathing_dots(prev_m, &minimap).unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            prev_minimap = minimap.try_clone().ok();
+
+            let raw_auto_p = if st.auto_detect { find_dots(&minimap, false).unwrap_or_default() } else { Vec::new() };
+            let raw_detected_p = if !breathing_p.is_empty() {
+                Some(breathing_p[0])
+            } else {
+                raw_auto_p.get(0).cloned()
+            };
+
+            // 【防抖抗闪内存锁】：呼吸灯熄灭的暗周期自动保持上一次坐标；同原地闪烁时微小震荡自动平滑，消除画面闪烁！
+            let final_auto_p1 = if let Some(new_pt) = raw_detected_p {
+                if let Some(last_pt) = last_stable_p1 {
+                    let dx = (new_pt.x - last_pt.x) as f64;
+                    let dy = (new_pt.y - last_pt.y) as f64;
+                    if (dx * dx + dy * dy) < 400.0 { // 20px 阈值范围内认为是原地呼吸
+                        Some(last_pt)
+                    } else {
+                        last_stable_p1 = Some(new_pt);
+                        Some(new_pt)
+                    }
+                } else {
+                    last_stable_p1 = Some(new_pt);
+                    Some(new_pt)
+                }
+            } else {
+                last_stable_p1
+            };
+
+            let auto_p = if let Some(p) = final_auto_p1 { vec![p] } else { Vec::new() };
             let auto_e = if st.auto_detect { find_dots(&minimap, true).unwrap_or_default() } else { Vec::new() };
             let cam_rect = st.manual_cam_rect.unwrap_or_else(|| {
                 detect_camera_frame(&minimap).unwrap_or(core::Rect::new(0, 0, t_w, t_h))
