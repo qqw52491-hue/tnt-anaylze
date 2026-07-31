@@ -9,3 +9,4 @@ image = "0.25"
 imageproc = "0.25"
 opencv = { version = "0.99.1", features = ["clang-runtime"] }
 xcap = "0.9.7"
+burn = { path = "/home/w/burn/crates/burn", features = ["extension"] }

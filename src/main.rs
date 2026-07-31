@@ -201,144 +201,43 @@ fn find_dots_by_color_and_edge(
 }
 
 // ====== 自动检测视野框 ======
-// 算法原理：计算小地图的行列色差梯度，找出显著的直线边缘，并筛选符合真实视野框尺寸 (W: 80~110, H: 55~75) 的最佳矩形框。
-// 这是一种完全无视颜色的检测方案，适应任何地图的视野框。
+// 算法原理：使用 HSV 颜色掩码过滤游戏 UI 素材固定的视野框边框，配合 boundingRect 取最大矩形轮廓。
 fn detect_camera_frame(minimap: &core::Mat) -> opencv::Result<core::Rect> {
-    let rows = minimap.rows() as usize;
-    let cols = minimap.cols() as usize;
-
-    // 使用 CLAHE (限制对比度自适应直方图均衡化) 来让“隐形”的边缘凸显出来
-    let mut gray = core::Mat::default();
+    let mut hsv = core::Mat::default();
     imgproc::cvt_color(
         minimap,
-        &mut gray,
-        imgproc::COLOR_BGR2GRAY,
+        &mut hsv,
+        imgproc::COLOR_BGR2HSV,
         0,
         core::AlgorithmHint::ALGO_HINT_DEFAULT,
     )?;
-    let mut clahe = imgproc::create_clahe(4.0, core::Size::new(8, 8))?;
-    let mut enhanced_gray = core::Mat::default();
-    clahe.apply(&gray, &mut enhanced_gray)?;
 
-    let gray_data = enhanced_gray.data_bytes()?;
+    // 视野框素材 HSV 范围 (黄色/绿色边框)
+    let lower_yellow_green = core::Scalar::new(15.0, 60.0, 60.0, 0.0);
+    let upper_yellow_green = core::Scalar::new(85.0, 255.0, 255.0, 0.0);
 
-    // 1. 计算每一列和每一行的边缘强度 (在增强后的灰度图上进行)
-    let mut col_scores: Vec<f64> = vec![0.0; cols];
-    for x in 0..cols - 1 {
-        let mut total = 0.0;
-        for y in 0..rows {
-            let p1 = gray_data[y * cols + x];
-            let p2 = gray_data[y * cols + x + 1];
-            total += (p1 as f64 - p2 as f64).abs();
-        }
-        col_scores[x] = total;
-    }
+    let mut mask = core::Mat::default();
+    core::in_range(&hsv, &lower_yellow_green, &upper_yellow_green, &mut mask)?;
 
-    let mut row_scores: Vec<f64> = vec![0.0; rows];
-    for y in 0..rows - 1 {
-        let mut total = 0.0;
-        for x in 0..cols {
-            let p1 = gray_data[y * cols + x];
-            let p2 = gray_data[(y + 1) * cols + x];
-            total += (p1 as f64 - p2 as f64).abs();
-        }
-        row_scores[y] = total;
-    }
+    let mut contours = core::Vector::<core::Vector<core::Point>>::new();
+    imgproc::find_contours(
+        &mask,
+        &mut contours,
+        imgproc::RETR_EXTERNAL,
+        imgproc::CHAIN_APPROX_SIMPLE,
+        core::Point::new(0, 0),
+    )?;
 
-    // 2. 找到局部最大值的候选线
-    let mut x_candidates = Vec::new();
-    for x in 5..cols - 5 {
-        if col_scores[x] > col_scores[x - 1]
-            && col_scores[x] > col_scores[x + 1]
-            && col_scores[x] > 1000.0
-        {
-            x_candidates.push((x, col_scores[x]));
-        }
-    }
-    x_candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    let mut best_rect = core::Rect::new(0, 0, 90, 60);
+    let mut max_area = 0;
 
-    let mut y_candidates = Vec::new();
-    for y in 5..rows - 5 {
-        if row_scores[y] > row_scores[y - 1]
-            && row_scores[y] > row_scores[y + 1]
-            && row_scores[y] > 1000.0
-        {
-            y_candidates.push((y, row_scores[y]));
-        }
-    }
-    y_candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-
-    // 3. 在候选线中寻找符合尺寸的最佳组合
-    let mut best_score = 0.0;
-    let mut best_rect = core::Rect::new(0, 0, 0, 0);
-
-    for i in 0..x_candidates.len() {
-        for j in (i + 1)..x_candidates.len() {
-            let mut x1 = x_candidates[i].0;
-            let mut x2 = x_candidates[j].0;
-            if x1 > x2 {
-                std::mem::swap(&mut x1, &mut x2);
-            }
-
-            let w = x2 - x1;
-            if w < 80 || w > 110 {
-                continue;
-            }
-
-            for k in 0..y_candidates.len() {
-                for l in (k + 1)..y_candidates.len() {
-                    let mut y1 = y_candidates[k].0;
-                    let mut y2 = y_candidates[l].0;
-                    if y1 > y2 {
-                        std::mem::swap(&mut y1, &mut y2);
-                    }
-
-                    let h = y2 - y1;
-                    if h < 55 || h > 75 {
-                        continue;
-                    }
-
-                    // 计算矩形四条线段上的平均梯度 (同样在增强灰度图上计算)
-                    let mut top_score = 0.0;
-                    for x in x1..x2 {
-                        let p1 = gray_data[y1 * cols + x];
-                        let p2 = gray_data[(y1 + 1) * cols + x];
-                        top_score += (p1 as f64 - p2 as f64).abs().min(30.0);
-                    }
-                    top_score /= w as f64;
-
-                    let mut bottom_score = 0.0;
-                    for x in x1..x2 {
-                        let p1 = gray_data[y2 * cols + x];
-                        let p2 = gray_data[(y2 + 1) * cols + x];
-                        bottom_score += (p1 as f64 - p2 as f64).abs().min(30.0);
-                    }
-                    bottom_score /= w as f64;
-
-                    let mut left_score = 0.0;
-                    for y in y1..y2 {
-                        let p1 = gray_data[y * cols + x1];
-                        let p2 = gray_data[y * cols + x1 + 1];
-                        left_score += (p1 as f64 - p2 as f64).abs().min(30.0);
-                    }
-                    left_score /= h as f64;
-
-                    let mut right_score = 0.0;
-                    for y in y1..y2 {
-                        let p1 = gray_data[y * cols + x2];
-                        let p2 = gray_data[y * cols + x2 + 1];
-                        right_score += (p1 as f64 - p2 as f64).abs().min(30.0);
-                    }
-                    right_score /= h as f64;
-
-                    let score = top_score + bottom_score + left_score + right_score;
-
-                    if score > best_score {
-                        best_score = score;
-                        best_rect = core::Rect::new(x1 as i32, y1 as i32, w as i32, h as i32);
-                    }
-                }
-            }
+    for i in 0..contours.len() {
+        let contour = contours.get(i)?;
+        let rect = opencv::geometry::bounding_rect(&contour)?;
+        let area = rect.width * rect.height;
+        if rect.width >= 40 && rect.width <= 226 && area > max_area {
+            max_area = area;
+            best_rect = rect;
         }
     }
 
