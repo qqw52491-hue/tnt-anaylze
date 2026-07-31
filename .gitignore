@@ -11,3 +11,4 @@
 # 允许提交字模库里的 PNG 矢量模板
 !src/templates/
 !src/templates/*.png
+test_xcap

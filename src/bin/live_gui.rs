@@ -25,6 +25,7 @@ struct AppState {
     locked_px_per_unit: Option<f64>,
     map_locked: bool,
     auto_detect: bool,
+    auto_angle: bool,
     is_fixed_angle: bool,
     exit_requested: bool,
 }
@@ -286,6 +287,7 @@ fn is_inside(x: i32, y: i32, rect: core::Rect) -> bool {
     x >= rect.x && x <= rect.x + rect.width && y >= rect.y && y <= rect.y + rect.height
 }
 
+#[cfg(target_os = "linux")]
 fn get_slurp_geometry() -> Option<(i32, i32, i32, i32)> {
     let output = Command::new("slurp").output().ok()?;
     let geo_str = String::from_utf8(output.stdout).ok()?;
@@ -300,39 +302,36 @@ fn get_slurp_geometry() -> Option<(i32, i32, i32, i32)> {
     None
 }
 
-fn main() -> opencv::Result<()> {
-    let mut recognizer = tnt_comput::ui::UiRecognizer::new("src/templates").expect("Failed to init recognizer");
+#[cfg(target_os = "macos")]
+fn get_slurp_geometry() -> Option<(i32, i32, i32, i32)> {
+    println!("🍎 正在 Mac 系统运行: 暂未对接 Mac 原生选区，使用默认区域...");
+    Some((0, 0, 800, 600))
+}
 
-    println!("👉 [步骤 1/2] 请在屏幕上框选【左上角小地图】区域...");
-    let map_crop_path = "/tmp/tnt_selected_map.png";
-    #[cfg(target_os = "macos")]
-    let _ = Command::new("screencapture")
-        .arg("-i")
-        .arg(map_crop_path)
-        .status();
-    #[cfg(target_os = "linux")]
+#[cfg(target_os = "linux")]
+fn capture_rect_to_file(geo: (i32, i32, i32, i32), path: &str) {
     let _ = Command::new("sh")
         .arg("-c")
-        .arg("grim -g \"$(slurp)\" /tmp/tnt_selected_map.png")
-        .status()
-        .or_else(|_| {
-            Command::new("gnome-screenshot")
-                .arg("-a")
-                .arg("-f")
-                .arg(map_crop_path)
-                .status()
-        })
-        .or_else(|_| Command::new("scrot").arg("-s").arg(map_crop_path).status());
-    #[cfg(target_os = "windows")]
-    let _ = Ok::<_, std::io::Error>(());
+        .arg(format!("grim -g \"{},{} {}x{}\" -t ppm {}.tmp && mv {}.tmp {}", geo.0, geo.1, geo.2, geo.3, path, path, path))
+        .status();
+}
 
-    let initial_img = match imgcodecs::imread(map_crop_path, imgcodecs::IMREAD_COLOR) {
-        Ok(m) if !m.empty() => m,
-        _ => return Ok(()),
-    };
-    let t_w = initial_img.cols();
-    let t_h = initial_img.rows();
-    let template = initial_img.try_clone()?;
+#[cfg(target_os = "macos")]
+fn capture_rect_to_file(geo: (i32, i32, i32, i32), path: &str) {
+    let _ = Command::new("sh")
+        .arg("-c")
+        .arg(format!("screencapture -R {},{},{},{} -x -t png {}.tmp && mv {}.tmp {}", geo.0, geo.1, geo.2, geo.3, path, path, path))
+        .status();
+}
+
+fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
+    #[cfg(target_os = "macos")]
+    println!("=== 🍎 Mac OS 环境检测成功，已自动切换底层抓图引擎 ===");
+
+    println!("👉 [步骤 1/2] 请在屏幕上框选【左上角小地图】区域...");
+    let map_geo = get_slurp_geometry().unwrap_or((0, 0, 800, 600));
+    let t_w = map_geo.2;
+    let t_h = map_geo.3;
 
     println!("👉 [步骤 2/2] 请在屏幕上框选【右下角/角度/力度/数值】区域...");
     let power_geo = get_slurp_geometry();
@@ -353,9 +352,7 @@ fn main() -> opencv::Result<()> {
             .status();
     }
 
-    let power_template = imgcodecs::imread(power_crop_path, imgcodecs::IMREAD_COLOR)
-        .ok()
-        .filter(|m| !m.empty());
+
 
     let window_name = "TNT Assistant HUD";
     highgui::named_window(window_name, highgui::WINDOW_AUTOSIZE)?;
@@ -371,6 +368,7 @@ fn main() -> opencv::Result<()> {
         locked_px_per_unit: None,
         map_locked: true,
         auto_detect: true,
+        auto_angle: true,
         is_fixed_angle: true,
         exit_requested: false,
     }));
@@ -415,15 +413,17 @@ fn main() -> opencv::Result<()> {
     let rect_wind_text = core::Rect::new(map_w_display + 125, 355, 60, 30);
     let btn_wind_p01 = core::Rect::new(map_w_display + 190, 355, 45, 30);
     let btn_wind_p1 = core::Rect::new(map_w_display + 245, 355, 45, 30);
+    
+    let btn_auto_angle = core::Rect::new(map_w_display + 20, 395, 230, 30);
 
     let state_cb = app_state.clone();
-    let template_clone = template.clone();
+    let map_geo_clone = map_geo.clone();
     highgui::set_mouse_callback(
         window_name,
         Some(Box::new(move |event, x, y, _flags| {
             let mut st = state_cb.lock().unwrap();
+            let t_w = map_geo_clone.2;
             let scale = if t_w > 600 { 1.0 } else { 2.0 };
-            let t_w = template_clone.cols();
             let map_w_display = (t_w as f64 * scale) as i32;
 
             if event == highgui::EVENT_LBUTTONDOWN {
@@ -466,28 +466,42 @@ fn main() -> opencv::Result<()> {
                     st.locked_px_per_unit = None; // Reset lock too
                 } else if is_inside(x, y, btn_a20) {
                     st.current_angle = 20.0;
+                    st.auto_angle = false;
                 } else if is_inside(x, y, btn_a30) {
                     st.current_angle = 30.0;
+                    st.auto_angle = false;
                 } else if is_inside(x, y, btn_a45) {
                     st.current_angle = 45.0;
+                    st.auto_angle = false;
                 } else if is_inside(x, y, btn_a50) {
                     st.current_angle = 50.0;
+                    st.auto_angle = false;
                 } else if is_inside(x, y, btn_a60) {
                     st.current_angle = 60.0;
+                    st.auto_angle = false;
                 } else if is_inside(x, y, btn_a65) {
                     st.current_angle = 65.0;
+                    st.auto_angle = false;
                 } else if is_inside(x, y, btn_a70) {
                     st.current_angle = 70.0;
+                    st.auto_angle = false;
                 } else if is_inside(x, y, btn_a75) {
                     st.current_angle = 75.0;
+                    st.auto_angle = false;
                 } else if is_inside(x, y, btn_ang_m5) {
                     st.current_angle = (st.current_angle - 5.0).max(0.0);
+                    st.auto_angle = false;
                 } else if is_inside(x, y, btn_ang_minus) {
                     st.current_angle = (st.current_angle - 1.0).max(0.0);
+                    st.auto_angle = false;
                 } else if is_inside(x, y, btn_ang_plus) {
                     st.current_angle = (st.current_angle + 1.0).min(180.0);
+                    st.auto_angle = false;
                 } else if is_inside(x, y, btn_ang_p5) {
                     st.current_angle = (st.current_angle + 5.0).min(180.0);
+                    st.auto_angle = false;
+                } else if is_inside(x, y, btn_auto_angle) {
+                    st.auto_angle = true;
                 } else if is_inside(x, y, btn_wind_m1) {
                     st.wind -= 1.0;
                 } else if is_inside(x, y, btn_wind_m01) {
@@ -559,53 +573,87 @@ fn main() -> opencv::Result<()> {
     let is_running = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let r_clone = is_running.clone();
 
-    let shared_frame = Arc::new(std::sync::Mutex::new(None::<core::Mat>));
-    let shared_frame_clone = shared_frame.clone();
+    let cap_time_ms = Arc::new(std::sync::Mutex::new(0u128));
+    let cap_time_ms_clone = cap_time_ms.clone();
+
+    let map_geo_clone = map_geo.clone();
+    let power_geo_clone = power_geo.clone();
+
+    let shared_map = Arc::new(std::sync::Mutex::new(None::<core::Mat>));
+    let shared_map_clone = shared_map.clone();
+    let shared_detected_pt = Arc::new(std::sync::Mutex::new(None::<core::Point>));
+    let shared_detected_pt_clone = shared_detected_pt.clone();
+    let shared_recognized_angle = Arc::new(std::sync::Mutex::new(None::<i32>));
+    let shared_recognized_angle_clone = shared_recognized_angle.clone();
+
+    let app_state_bg = app_state.clone();
 
     thread::spawn(move || {
-        while r_clone.load(std::sync::atomic::Ordering::Relaxed) {
-            if let Ok(monitors) = xcap::Monitor::all() {
-                if let Some(monitor) = monitors.first() {
-                    if let Ok(image) = monitor.capture_image() {
-                        let width = image.width() as i32;
-                        let height = image.height() as i32;
-                        unsafe {
-                            if let Ok(mut mat) =
-                                core::Mat::new_rows_cols(height, width, core::CV_8UC4)
-                            {
-                                if let Ok(data_bytes) = mat.data_bytes_mut() {
-                                    std::ptr::copy_nonoverlapping(
-                                        image.as_raw().as_ptr(),
-                                        data_bytes.as_mut_ptr(),
-                                        image.as_raw().len(),
-                                    );
+        let recognizer = tnt_comput::ui::UiRecognizer::new("src/templates").expect("Failed to init recognizer");
+        let mut prev_minimap: Option<core::Mat> = None;
+        let mut last_recog_time = std::time::Instant::now();
 
-                                    let mut bgr_mat = core::Mat::default();
-                                    if imgproc::cvt_color(
-                                        &mat,
-                                        &mut bgr_mat,
-                                        imgproc::COLOR_RGBA2BGR,
-                                        0,
-                                        core::AlgorithmHint::ALGO_HINT_DEFAULT,
-                                    )
-                                    .is_ok()
-                                    {
-                                        if let Ok(mut lock) = shared_frame_clone.lock() {
-                                            *lock = Some(bgr_mat);
-                                        }
-                                    }
+        #[cfg(target_os = "linux")]
+        let (map_path, power_path) = ("/tmp/tnt_map.ppm", "/tmp/tnt_power.ppm");
+        #[cfg(target_os = "macos")]
+        let (map_path, power_path) = ("/tmp/tnt_map.png", "/tmp/tnt_power.png");
+
+        while r_clone.load(std::sync::atomic::Ordering::Relaxed) {
+            let t0 = std::time::Instant::now();
+            
+            capture_rect_to_file(map_geo_clone, map_path);
+            
+            if let Ok(m) = imgcodecs::imread(map_path, imgcodecs::IMREAD_COLOR) {
+                if !m.empty() {
+                    // Background breathing dots detection
+                    if m.cols() <= 1200 && m.rows() <= 800 {
+                        if let Some(ref prev) = prev_minimap {
+                            if let Ok(pts) = detect_breathing_dots(prev, &m) {
+                                if let Ok(mut lock) = shared_detected_pt_clone.lock() {
+                                    *lock = if !pts.is_empty() { Some(pts[0]) } else { None };
                                 }
                             }
                         }
                     }
+                    prev_minimap = m.try_clone().ok();
+
+                    if let Ok(mut lock) = shared_map_clone.lock() { *lock = Some(m); }
                 }
             }
-            thread::sleep(Duration::from_millis(30)); // ~30 fps
+            
+            if let Some(p_geo) = power_geo_clone {
+                capture_rect_to_file(p_geo, power_path);
+                
+                if let Ok(p_mat) = imgcodecs::imread(power_path, imgcodecs::IMREAD_COLOR) {
+                    if !p_mat.empty() && p_mat.cols() <= 300 && p_mat.rows() <= 200 {
+                        if last_recog_time.elapsed().as_millis() > 100 {
+                            if let Ok(Some(val)) = recognizer.recognize_angle_digit(&p_mat) {
+                                if let Ok(mut lock) = shared_recognized_angle_clone.lock() {
+                                    *lock = Some(val);
+                                }
+                                // Auto-sync angle if enabled
+                                if val >= 10 && val <= 90 {
+                                    if let Ok(mut m_state) = app_state_bg.lock() {
+                                        if m_state.auto_angle {
+                                            m_state.current_angle = val as f64;
+                                        }
+                                    }
+                                }
+                            }
+                            last_recog_time = std::time::Instant::now();
+                        }
+                    }
+                }
+            }
+
+            if let Ok(mut lock) = cap_time_ms_clone.lock() { 
+                *lock = t0.elapsed().as_millis(); 
+            }
+            std::thread::sleep(std::time::Duration::from_millis(40)); // 25 FPS bg capture
         }
     });
 
     let mut first_show = true;
-    let mut last_valid_loc = core::Point::new(0, 0);
 
     // 立即显示初始化画面，防止 Mac 窗口引擎死锁
     let mut init_canvas = core::Mat::new_rows_cols_with_default(
@@ -630,125 +678,25 @@ fn main() -> opencv::Result<()> {
     highgui::wait_key(100)?;
 
     let mut wind_input_buf = String::new();
-    let mut prev_minimap: Option<core::Mat> = None;
     let mut last_stable_p1: Option<core::Point> = None;
+    let mut fps_t0 = std::time::Instant::now();
+
     loop {
-        let full_img = {
-            let lock = shared_frame.lock().unwrap();
+        let loop_t0 = std::time::Instant::now();
+        
+        let img = {
+            let lock = shared_map.lock().unwrap();
             lock.as_ref().and_then(|m| m.try_clone().ok())
         };
 
-        let mut max_val = 0.0;
-        let mut max_loc = core::Point::new(0, 0);
-        let mut img = None;
-        let mut power_recognized_val: Option<i32> = None;
+        let t_io = loop_t0.elapsed().as_millis();
+        let t1 = std::time::Instant::now();
 
-        if let Some(ref f_img) = full_img {
-            if template.cols() <= f_img.cols() && template.rows() <= f_img.rows() {
-                let map_locked = app_state.lock().unwrap().map_locked;
-                if !map_locked || (last_valid_loc.x == 0 && last_valid_loc.y == 0) {
-                    let mut match_result = core::Mat::default();
-                    if imgproc::match_template(
-                        f_img,
-                        &template,
-                        &mut match_result,
-                        imgproc::TM_CCOEFF_NORMED,
-                        &core::no_array(),
-                    )
-                    .is_ok()
-                    {
-                        let _ = core::min_max_loc(
-                            &match_result,
-                            None,
-                            Some(&mut max_val),
-                            None,
-                            Some(&mut max_loc),
-                            &core::no_array(),
-                        );
-                        if max_val > 0.35 {
-                            last_valid_loc = max_loc;
-                        }
-                    }
-                }
-            }
+        let power_recognized_val = *shared_recognized_angle.lock().unwrap();
+        let raw_detected_p = *shared_detected_pt.lock().unwrap();
 
-            if last_valid_loc.x + t_w <= f_img.cols() && last_valid_loc.y + t_h <= f_img.rows() {
-                if let Ok(roi) = core::Mat::roi(
-                    f_img,
-                    core::Rect::new(last_valid_loc.x, last_valid_loc.y, t_w, t_h),
-                ) {
-                    img = roi.try_clone().ok();
-                }
-            }
-
-            // 【双区域识别】：同步实时监控右下角/力度/角度/数值 ROI
-            let power_roi_mat = if let Some((px, py, pw, ph)) = power_geo {
-                if px + pw <= f_img.cols() && py + ph <= f_img.rows() {
-                    core::Mat::roi(f_img, core::Rect::new(px, py, pw, ph))
-                        .ok()
-                        .and_then(|r| r.try_clone().ok())
-                } else {
-                    None
-                }
-            } else if let Some(ref p_tpl) = power_template {
-                if p_tpl.cols() <= f_img.cols() && p_tpl.rows() <= f_img.rows() {
-                    let mut p_match_result = core::Mat::default();
-                    if imgproc::match_template(
-                        f_img,
-                        p_tpl,
-                        &mut p_match_result,
-                        imgproc::TM_CCOEFF_NORMED,
-                        &core::no_array(),
-                    )
-                    .is_ok()
-                    {
-                        let mut p_max_val = 0.0;
-                        let mut p_max_loc = core::Point::new(0, 0);
-                        let _ = core::min_max_loc(
-                            &p_match_result,
-                            None,
-                            Some(&mut p_max_val),
-                            None,
-                            Some(&mut p_max_loc),
-                            &core::no_array(),
-                        );
-                        if p_max_val > 0.25 {
-                            core::Mat::roi(
-                                f_img,
-                                core::Rect::new(
-                                    p_max_loc.x,
-                                    p_max_loc.y,
-                                    p_tpl.cols(),
-                                    p_tpl.rows(),
-                                ),
-                            )
-                            .ok()
-                            .and_then(|r| r.try_clone().ok())
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-
-            if let Some(ref p_mat) = power_roi_mat {
-                if let Ok(Some(val)) = recognizer.recognize_angle_digit(p_mat) {
-                    power_recognized_val = Some(val);
-                    // 【角度自动同步】：识别到的数值自动更新为当前面板的锁定角度 current_angle！
-                    if val >= 10 && val <= 90 {
-                        if let Ok(mut m_state) = app_state.lock() {
-                            m_state.current_angle = val as f64;
-                        }
-                    }
-                }
-            }
-        }
+        let t_recog = t1.elapsed().as_millis();
+        let t2 = std::time::Instant::now();
 
         let canvas_w = map_w_display + 270;
         let canvas_h_target = ((t_h as f64 * scale) as i32).max(580);
@@ -776,29 +724,12 @@ fn main() -> opencv::Result<()> {
                     map_display.at_row::<core::Vec3b>(y),
                     canvas.at_row_mut::<core::Vec3b>(y),
                 ) {
-                    for x in 0..map_display.cols() {
-                        dst_row[x as usize] = src_row[x as usize];
-                    }
+                    let len = src_row.len();
+                    dst_row[0..len].copy_from_slice(src_row);
                 }
             }
 
-            let breathing_p = if let Some(ref prev_m) = prev_minimap {
-                detect_breathing_dots(prev_m, &minimap).unwrap_or_default()
-            } else {
-                Vec::new()
-            };
-            prev_minimap = minimap.try_clone().ok();
 
-            let raw_auto_p = if st.auto_detect {
-                find_dots(&minimap, false).unwrap_or_default()
-            } else {
-                Vec::new()
-            };
-            let raw_detected_p = if !breathing_p.is_empty() {
-                Some(breathing_p[0])
-            } else {
-                raw_auto_p.get(0).cloned()
-            };
 
             // 【防抖抗闪内存锁】：呼吸灯熄灭的暗周期自动保持上一次坐标；同原地闪烁时微小震荡自动平滑，消除画面闪烁！
             let final_auto_p1 = if let Some(new_pt) = raw_detected_p {
@@ -825,14 +756,8 @@ fn main() -> opencv::Result<()> {
             } else {
                 Vec::new()
             };
-            let auto_e = if st.auto_detect {
-                find_dots(&minimap, true).unwrap_or_default()
-            } else {
-                Vec::new()
-            };
-            let cam_rect = st.manual_cam_rect.unwrap_or_else(|| {
-                detect_camera_frame(&minimap).unwrap_or(core::Rect::new(0, 0, t_w, t_h))
-            });
+            let auto_e: Vec<core::Point> = Vec::new();
+            let cam_rect = st.manual_cam_rect.unwrap_or(core::Rect::new(0, 0, t_w, t_h));
 
             let to_scr = |p: core::Point| {
                 core::Point::new((p.x as f64 * scale) as i32, (p.y as f64 * scale) as i32)
@@ -844,56 +769,27 @@ fn main() -> opencv::Result<()> {
                 cam_rect.x + cam_rect.width,
                 cam_rect.y + cam_rect.height,
             ));
-            let box_color = if st.manual_cam_rect.is_some() {
-                core::Scalar::new(0.0, 255.0, 255.0, 0.0)
-            } else {
-                core::Scalar::new(0.0, 255.0, 0.0, 0.0)
-            };
-            let _ = imgproc::rectangle(
-                &mut canvas,
-                core::Rect::new(cam_p1.x, cam_p1.y, cam_p2.x - cam_p1.x, cam_p2.y - cam_p1.y),
-                box_color,
-                2,
-                imgproc::LINE_8,
-                0,
-            );
+            if st.manual_cam_rect.is_some() && st.locked_px_per_unit.is_none() {
+                let box_color = core::Scalar::new(0.0, 255.0, 255.0, 0.0);
+                let _ = imgproc::rectangle(
+                    &mut canvas,
+                    core::Rect::new(cam_p1.x, cam_p1.y, cam_p2.x - cam_p1.x, cam_p2.y - cam_p1.y),
+                    box_color,
+                    2,
+                    imgproc::LINE_8,
+                    0,
+                );
 
-            // 绘制 12 等分刻度（纯粹视觉辅助，让用户能直观看到 12 距的刻度线）
-            let ruler_width = cam_p2.x - cam_p1.x;
-            for i in 1..12 {
-                let tick_x = cam_p1.x + (ruler_width as f64 * (i as f64 / 12.0)) as i32;
-                let _ = imgproc::line(
-                    &mut canvas,
-                    core::Point::new(tick_x, cam_p1.y),
-                    core::Point::new(tick_x, cam_p1.y + 10),
-                    box_color,
-                    1,
-                    imgproc::LINE_AA,
-                    0,
-                );
-                let _ = imgproc::line(
-                    &mut canvas,
-                    core::Point::new(tick_x, cam_p2.y - 10),
-                    core::Point::new(tick_x, cam_p2.y),
-                    box_color,
-                    1,
-                    imgproc::LINE_AA,
-                    0,
-                );
+                let ruler_width = cam_p2.x - cam_p1.x;
+                for i in 1..12 {
+                    let tick_x = cam_p1.x + (ruler_width as f64 * (i as f64 / 12.0)) as i32;
+                    let _ = imgproc::line(&mut canvas, core::Point::new(tick_x, cam_p1.y), core::Point::new(tick_x, cam_p1.y + 10), box_color, 1, imgproc::LINE_AA, 0);
+                    let _ = imgproc::line(&mut canvas, core::Point::new(tick_x, cam_p2.y - 10), core::Point::new(tick_x, cam_p2.y), box_color, 1, imgproc::LINE_AA, 0);
+                }
+
+                let cam_txt = format!("CAMERA {}x{}", cam_rect.width, cam_rect.height);
+                let _ = imgproc::put_text(&mut canvas, &cam_txt, core::Point::new(cam_p1.x, (cam_p1.y - 5).max(10)), imgproc::FONT_HERSHEY_SIMPLEX, 0.4, core::Scalar::new(0.0, 255.0, 255.0, 0.0), 1, imgproc::LINE_8, false);
             }
-
-            let cam_txt = format!("CAMERA {}x{}", cam_rect.width, cam_rect.height);
-            let _ = imgproc::put_text(
-                &mut canvas,
-                &cam_txt,
-                core::Point::new(cam_p1.x, (cam_p1.y - 5).max(10)),
-                imgproc::FONT_HERSHEY_SIMPLEX,
-                0.4,
-                core::Scalar::new(0.0, 255.0, 0.0, 0.0),
-                1,
-                imgproc::LINE_8,
-                false,
-            );
 
             let mut current_px_per_unit = cam_rect.width as f64 / 12.0;
             if let Some(locked) = st.locked_px_per_unit {
@@ -959,7 +855,7 @@ fn main() -> opencv::Result<()> {
                 draw_pt(&mut canvas, e, "敌方 (Enemy)", true, st.manual_e1.is_some());
             }
 
-            let mut y_offset = 430;
+            let mut y_offset = 480;
             let mut draw_result = |p: core::Point, e: core::Point| {
                 // Ensure ruler is locked
                 if st.locked_px_per_unit.is_none() {
@@ -1114,23 +1010,10 @@ fn main() -> opencv::Result<()> {
             if let (Some(p), Some(e)) = (p1, e1) {
                 draw_result(p, e);
             }
-        } else if full_img.is_none() {
+        } else if img.is_none() {
             imgproc::put_text(
                 &mut canvas,
-                "Error reading background screen!",
-                core::Point::new(50, 50),
-                imgproc::FONT_HERSHEY_SIMPLEX,
-                0.8,
-                core::Scalar::new(0.0, 0.0, 255.0, 0.0),
-                2,
-                imgproc::LINE_AA,
-                false,
-            )?;
-        } else {
-            let warn_text = format!("Waiting for minimap... (score: {:.2})", max_val);
-            imgproc::put_text(
-                &mut canvas,
-                &warn_text,
+                "Waiting for Capture...",
                 core::Point::new(50, 50),
                 imgproc::FONT_HERSHEY_SIMPLEX,
                 0.8,
@@ -1141,17 +1024,20 @@ fn main() -> opencv::Result<()> {
             )?;
         }
 
-        let pval_str = if let Some(val) = power_recognized_val {
-            format!("右下角动态读数: {}", val)
+        let pval_str = if st.auto_angle {
+            if let Some(val) = power_recognized_val {
+                format!("实机同步: 开启 ({})", val)
+            } else {
+                "实机同步: 监听中...".to_string()
+            }
         } else {
-            "右下角动态读数: 监听中...".to_string()
+            "实机同步: 已暂停 (点击恢复)".to_string()
         };
-        let pval_rect = core::Rect::new(map_w_display + 20, 395, 230, 30);
         let _ = draw_btn(
             &mut canvas,
-            pval_rect,
+            btn_auto_angle,
             &pval_str,
-            power_recognized_val.is_some(),
+            st.auto_angle,
         );
 
         draw_btn(
@@ -1324,13 +1210,31 @@ fn main() -> opencv::Result<()> {
             false,
         )?;
 
+        let t_ui = t2.elapsed().as_millis();
+        let bg_cap_ms = *cap_time_ms.lock().unwrap();
+        let fps = 1000.0 / fps_t0.elapsed().as_millis().max(1) as f64;
+        fps_t0 = std::time::Instant::now();
+        
+        let perf_txt = format!("FPS:{:.0} | IO:{} Rec:{} UI:{} BG:{}", fps, t_io, t_recog, t_ui, bg_cap_ms);
+        let _ = imgproc::put_text(
+            &mut canvas,
+            &perf_txt,
+            core::Point::new(map_w_display + 5, 435),
+            imgproc::FONT_HERSHEY_SIMPLEX,
+            0.55,
+            core::Scalar::new(255.0, 100.0, 100.0, 0.0),
+            2,
+            imgproc::LINE_AA,
+            false,
+        );
+
         highgui::imshow(window_name, &canvas)?;
         if first_show {
             highgui::set_window_property(window_name, highgui::WND_PROP_TOPMOST, 1.0)?;
             first_show = false;
         }
 
-        let key = highgui::wait_key(100)?;
+        let key = highgui::wait_key(15)?;
         let is_visible =
             highgui::get_window_property(window_name, highgui::WND_PROP_VISIBLE).unwrap_or(1.0);
         let exit_req = app_state.lock().unwrap().exit_requested;
@@ -1351,56 +1255,57 @@ fn main() -> opencv::Result<()> {
                 if let Ok(a) = wind_input_buf.parse::<f64>() {
                     let mut st = app_state.lock().unwrap();
                     st.current_angle = a.clamp(0.0, 180.0);
+                    st.auto_angle = false;
                 }
                 wind_input_buf.clear();
             }
         } else if key == 8 || key == 127 {
             // Backspace
             wind_input_buf.pop();
+        } else if key == '1' as i32 {
+            // 快捷键 1: 切换我方标注模式 (EditMode::P1)
+            let mut st = app_state.lock().unwrap();
+            st.edit_mode = if st.edit_mode == EditMode::P1 { EditMode::None } else { EditMode::P1 };
+        } else if key == '2' as i32 {
+            // 快捷键 2: 切换敌方标注模式 (EditMode::E1)
+            let mut st = app_state.lock().unwrap();
+            st.edit_mode = if st.edit_mode == EditMode::E1 { EditMode::None } else { EditMode::E1 };
+        } else if key == 'c' as i32 || key == 'C' as i32 {
+            // 快捷键 C: 清空手动标记
+            let mut st = app_state.lock().unwrap();
+            st.manual_p1 = None;
+            st.manual_e1 = None;
+            st.edit_mode = EditMode::None;
+        } else if key == 'r' as i32 || key == 'R' as i32 {
+            // 快捷键 R: 锁定/解锁距离尺
+            let mut st = app_state.lock().unwrap();
+            if st.locked_px_per_unit.is_some() {
+                st.locked_px_per_unit = None;
+            } else {
+                st.locked_px_per_unit = Some(0.0);
+            }
+        } else if key == 'a' as i32 || key == 'A' as i32 {
+            // 快捷键 A: 切换自动识别开关
+            let mut st = app_state.lock().unwrap();
+            st.auto_detect = !st.auto_detect;
+        } else if key == 'l' as i32 || key == 'L' as i32 {
+            // 快捷键 L: 锁定/追踪地图区域
+            let mut st = app_state.lock().unwrap();
+            st.map_locked = !st.map_locked;
         } else if key == 'm' as i32 || key == 'M' as i32 {
             let mut st = app_state.lock().unwrap();
             st.is_fixed_angle = !st.is_fixed_angle;
-        } else if key == 'w' as i32 {
-            let mut st = app_state.lock().unwrap();
-            if let Some(p) = st.manual_p1.as_mut() {
-                p.y -= 1;
-            }
-            if let Some(e) = st.manual_e1.as_mut() {
-                e.y -= 1;
-            }
-        } else if key == 's' as i32 {
-            let mut st = app_state.lock().unwrap();
-            if let Some(p) = st.manual_p1.as_mut() {
-                p.y += 1;
-            }
-            if let Some(e) = st.manual_e1.as_mut() {
-                e.y += 1;
-            }
-        } else if key == 'a' as i32 {
-            let mut st = app_state.lock().unwrap();
-            if let Some(p) = st.manual_p1.as_mut() {
-                p.x -= 1;
-            }
-            if let Some(e) = st.manual_e1.as_mut() {
-                e.x -= 1;
-            }
-        } else if key == 'd' as i32 {
-            let mut st = app_state.lock().unwrap();
-            if let Some(p) = st.manual_p1.as_mut() {
-                p.x += 1;
-            }
-            if let Some(e) = st.manual_e1.as_mut() {
-                e.x += 1;
-            }
         } else if key == 65362 || key == 0x260000 || key == 82 {
             // Up arrow
             if let Ok(mut m_state) = app_state.lock() {
                 m_state.current_angle = (m_state.current_angle + 1.0).min(180.0);
+                m_state.auto_angle = false;
             }
         } else if key == 65364 || key == 0x280000 || key == 84 {
             // Down arrow
             if let Ok(mut m_state) = app_state.lock() {
                 m_state.current_angle = (m_state.current_angle - 1.0).max(0.0);
+                m_state.auto_angle = false;
             }
         } else if key > 0 {
             let ch = (key & 0xFF) as u8 as char;

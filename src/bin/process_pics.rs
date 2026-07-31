@@ -5,7 +5,7 @@ use opencv::{
 };
 use std::fs;
 
-fn binarize_and_clean(roi: &core::Mat) -> opencv::Result<core::Mat> {
+fn binarize_and_clean(roi: &core::Mat) -> opencv::Result<(core::Mat, core::Mat)> {
     const UPSCALE: i32 = 3;
     
     let gray = if roi.channels() == 3 {
@@ -22,7 +22,6 @@ fn binarize_and_clean(roi: &core::Mat) -> opencv::Result<core::Mat> {
         let s = ch.get(1)?;
         let v = ch.get(2)?;
         
-        // 1. 饱和度 > 100 且 亮度 < 180 判定为纯彩色干扰线/背景，防止将与干扰线重叠的白字切断
         let mut s_mask = core::Mat::default();
         imgproc::threshold(&s, &mut s_mask, 100.0, 255.0, imgproc::THRESH_BINARY)?;
         
@@ -39,7 +38,6 @@ fn binarize_and_clean(roi: &core::Mat) -> opencv::Result<core::Mat> {
         roi.clone()
     };
 
-    // 2. 放大3倍提升像素精度
     let mut up = core::Mat::default();
     imgproc::resize(
         &gray,
@@ -50,7 +48,6 @@ fn binarize_and_clean(roi: &core::Mat) -> opencv::Result<core::Mat> {
         imgproc::INTER_CUBIC,
     )?;
 
-    // 3. Top-Hat 提取前景亮字
     let k = imgproc::get_structuring_element(
         imgproc::MORPH_ELLIPSE,
         Size::new(15, 15),
@@ -68,7 +65,6 @@ fn binarize_and_clean(roi: &core::Mat) -> opencv::Result<core::Mat> {
         imgproc::morphology_default_border_value()?,
     )?;
 
-    // 4. Otsu 自适应二值化 (设下限 30)
     let mut mask = core::Mat::default();
     let otsu_thresh = imgproc::threshold(
         &tophat,
@@ -88,7 +84,6 @@ fn binarize_and_clean(roi: &core::Mat) -> opencv::Result<core::Mat> {
         )?;
     }
 
-    // 5. 形态学开运算去除微小斑点
     let k_open = imgproc::get_structuring_element(
         imgproc::MORPH_RECT,
         Size::new(3, 3),
@@ -106,7 +101,6 @@ fn binarize_and_clean(roi: &core::Mat) -> opencv::Result<core::Mat> {
         imgproc::morphology_default_border_value()?,
     )?;
 
-    // 6. 连通域二次去噪
     let mut labels = core::Mat::default();
     let mut stats = core::Mat::default();
     let mut centroids = core::Mat::default();
@@ -139,10 +133,70 @@ fn binarize_and_clean(roi: &core::Mat) -> opencv::Result<core::Mat> {
         }
     }
 
-    Ok(final_mask)
+    let mut gray_out = core::Mat::new_rows_cols_with_default(
+        cleaned.rows(),
+        cleaned.cols(),
+        core::CV_8UC1,
+        Scalar::all(0.0),
+    )?;
+    tophat.copy_to_masked(&mut gray_out, &final_mask)?;
+
+    Ok((final_mask, gray_out))
 }
 
-fn extract_individual_digits(mask: &core::Mat, split_ratio: f64) -> opencv::Result<Vec<core::Mat>> {
+fn split_by_valley(
+    mask: &core::Mat,
+    r: Rect,
+    num_parts: i32,
+) -> opencv::Result<Vec<Rect>> {
+    let sub = core::Mat::roi(mask, r)?;
+
+    let mut col_sum = vec![0i32; r.width as usize];
+    for y in 0..r.height {
+        for x in 0..r.width {
+            if *sub.at_2d::<u8>(y, x)? > 0 {
+                col_sum[x as usize] += 1;
+            }
+        }
+    }
+
+    let mut cuts = vec![0i32];
+    for p in 1..num_parts {
+        let center = r.width * p / num_parts;
+        let span = ((r.width / num_parts) as f64 * 0.30).round().max(2.0) as i32;
+        let lo = (center - span).max(1);
+        let hi = (center + span).min(r.width - 1);
+
+        let mut best = center;
+        let mut best_v = i32::MAX;
+        for x in lo..hi {
+            let v = col_sum[x as usize];
+            if v < best_v || (v == best_v && (x - center).abs() < (best - center).abs()) {
+                best_v = v;
+                best = x;
+            }
+        }
+
+        if (best_v as f64) > (r.height as f64 * 0.60) {
+            return Ok(vec![r]);
+        }
+
+        cuts.push(best);
+    }
+    cuts.push(r.width);
+
+    Ok(cuts
+        .windows(2)
+        .filter(|w| w[1] - w[0] >= 3)
+        .map(|w| Rect::new(r.x + w[0], r.y, w[1] - w[0], r.height))
+        .collect())
+}
+
+fn extract_individual_digits(
+    mask: &core::Mat,
+    gray: &core::Mat,
+    split_ratio: f64,
+) -> opencv::Result<Vec<core::Mat>> {
     let mut labels = core::Mat::default();
     let mut stats = core::Mat::default();
     let mut centroids = core::Mat::default();
@@ -172,22 +226,33 @@ fn extract_individual_digits(mask: &core::Mat, split_ratio: f64) -> opencv::Resu
         }
     }
 
-    // 按 X 坐标从左到右排序
     valid_rects.sort_by_key(|r| r.x);
+
+    // 为了更精准地切分粘连字符（如 36），我们专门为 split_by_valley 准备一个腐蚀过的 mask
+    // 这样 3 和 6 之间细微的粘连会被断开，投影曲线在中间会有真正的谷底
+    let k_erode = imgproc::get_structuring_element(
+        imgproc::MORPH_RECT,
+        core::Size::new(2, 2),
+        core::Point::new(-1, -1),
+    )?;
+    let mut eroded_mask = core::Mat::default();
+    imgproc::erode(
+        mask,
+        &mut eroded_mask,
+        &k_erode,
+        core::Point::new(-1, -1),
+        1,
+        core::BORDER_CONSTANT,
+        imgproc::morphology_default_border_value()?,
+    )?;
 
     let mut final_rects = Vec::new();
     for r in valid_rects {
-        let expect_w = ((r.height as f64) * 0.62).round() as i32;
-        let expect_w = expect_w.max(6);
-        // 根据传入的 split_ratio 决定是否强行拆分连体字
+        let expect_w = (((r.height as f64) * 0.62).round() as i32).max(6);
         if r.width > (expect_w as f64 * split_ratio) as i32 {
             let num_parts = ((r.width as f64) / (expect_w as f64)).round().max(2.0) as i32;
-            let part_w = r.width / num_parts;
-            for p in 0..num_parts {
-                let rx = r.x + p * part_w;
-                let rw = if p == num_parts - 1 { r.x + r.width - rx } else { part_w };
-                final_rects.push(Rect::new(rx, r.y, rw, r.height));
-            }
+            // 用瘦身后的 eroded_mask 寻找切割点，切分更加准确
+            final_rects.extend(split_by_valley(&eroded_mask, r, num_parts)?);
         } else {
             final_rects.push(r);
         }
@@ -195,39 +260,20 @@ fn extract_individual_digits(mask: &core::Mat, split_ratio: f64) -> opencv::Resu
 
     let mut digit_mats = Vec::new();
     for rect in final_rects {
-        let digit_roi = core::Mat::roi(mask, rect)?;
+        let digit_roi = core::Mat::roi(gray, rect)?;
         digit_mats.push(digit_roi.try_clone()?);
     }
 
     Ok(digit_mats)
 }
 
-/// 按照 MNIST 规范平滑抗锯齿与断笔，并将单字转换为 28x28 质心对齐图像
-fn to_mnist_28(src: &core::Mat) -> opencv::Result<core::Mat> {
+fn to_template_40(src: &core::Mat) -> opencv::Result<core::Mat> {
     let cols = src.cols();
     let rows = src.rows();
     if cols == 0 || rows == 0 {
-        return core::Mat::new_rows_cols_with_default(28, 28, core::CV_8UC1, Scalar::all(0.0));
+        return core::Mat::new_rows_cols_with_default(40, 40, core::CV_8UC1, Scalar::all(0.0));
     }
 
-    // 0. 轻微膨胀平滑 (修复断笔与锯齿，线条更丝滑)
-    let k_smooth = imgproc::get_structuring_element(
-        imgproc::MORPH_ELLIPSE,
-        Size::new(2, 2),
-        Point::new(-1, -1),
-    )?;
-    let mut src_smooth = core::Mat::default();
-    imgproc::dilate(
-        src,
-        &mut src_smooth,
-        &k_smooth,
-        Point::new(-1, -1),
-        1,
-        core::BORDER_CONSTANT,
-        imgproc::morphology_default_border_value()?,
-    )?;
-
-    // 1. 找前景外接框 (裁掉多余黑边)
     let mut min_x = cols;
     let mut max_x = 0i32;
     let mut min_y = rows;
@@ -236,7 +282,7 @@ fn to_mnist_28(src: &core::Mat) -> opencv::Result<core::Mat> {
 
     for y in 0..rows {
         for x in 0..cols {
-            let val = *src_smooth.at_2d::<u8>(y, x)?;
+            let val = *src.at_2d::<u8>(y, x)?;
             if val > 50 {
                 if x < min_x { min_x = x; }
                 if x > max_x { max_x = x; }
@@ -248,51 +294,30 @@ fn to_mnist_28(src: &core::Mat) -> opencv::Result<core::Mat> {
     }
 
     if !has_fg || max_x < min_x || max_y < min_y {
-        return core::Mat::new_rows_cols_with_default(28, 28, core::CV_8UC1, Scalar::all(0.0));
+        return core::Mat::new_rows_cols_with_default(40, 40, core::CV_8UC1, Scalar::all(0.0));
     }
 
     let crop_w = max_x - min_x + 1;
     let crop_h = max_y - min_y + 1;
-    let cropped = core::Mat::roi(&src_smooth, Rect::new(min_x, min_y, crop_w, crop_h))?;
+    let cropped = core::Mat::roi(src, Rect::new(min_x, min_y, crop_w, crop_h))?;
 
-    // 2. 等比缩放，让长边 = 20
-    let scale = 20.0 / (crop_w.max(crop_h) as f64);
+    let scale = 36.0 / (crop_w.max(crop_h) as f64);
     let nw = ((crop_w as f64 * scale).round() as i32).max(1);
     let nh = ((crop_h as f64 * scale).round() as i32).max(1);
 
     let mut resized = core::Mat::default();
     imgproc::resize(&cropped, &mut resized, Size::new(nw, nh), 0.0, 0.0, imgproc::INTER_AREA)?;
 
-    // 3. 计算像素质心 Center of Mass
-    let mut sum_v = 0.0f64;
-    let mut sum_x = 0.0f64;
-    let mut sum_y = 0.0f64;
-
-    for y in 0..nh {
-        for x in 0..nw {
-            let v = *resized.at_2d::<u8>(y, x)? as f64;
-            sum_v += v;
-            sum_x += v * (x as f64);
-            sum_y += v * (y as f64);
-        }
-    }
-
-    let (cx, cy) = if sum_v > 0.0 {
-        (sum_x / sum_v, sum_y / sum_v)
-    } else {
-        (nw as f64 / 2.0, nh as f64 / 2.0)
-    };
-
-    // 4. 按质心贴到 28x28 画布中心 (14.0, 14.0)
-    let mut canvas = core::Mat::new_rows_cols_with_default(28, 28, core::CV_8UC1, Scalar::all(0.0))?;
-    let offset_x = (14.0 - cx).round() as i32;
-    let offset_y = (14.0 - cy).round() as i32;
+    // 对于固定字体，直接用几何中心对齐即可，最稳
+    let mut canvas = core::Mat::new_rows_cols_with_default(40, 40, core::CV_8UC1, Scalar::all(0.0))?;
+    let offset_x = (40 - nw) / 2;
+    let offset_y = (40 - nh) / 2;
 
     for y in 0..nh {
         for x in 0..nw {
             let tx = x + offset_x;
             let ty = y + offset_y;
-            if tx >= 0 && tx < 28 && ty >= 0 && ty < 28 {
+            if tx >= 0 && tx < 40 && ty >= 0 && ty < 40 {
                 let v = *resized.at_2d::<u8>(y, x)?;
                 *canvas.at_2d_mut::<u8>(ty, tx)? = v;
             }
@@ -307,9 +332,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let split_ratio: f64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(1.55);
 
     let out_dir = "src/pic_cleaned";
-    let mnist_dir = "src/pic_mnist28";
+    let tmpl_dir = "src/pic_template40";
     fs::create_dir_all(out_dir)?;
-    fs::create_dir_all(mnist_dir)?;
+    fs::create_dir_all(tmpl_dir)?;
 
     let entries = fs::read_dir("src/pic")?;
     let mut files: Vec<_> = entries.filter_map(Result::ok).collect();
@@ -329,24 +354,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
 
-        let clean_mask = binarize_and_clean(&raw_img)?;
-        let digit_mats = extract_individual_digits(&clean_mask, split_ratio)?;
+        let (clean_mask, clean_gray) = binarize_and_clean(&raw_img)?;
+        let digit_mats = extract_individual_digits(&clean_mask, &clean_gray, split_ratio)?;
 
         for (i, digit_mat) in digit_mats.iter().enumerate() {
             let out_path = format!("{}/{}_{}.png", out_dir, fname_stem, i);
             imgcodecs::imwrite(&out_path, digit_mat, &core::Vector::new())?;
 
-            // 转换为 MNIST 28x28 质心对齐标准小图并保存
-            let mnist_img = to_mnist_28(digit_mat)?;
-            let mnist_path = format!("{}/{}_{}_28.png", mnist_dir, fname_stem, i);
-            imgcodecs::imwrite(&mnist_path, &mnist_img, &core::Vector::new())?;
+            let tmpl_img = to_template_40(digit_mat)?;
+            let tmpl_path = format!("{}/{}_{}_40.png", tmpl_dir, fname_stem, i);
+            imgcodecs::imwrite(&tmpl_path, &tmpl_img, &core::Vector::new())?;
 
-            println!("导出独立单字: {} | MNIST 规范: {}", out_path, mnist_path);
+            println!("导出独立单字: {} | 40x40 模板: {}", out_path, tmpl_path);
         }
     }
 
     println!("所有图片处理完成！");
     println!("1. 原始裁剪单字保存至: {}", out_dir);
-    println!("2. 丝滑平滑 + 28x28 质心对齐单字保存至: {}", mnist_dir);
+    println!("2. 40x40 高清去模糊单字保存至: {}", tmpl_dir);
     Ok(())
 }

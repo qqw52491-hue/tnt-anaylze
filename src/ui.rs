@@ -22,12 +22,32 @@ pub struct RecognizerResult {
     pub wind_value: f64,
 }
 
-pub struct UiRecognizer;
+pub struct UiRecognizer {
+    templates: Vec<(u8, core::Mat)>,
+}
 
 impl UiRecognizer {
     /// 初始化识别器
-    pub fn new<P: AsRef<Path>>(_template_dir: P) -> opencv::Result<Self> {
-        Ok(Self)
+    pub fn new<P: AsRef<Path>>(template_dir: P) -> opencv::Result<Self> {
+        let mut templates = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(template_dir) {
+            for entry in entries.filter_map(Result::ok) {
+                let path = entry.path();
+                if path.extension().unwrap_or_default() != "png" {
+                    continue;
+                }
+                let fname = path.file_name().unwrap().to_string_lossy();
+                if let Some(first_char) = fname.chars().next() {
+                    if let Some(digit) = first_char.to_digit(10) {
+                        let img = imgcodecs::imread(path.to_str().unwrap(), imgcodecs::IMREAD_GRAYSCALE)?;
+                        if !img.empty() {
+                            templates.push((digit as u8, img));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(Self { templates })
     }
 
     /// 1. 小地图·视野框识别: HSV 黄色掩码 + boundingRect 取最大矩形
@@ -183,9 +203,281 @@ impl UiRecognizer {
         Ok(wind_val)
     }
 
-    /// 角度识别 (已停用 OCR)
-    pub fn recognize_angle_digit(&self, _angle_roi: &core::Mat) -> opencv::Result<Option<i32>> {
-        Ok(None)
+    fn binarize_and_clean(&self, roi: &core::Mat) -> opencv::Result<(core::Mat, core::Mat)> {
+        const UPSCALE: i32 = 3;
+        
+        let gray = if roi.channels() == 3 {
+            let mut hsv = core::Mat::default();
+            imgproc::cvt_color(roi, &mut hsv, imgproc::COLOR_BGR2HSV, 0, core::AlgorithmHint::ALGO_HINT_DEFAULT)?;
+            let mut ch = core::Vector::<core::Mat>::new();
+            core::split(&hsv, &mut ch)?;
+            let s = ch.get(1)?;
+            let v = ch.get(2)?;
+            
+            let mut s_mask = core::Mat::default();
+            imgproc::threshold(&s, &mut s_mask, 100.0, 255.0, imgproc::THRESH_BINARY)?;
+            
+            let mut v_bright = core::Mat::default();
+            imgproc::threshold(&v, &mut v_bright, 180.0, 255.0, imgproc::THRESH_BINARY_INV)?;
+
+            let mut erase_mask = core::Mat::default();
+            core::bitwise_and(&s_mask, &v_bright, &mut erase_mask, &core::no_array())?;
+
+            let mut gray = v.clone();
+            gray.set_to(&core::Scalar::all(0.0), &erase_mask)?;
+            gray
+        } else {
+            roi.clone()
+        };
+
+        let mut up = core::Mat::default();
+        imgproc::resize(&gray, &mut up, core::Size::new(gray.cols() * UPSCALE, gray.rows() * UPSCALE), 0.0, 0.0, imgproc::INTER_CUBIC)?;
+
+        let k = imgproc::get_structuring_element(imgproc::MORPH_ELLIPSE, core::Size::new(15, 15), Point::new(-1, -1))?;
+        let mut tophat = core::Mat::default();
+        imgproc::morphology_ex(&up, &mut tophat, imgproc::MORPH_TOPHAT, &k, Point::new(-1, -1), 1, core::BORDER_REPLICATE, imgproc::morphology_default_border_value()?)?;
+
+        let mut mask = core::Mat::default();
+        let otsu_thresh = imgproc::threshold(&tophat, &mut mask, 0.0, 255.0, imgproc::THRESH_BINARY | imgproc::THRESH_OTSU)?;
+        if otsu_thresh < 30.0 {
+            imgproc::threshold(&tophat, &mut mask, 30.0, 255.0, imgproc::THRESH_BINARY)?;
+        }
+
+        let k_open = imgproc::get_structuring_element(imgproc::MORPH_RECT, core::Size::new(3, 3), Point::new(-1, -1))?;
+        let mut cleaned = core::Mat::default();
+        imgproc::morphology_ex(&mask, &mut cleaned, imgproc::MORPH_OPEN, &k_open, Point::new(-1, -1), 1, core::BORDER_CONSTANT, imgproc::morphology_default_border_value()?)?;
+
+        let mut labels = core::Mat::default();
+        let mut stats = core::Mat::default();
+        let mut centroids = core::Mat::default();
+        let num_labels = imgproc::connected_components_with_stats(&cleaned, &mut labels, &mut stats, &mut centroids, 8, core::CV_32S)?;
+
+        let mut final_mask = core::Mat::new_rows_cols_with_default(cleaned.rows(), cleaned.cols(), core::CV_8UC1, Scalar::all(0.0))?;
+
+        for i in 1..num_labels {
+            let w = *stats.at_2d::<i32>(i, imgproc::CC_STAT_WIDTH)?;
+            let h = *stats.at_2d::<i32>(i, imgproc::CC_STAT_HEIGHT)?;
+            let area = *stats.at_2d::<i32>(i, imgproc::CC_STAT_AREA)?;
+            let aspect_ratio = (w as f64) / (h as f64);
+
+            if area >= 100 && h >= 18 && aspect_ratio <= 3.0 {
+                let mut comp_mask = core::Mat::default();
+                core::compare(&labels, &Scalar::all(i as f64), &mut comp_mask, core::CMP_EQ)?;
+                final_mask.set_to(&Scalar::all(255.0), &comp_mask)?;
+            }
+        }
+
+        let mut gray_out = core::Mat::new_rows_cols_with_default(cleaned.rows(), cleaned.cols(), core::CV_8UC1, Scalar::all(0.0))?;
+        tophat.copy_to_masked(&mut gray_out, &final_mask)?;
+
+        Ok((final_mask, gray_out))
+    }
+
+    fn split_by_valley(&self, mask: &core::Mat, r: Rect, num_parts: i32) -> opencv::Result<Vec<Rect>> {
+        let sub = core::Mat::roi(mask, r)?;
+        let mut col_sum = vec![0i32; r.width as usize];
+        for y in 0..r.height {
+            for x in 0..r.width {
+                if *sub.at_2d::<u8>(y, x)? > 0 { col_sum[x as usize] += 1; }
+            }
+        }
+        let mut cuts = vec![0i32];
+        for p in 1..num_parts {
+            let center = r.width * p / num_parts;
+            let span = ((r.width / num_parts) as f64 * 0.30).round().max(2.0) as i32;
+            let lo = (center - span).max(1);
+            let hi = (center + span).min(r.width - 1);
+
+            let mut best = center;
+            let mut best_v = i32::MAX;
+            for x in lo..hi {
+                let v = col_sum[x as usize];
+                if v < best_v || (v == best_v && (x - center).abs() < (best - center).abs()) {
+                    best_v = v;
+                    best = x;
+                }
+            }
+            if (best_v as f64) > (r.height as f64 * 0.60) { return Ok(vec![r]); }
+            cuts.push(best);
+        }
+        cuts.push(r.width);
+        Ok(cuts.windows(2).filter(|w| w[1] - w[0] >= 3).map(|w| Rect::new(r.x + w[0], r.y, w[1] - w[0], r.height)).collect())
+    }
+
+    fn extract_individual_digits(&self, mask: &core::Mat, gray: &core::Mat, split_ratio: f64) -> opencv::Result<Vec<core::Mat>> {
+        let mut labels = core::Mat::default();
+        let mut stats = core::Mat::default();
+        let mut centroids = core::Mat::default();
+        let num_labels = imgproc::connected_components_with_stats(mask, &mut labels, &mut stats, &mut centroids, 8, core::CV_32S)?;
+
+        let mut valid_rects = Vec::new();
+        for i in 1..num_labels {
+            let x = *stats.at_2d::<i32>(i, imgproc::CC_STAT_LEFT)?;
+            let y = *stats.at_2d::<i32>(i, imgproc::CC_STAT_TOP)?;
+            let w = *stats.at_2d::<i32>(i, imgproc::CC_STAT_WIDTH)?;
+            let h = *stats.at_2d::<i32>(i, imgproc::CC_STAT_HEIGHT)?;
+            let area = *stats.at_2d::<i32>(i, imgproc::CC_STAT_AREA)?;
+            let aspect_ratio = (w as f64) / (h as f64);
+            if area >= 100 && h >= 18 && aspect_ratio <= 3.0 {
+                valid_rects.push(Rect::new(x, y, w, h));
+            }
+        }
+        valid_rects.sort_by_key(|r| r.x);
+
+        let k_erode = imgproc::get_structuring_element(imgproc::MORPH_RECT, core::Size::new(2, 2), core::Point::new(-1, -1))?;
+        let mut eroded_mask = core::Mat::default();
+        imgproc::erode(mask, &mut eroded_mask, &k_erode, core::Point::new(-1, -1), 1, core::BORDER_CONSTANT, imgproc::morphology_default_border_value()?)?;
+
+        let mut final_rects = Vec::new();
+        for r in valid_rects {
+            let expect_w = (((r.height as f64) * 0.62).round() as i32).max(6);
+            if r.width > (expect_w as f64 * split_ratio) as i32 {
+                let num_parts = ((r.width as f64) / (expect_w as f64)).round().max(2.0) as i32;
+                final_rects.extend(self.split_by_valley(&eroded_mask, r, num_parts)?);
+            } else {
+                final_rects.push(r);
+            }
+        }
+
+        let mut digit_mats = Vec::new();
+        for rect in final_rects {
+            let digit_roi = core::Mat::roi(gray, rect)?;
+            digit_mats.push(digit_roi.try_clone()?);
+        }
+        Ok(digit_mats)
+    }
+
+    fn to_template_40(&self, src: &core::Mat) -> opencv::Result<core::Mat> {
+        let cols = src.cols();
+        let rows = src.rows();
+        if cols == 0 || rows == 0 {
+            return core::Mat::new_rows_cols_with_default(40, 40, core::CV_8UC1, Scalar::all(0.0));
+        }
+
+        let mut min_x = cols;
+        let mut max_x = 0i32;
+        let mut min_y = rows;
+        let mut max_y = 0i32;
+        let mut has_fg = false;
+
+        for y in 0..rows {
+            for x in 0..cols {
+                let val = *src.at_2d::<u8>(y, x)?;
+                if val > 50 {
+                    if x < min_x { min_x = x; }
+                    if x > max_x { max_x = x; }
+                    if y < min_y { min_y = y; }
+                    if y > max_y { max_y = y; }
+                    has_fg = true;
+                }
+            }
+        }
+
+        if !has_fg || max_x < min_x || max_y < min_y {
+            return core::Mat::new_rows_cols_with_default(40, 40, core::CV_8UC1, Scalar::all(0.0));
+        }
+
+        let crop_w = max_x - min_x + 1;
+        let crop_h = max_y - min_y + 1;
+        let cropped = core::Mat::roi(src, Rect::new(min_x, min_y, crop_w, crop_h))?;
+
+        let scale = 36.0 / (crop_w.max(crop_h) as f64);
+        let nw = ((crop_w as f64 * scale).round() as i32).max(1);
+        let nh = ((crop_h as f64 * scale).round() as i32).max(1);
+
+        let mut resized = core::Mat::default();
+        imgproc::resize(&cropped, &mut resized, core::Size::new(nw, nh), 0.0, 0.0, imgproc::INTER_AREA)?;
+
+        let mut canvas = core::Mat::new_rows_cols_with_default(40, 40, core::CV_8UC1, Scalar::all(0.0))?;
+        let offset_x = (40 - nw) / 2;
+        let offset_y = (40 - nh) / 2;
+
+        for y in 0..nh {
+            for x in 0..nw {
+                let tx = x + offset_x;
+                let ty = y + offset_y;
+                if tx >= 0 && tx < 40 && ty >= 0 && ty < 40 {
+                    let v = *resized.at_2d::<u8>(y, x)?;
+                    *canvas.at_2d_mut::<u8>(ty, tx)? = v;
+                }
+            }
+        }
+        Ok(canvas)
+    }
+
+    fn match_digit(&self, target: &core::Mat) -> opencv::Result<Option<u8>> {
+        if self.templates.is_empty() {
+            return Ok(None);
+        }
+        
+        let mut max_sim = -1.0;
+        let mut best_digit = None;
+        let mut best_translation = (0, 0);
+
+        for (digit, tmpl) in &self.templates {
+            for dy in -2..=2 {
+                for dx in -2..=2 {
+                    let mut dot_product = 0.0;
+                    let mut norm_tgt = 0.0;
+                    let mut norm_tmpl = 0.0;
+
+                    for y in 0..40 {
+                        for x in 0..40 {
+                            let sy = y + dy;
+                            let sx = x + dx;
+                            
+                            let mut v_tgt = 0.0;
+                            if sx >= 0 && sx < 40 && sy >= 0 && sy < 40 {
+                                v_tgt = (*target.at_2d::<u8>(sy, sx)?) as f64;
+                            }
+                            let v_tmpl = (*tmpl.at_2d::<u8>(y, x)?) as f64;
+
+                            dot_product += v_tgt * v_tmpl;
+                            norm_tgt += v_tgt * v_tgt;
+                            norm_tmpl += v_tmpl * v_tmpl;
+                        }
+                    }
+
+                    if norm_tgt > 0.0 && norm_tmpl > 0.0 {
+                        let sim = dot_product / (norm_tgt.sqrt() * norm_tmpl.sqrt());
+                        if sim > max_sim {
+                            max_sim = sim;
+                            best_digit = Some(*digit);
+                            best_translation = (dx, dy);
+                        }
+                    }
+                }
+            }
+        }
+        
+        if max_sim > 0.85 {
+            Ok(best_digit)
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// 角度识别 (基于模板匹配)
+    pub fn recognize_angle_digit(&self, angle_roi: &core::Mat) -> opencv::Result<Option<i32>> {
+        let (mask, gray) = self.binarize_and_clean(angle_roi)?;
+        let digit_mats = self.extract_individual_digits(&mask, &gray, 1.55)?;
+        
+        let mut final_num = 0;
+        let mut found_any = false;
+        
+        for mat in digit_mats {
+            let tmpl40 = self.to_template_40(&mat)?;
+            if let Some(d) = self.match_digit(&tmpl40)? {
+                final_num = final_num * 10 + (d as i32);
+                found_any = true;
+            }
+        }
+        
+        if found_any {
+            Ok(Some(final_num))
+        } else {
+            Ok(None)
+        }
     }
 
     /// 一键解析截屏图像
