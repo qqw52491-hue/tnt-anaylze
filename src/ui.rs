@@ -28,10 +28,8 @@ pub struct RecognizerResult {
 const SIM_MIN: f64 = 0.58;
 /// 最佳候选需要领先"第二名的其他数字"的幅度。
 ///
-/// FIX: 上一版卡到 0.02，太狠了。在 ZNCC 下 3↔、8、9 本来就很像，
-/// 7↔1、9 也一样，一帧稍微糊一点就可能是 0.63 vs 0.62——
-/// 冠军是对的，却因为只领先 0.01 被否决，整帧作废，表现就是"卡住"。
-/// 降到 0.005：只拦真正的平局（两个数字得分几乎一样），不再拦微小优势。
+/// 卡得太死会适得其反：3↔、8、9 和 7↔1、9 在 ZNCC 下本来就很像，
+/// 一帧稍糊就可能是 0.63 vs 0.62——冠军是对的，却因为领先不够被否决。
 const SIM_MARGIN: f64 = 0.005;
 
 pub struct UiRecognizer {
@@ -43,6 +41,81 @@ pub struct UiRecognizer {
 }
 
 impl UiRecognizer {
+    /// 剔除孤立小白点，只保留成规模的笔画。
+    ///
+    /// FIX（3 漏识别的真正原因）：模板库里仅有的两张 3，数字上方都粘了
+    /// 一个裁剪残留的白点。to_template_40 算外接框时把白点一起框进去，
+    /// 导致这两张模板里的 3 被压扁、下移、整体缩小——存的根本不是
+    /// "一个 3 的标准形状"，而是"一个 3 加一块空白"。拿真实的 3 去比永远对不齐，
+    /// 而 3 总共就这两张模板，两张全坏 = 3 等于没有可用模板。
+    ///
+    /// 保留面积 ≥ 最大连通域 20% 的块，而不是只留最大的一块：
+    /// 经过开运算后的 3 有可能断成上下两段弧，只留最大块会把它拆残。
+    /// 真正的裁剪杂点只有几个像素，远在这个比例之下。
+    fn strip_specks(src: &core::Mat) -> opencv::Result<core::Mat> {
+        if src.empty() || src.channels() != 1 {
+            return src.try_clone();
+        }
+
+        let mut bin = core::Mat::default();
+        imgproc::threshold(src, &mut bin, 30.0, 255.0, imgproc::THRESH_BINARY)?;
+
+        let mut labels = core::Mat::default();
+        let mut stats = core::Mat::default();
+        let mut centroids = core::Mat::default();
+        let n = imgproc::connected_components_with_stats(
+            &bin,
+            &mut labels,
+            &mut stats,
+            &mut centroids,
+            8,
+            core::CV_32S,
+        )?;
+
+        // 0 是背景，n <= 2 说明只有一块前景，没什么可剔的。
+        if n <= 2 {
+            return src.try_clone();
+        }
+
+        let mut max_area = 0i32;
+        for i in 1..n {
+            let a = *stats.at_2d::<i32>(i, imgproc::CC_STAT_AREA)?;
+            if a > max_area {
+                max_area = a;
+            }
+        }
+        // 整张图本来就没什么东西，不敲。
+        if max_area < 30 {
+            return src.try_clone();
+        }
+
+        let keep_min = ((((max_area as f64) * 0.20).ceil()) as i32).max(15);
+
+        let mut keep = core::Mat::new_rows_cols_with_default(
+            src.rows(),
+            src.cols(),
+            core::CV_8UC1,
+            Scalar::all(0.0),
+        )?;
+        for i in 1..n {
+            let a = *stats.at_2d::<i32>(i, imgproc::CC_STAT_AREA)?;
+            if a >= keep_min {
+                let mut cm = core::Mat::default();
+                core::compare(&labels, &Scalar::all(i as f64), &mut cm, core::CMP_EQ)?;
+                keep.set_to(&Scalar::all(255.0), &cm)?;
+            }
+        }
+
+        let mut out = core::Mat::new_rows_cols_with_default(
+            src.rows(),
+            src.cols(),
+            core::CV_8UC1,
+            Scalar::all(0.0),
+        )?;
+        src.copy_to_masked(&mut out, &keep)?;
+        Ok(out)
+    }
+
     /// 把一张 40x40 灰度图展平并去均值，返回 (展平像素, L2 范数)。
     fn flatten_centered(img: &core::Mat) -> opencv::Result<(Vec<f64>, f64)> {
         let mut flat = vec![0f64; 40 * 40];
@@ -84,17 +157,19 @@ impl UiRecognizer {
                 let Some(first_char) = fname.chars().next() else { continue };
                 let Some(digit) = first_char.to_digit(10) else { continue };
 
-                let img = imgcodecs::imread(path.to_str().unwrap(), imgcodecs::IMREAD_GRAYSCALE)?;
+                let raw = imgcodecs::imread(path.to_str().unwrap(), imgcodecs::IMREAD_GRAYSCALE)?;
                 // 模板必须是 40x40，否则展平就对不上了
-                if img.empty() || img.rows() != 40 || img.cols() != 40 {
+                if raw.empty() || raw.rows() != 40 || raw.cols() != 40 {
                     continue;
                 }
 
-                // FIX（样本太少的治标办法）：每张模板额外生成一张变细、一张变粗的。
-                // 你的模板库里 4 有 7 张、而 3 和 7 各只有 2 张，且都是十位（文件名 _0）。
-                // 实际画面里同一个数字会因为抗锯齿、UPSCALE=3 插值、tophat 响应强弱，
-                // 笔画胖一圈或痦一圈，而这正是样本少的数字盖不住的维度。
-                // 形态学扩增把 31 张变成 93 张，不需要你重新采集。
+                // 模板自身也可能带着采集时的裁剪杂点（你这两张 3 就是），
+                // 先洗一遍再入库，不需要重新采集。
+                let img = Self::strip_specks(&raw)?;
+
+                // 每张模板额外生成一张变细、一张变粗的。
+                // 同一个数字在画面里会因为抗锯齿、UPSCALE=3 插值、tophat 响应强弱
+                // 而笔画胖一圈或痦一圈，这正是样本少的数字盖不住的维度。
                 let mut thin = core::Mat::default();
                 imgproc::erode(
                     &img,
@@ -453,15 +528,20 @@ impl UiRecognizer {
             return core::Mat::new_rows_cols_with_default(40, 40, core::CV_8UC1, Scalar::all(0.0));
         }
 
+        // FIX: 先剔掉孤立白点再算外接框。只要数字旁边粘一个几像素的杂点，
+        // 外接框就会被撑大，数字被连带缩小并偏移，归一化完全失效。
+        // 这同时修了两件事：实时帧里的杂点，以及用本函数新采集的模板不再被污染。
+        let cleaned_src = Self::strip_specks(src)?;
+        let src = &cleaned_src;
+
         let mut min_x = cols;
         let mut max_x = 0i32;
         let mut min_y = rows;
         let mut max_y = 0i32;
         let mut has_fg = false;
 
-        // FIX: 前景判定从 >50 降到 >30，与 binarize_and_clean 里 Otsu 的兜底阈值一致。
-        // 原来 3 和 7 的细笔画末端（tophat 响应本来就弱）会被排除在外接框之外，
-        // 导致居中和缩放都偏掉。
+        // 前景判定用 >30，与 binarize_and_clean 里 Otsu 的兜底阈值一致。
+        // 3 和 7 的细笔画末端（tophat 响应本来就弱）不会被排除在外接框之外。
         for y in 0..rows {
             for x in 0..cols {
                 let val = *src.at_2d::<u8>(y, x)?;
