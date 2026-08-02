@@ -149,13 +149,13 @@ struct DragState {
 fn select_region_interactive(title: &str) -> Option<Geometry> {
     let tmp = "/tmp/tnt_fullscreen.png";
     if !capture_full_screen(tmp) {
-        eprintln!("\u274c 全屏截图失败，无法进入选区");
+        eprintln!("❌ 全屏截图失败，无法进入选区");
         return None;
     }
 
     let full = imgcodecs::imread(tmp, imgcodecs::IMREAD_COLOR).ok()?;
     if full.empty() {
-        eprintln!("\u274c 截图读取失败：{}", tmp);
+        eprintln!("❌ 截图读取失败：{}", tmp);
         return None;
     }
 
@@ -213,7 +213,7 @@ fn select_region_interactive(title: &str) -> Option<Geometry> {
     )
     .ok()?;
 
-    println!("\u{1f5b1}\u{fe0f}  {}：按住左键拖框 -> 松开 -> [Enter/空格] 确认，[ESC] 取消，不满意可重拖", title);
+    println!("🖱️  {}：按住左键拖框 -> 松开 -> [Enter/空格] 确认，[ESC] 取消，不满意可重拖", title);
 
     let result: Option<Geometry>;
     loop {
@@ -274,7 +274,7 @@ fn select_region_interactive(title: &str) -> Option<Geometry> {
         }
         if key == 13 || key == 10 || key == 32 {
             if !d.has_box {
-                println!("\u26a0\u{fe0f}  还没有拖出框，先按住左键拖一个矩形");
+                println!("⚠️  还没有拖出框，先按住左键拖一个矩形");
                 continue;
             }
             let (Some(s), Some(c)) = (d.start, d.cur) else {
@@ -288,7 +288,7 @@ fn select_region_interactive(title: &str) -> Option<Geometry> {
             let px_h = ((s.y - c.y).abs() as f64 / disp_scale).round();
 
             if px_w < 8.0 || px_h < 8.0 {
-                println!("\u26a0\u{fe0f}  选区太小了，重新拖一个");
+                println!("⚠️  选区太小了，重新拖一个");
                 continue;
             }
 
@@ -306,7 +306,7 @@ fn select_region_interactive(title: &str) -> Option<Geometry> {
             let gw = gw.min((max_gx - gx).max(1));
             let gh = gh.min((max_gy - gy).max(1));
 
-            println!("\u2705 {} 已选定: x={} y={} w={} h={} (倍率 {:.1})", title, gx, gy, gw, gh, ratio);
+            println!("✅ {} 已选定: x={} y={} w={} h={} (倍率 {:.1})", title, gx, gy, gw, gh, ratio);
             result = Some((gx, gy, gw, gh));
             break;
         }
