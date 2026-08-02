@@ -35,10 +35,20 @@ const SIM_MARGIN: f64 = 0.005;
 /// 角度上限。反抛物线可以打过头顶，屏幕上会显示 91..=180。
 const ANGLE_MAX: i32 = 180;
 
+/// 每多一个对不上的环（洞）扣多少分。
+///
+/// 拓扑是 ZNCC 看不到的维度：3 和 8 的像素分布重合很高，
+/// 但"有几个封闭的环"跟字体、笔画粗细、模糊程度都无关：
+/// 3/7/1/2/5 零个环，0/6/9 一个，8 两个。
+const HOLE_PENALTY: f64 = 0.15;
+
+/// 宽高比差异的扣分系数。专治 1↔7：1 又窄又高（约 0.3），7 明显宽（约 0.6）。
+const ASPECT_PENALTY: f64 = 0.50;
+
 pub struct UiRecognizer {
-    /// (数字, 去均值后的 40x40 展平像素, 去均值后的 L2 范数)
+    /// (数字, 去均值后的 40x40 展平像素, L2 范数, 洞数, 宽高比)
     /// 预展平 + 预去均值，是为了让热循环彻底不碰 OpenCV 的 at_2d。
-    templates: Vec<(u8, Vec<f64>, f64)>,
+    templates: Vec<(u8, Vec<f64>, f64, i32, f64)>,
     /// 失败样本落盘开关，由环境变量 TNT_DUMP_FAIL 控制。
     dump_fail: bool,
 }
@@ -62,6 +72,75 @@ impl UiRecognizer {
             norm_sq += *v * *v;
         }
         Ok((flat, norm_sq.sqrt()))
+    }
+
+    /// 字形的结构特征：(洞数, 墨迹宽高比)。
+    ///
+    /// 洞 = 反色后不接触图像边界的背景连通域。背景用 4 连通（前景 8 连通），
+    /// 否则斜向缝隙会把环"漏"到外面去。面积小于 8 像素的不算环，挡噪点。
+    fn glyph_stats(img: &core::Mat) -> opencv::Result<(i32, f64)> {
+        if img.empty() || img.channels() != 1 {
+            return Ok((0, 1.0));
+        }
+
+        let rows = img.rows();
+        let cols = img.cols();
+
+        let mut bin = core::Mat::default();
+        imgproc::threshold(img, &mut bin, 30.0, 255.0, imgproc::THRESH_BINARY)?;
+
+        let mut min_x = cols;
+        let mut max_x = -1i32;
+        let mut min_y = rows;
+        let mut max_y = -1i32;
+        for y in 0..rows {
+            for x in 0..cols {
+                if *bin.at_2d::<u8>(y, x)? > 0 {
+                    if x < min_x { min_x = x; }
+                    if x > max_x { max_x = x; }
+                    if y < min_y { min_y = y; }
+                    if y > max_y { max_y = y; }
+                }
+            }
+        }
+        if max_x < min_x || max_y < min_y {
+            return Ok((0, 1.0));
+        }
+        let aspect = ((max_x - min_x + 1) as f64) / (((max_y - min_y + 1).max(1)) as f64);
+
+        let mut inv = core::Mat::default();
+        imgproc::threshold(&bin, &mut inv, 127.0, 255.0, imgproc::THRESH_BINARY_INV)?;
+
+        let mut labels = core::Mat::default();
+        let mut stats = core::Mat::default();
+        let mut centroids = core::Mat::default();
+        let n = imgproc::connected_components_with_stats(
+            &inv,
+            &mut labels,
+            &mut stats,
+            &mut centroids,
+            4,
+            core::CV_32S,
+        )?;
+
+        let mut holes = 0i32;
+        for i in 1..n {
+            let x = *stats.at_2d::<i32>(i, imgproc::CC_STAT_LEFT)?;
+            let y = *stats.at_2d::<i32>(i, imgproc::CC_STAT_TOP)?;
+            let w = *stats.at_2d::<i32>(i, imgproc::CC_STAT_WIDTH)?;
+            let h = *stats.at_2d::<i32>(i, imgproc::CC_STAT_HEIGHT)?;
+            let a = *stats.at_2d::<i32>(i, imgproc::CC_STAT_AREA)?;
+            // 摸到边界的是外部背景，不是环。
+            if x == 0 || y == 0 || x + w == cols || y + h == rows {
+                continue;
+            }
+            if a < 8 {
+                continue;
+            }
+            holes += 1;
+        }
+
+        Ok((holes, aspect))
     }
 
     /// 初始化识别器
@@ -117,8 +196,9 @@ impl UiRecognizer {
 
                 for variant in [&img, &thin, &thick] {
                     let (flat, norm) = Self::flatten_centered(variant)?;
+                    let (holes, aspect) = Self::glyph_stats(variant)?;
                     if norm > 1e-6 {
-                        templates.push((digit as u8, flat, norm));
+                        templates.push((digit as u8, flat, norm, holes, aspect));
                     }
                 }
             }
@@ -506,18 +586,26 @@ impl UiRecognizer {
         Ok(canvas)
     }
 
-    /// 算出 0..9 每个数字的最佳 ZNCC 得分。
+    /// 算出 0..9 每个数字的得分，返回 (修正后得分, 对应的原始 ZNCC 得分)。
     ///
     /// 用 ZNCC（先减各自均值）而不是裸余弦：灰度像素恒为非负，
     /// 裸余弦会严重依赖前景像素的多少，稀疏的 3、7 分数被系统性压低。
-    /// 去均值后相似度只反映形状，笔画密度不再影响判定。
     ///
-    /// PERF: 模板已在 new() 里预展平并预去均值，热循环完全不碰 at_2d。
-    fn score_digits(&self, target: &core::Mat) -> opencv::Result<[f64; 10]> {
-        let mut per_digit = [-2.0f64; 10];
+    /// 修正项（拓扑 + 宽高比）只用来排名次，不用来判生死：
+    /// SIM_MIN 那道门槛看的是原始分，否则扣分会把本来能认出来的字扣成废帧。
+    ///
+    /// 洞数只扣单向（模板比目标多才扣）：真实帧里 3 的笔画太粗可能糊出一个假环，
+    /// 反向也扣的话假环会反咬 3 一口。
+    ///
+    /// PERF: 模板已在 new() 里预展平、预去均值、预算结构特征。
+    fn score_digits(&self, target: &core::Mat) -> opencv::Result<([f64; 10], [f64; 10])> {
+        let mut adj = [-2.0f64; 10];
+        let mut raw_at_best = [0.0f64; 10];
         if self.templates.is_empty() {
-            return Ok(per_digit);
+            return Ok((adj, raw_at_best));
         }
+
+        let (t_holes, t_aspect) = Self::glyph_stats(target)?;
 
         let mut raw = vec![0f64; 40 * 40];
         for y in 0..40 {
@@ -556,21 +644,28 @@ impl UiRecognizer {
                     continue; // 全空白
                 }
 
-                for (digit, tmpl, tmpl_norm) in &self.templates {
+                for (digit, tmpl, tmpl_norm, tmpl_holes, tmpl_aspect) in &self.templates {
                     let mut dot = 0f64;
                     for i in 0..(40 * 40) {
                         dot += shifted[i] * tmpl[i];
                     }
                     let sim = dot / (norm * tmpl_norm);
-                    let slot = &mut per_digit[*digit as usize];
-                    if sim > *slot {
-                        *slot = sim;
+
+                    let hole_gap = (*tmpl_holes - t_holes).max(0) as f64;
+                    let penalty = HOLE_PENALTY * hole_gap
+                        + ASPECT_PENALTY * (t_aspect - *tmpl_aspect).abs();
+                    let score = sim - penalty;
+
+                    let d = *digit as usize;
+                    if score > adj[d] {
+                        adj[d] = score;
+                        raw_at_best[d] = sim;
                     }
                 }
             }
         }
 
-        Ok(per_digit)
+        Ok((adj, raw_at_best))
     }
 
     /// 从得分表里选出 (冠军数字, 冠军分, 亚军分)。
@@ -594,13 +689,14 @@ impl UiRecognizer {
 
     /// 模板匹配单个数字，返回 (数字, ZNCC 相似度)。
     fn match_digit(&self, target: &core::Mat) -> opencv::Result<(Option<u8>, f64)> {
-        let per_digit = self.score_digits(target)?;
-        let (best_idx, best_sim, second_sim) = Self::pick_best(&per_digit);
+        let (adj, raw_at_best) = self.score_digits(target)?;
+        let (best_idx, best_adj, second_adj) = Self::pick_best(&adj);
+        let best_raw = raw_at_best[best_idx];
 
-        if best_sim >= SIM_MIN && (best_sim - second_sim) >= SIM_MARGIN {
-            Ok((Some(best_idx as u8), best_sim))
+        if best_raw >= SIM_MIN && (best_adj - second_adj) >= SIM_MARGIN {
+            Ok((Some(best_idx as u8), best_raw))
         } else {
-            Ok((None, best_sim.max(0.0)))
+            Ok((None, best_raw.max(0.0)))
         }
     }
 
@@ -655,22 +751,23 @@ impl UiRecognizer {
 
         for mat in digit_mats {
             let tmpl40 = self.to_template_40(&mat)?;
-            let per_digit = self.score_digits(&tmpl40)?;
-            let (best_idx, best_sim, second_sim) = Self::pick_best(&per_digit);
+            let (adj, raw_at_best) = self.score_digits(&tmpl40)?;
+            let (best_idx, best_adj, second_adj) = Self::pick_best(&adj);
+            let best_raw = raw_at_best[best_idx];
 
-            if best_sim < SIM_MIN || (best_sim - second_sim) < SIM_MARGIN {
+            if best_raw < SIM_MIN || (best_adj - second_adj) < SIM_MARGIN {
                 // 只要有一位没认出来，整帧作废，交给上层沿用上一帧。
                 // 旧版是静默跳过这一位，剩下一位照样拼成角度返回，
                 // 73 会变成 7 且能通过范围校验，变成一个"看起来正常"的错角度。
                 if self.dump_fail {
-                    self.dump_failure(&tmpl40, &per_digit);
+                    self.dump_failure(&tmpl40, &adj);
                 }
-                return Ok((None, best_sim.max(0.0)));
+                return Ok((None, best_raw.max(0.0)));
             }
 
             digits.push(best_idx as u8);
-            if best_sim < worst_conf {
-                worst_conf = best_sim;
+            if best_raw < worst_conf {
+                worst_conf = best_raw;
             }
         }
 
@@ -687,7 +784,7 @@ impl UiRecognizer {
             return Ok((None, worst_conf));
         }
 
-        // 反抛物线折返：屏幕显示 95 -> 实际按 85 算，102 -> 78。
+        // 反抛物线折返：大于 90 才折，95 -> 85，102 -> 78；小于等于 90 原样不动。
         let val = if val > 90 { ANGLE_MAX - val } else { val };
 
         // 置信度取所有位里最低的那一位，避免"一位很准 + 一位勉强"被平均掩盖。
