@@ -1,8 +1,8 @@
 use opencv::{core, highgui, imgcodecs, imgproc, prelude::*};
-use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+
+use tnt_comput::screen;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum EditMode {
@@ -70,95 +70,12 @@ fn compute_trajectory(dx_units: f64, dy_units: f64, angle_deg: f64, wind: f64) -
     (base_power.clamp(1.0, 100.0), final_angle)
 }
 
-fn find_dots(minimap: &core::Mat, is_red: bool) -> opencv::Result<Vec<core::Point>> {
-    let mut hsv = core::Mat::default();
-    imgproc::cvt_color(
-        minimap,
-        &mut hsv,
-        imgproc::COLOR_BGR2HSV,
-        0,
-        core::AlgorithmHint::ALGO_HINT_DEFAULT,
-    )?;
-
-    let (lower1, upper1, lower2, upper2) = if is_red {
-        (
-            core::Scalar::new(0.0, 80.0, 80.0, 0.0),
-            core::Scalar::new(20.0, 255.0, 255.0, 0.0),
-            core::Scalar::new(160.0, 80.0, 80.0, 0.0),
-            core::Scalar::new(180.0, 255.0, 255.0, 0.0),
-        )
-    } else {
-        (
-            core::Scalar::new(80.0, 80.0, 80.0, 0.0),
-            core::Scalar::new(150.0, 255.0, 255.0, 0.0),
-            core::Scalar::new(80.0, 80.0, 80.0, 0.0),
-            core::Scalar::new(150.0, 255.0, 255.0, 0.0),
-        )
-    };
-
-    let mut mask1 = core::Mat::default();
-    let mut mask2 = core::Mat::default();
-    let mut mask = core::Mat::default();
-    core::in_range(&hsv, &lower1, &upper1, &mut mask1)?;
-    core::in_range(&hsv, &lower2, &upper2, &mut mask2)?;
-    core::bitwise_or(&mask1, &mask2, &mut mask, &core::no_array())?;
-
-    let mut contours = core::Vector::<core::Vector<core::Point>>::new();
-    imgproc::find_contours(
-        &mask,
-        &mut contours,
-        imgproc::RETR_EXTERNAL,
-        imgproc::CHAIN_APPROX_SIMPLE,
-        core::Point::new(0, 0),
-    )?;
-
-    let mut pts = Vec::new();
-    for i in 0..contours.len() {
-        let contour = contours.get(i)?;
-        let rect = opencv::geometry::bounding_rect(&contour)?;
-        let area = rect.width * rect.height;
-
-        if area >= 9 && area <= 600 && rect.width <= 30 && rect.height <= 30 {
-            let aspect = rect.width as f64 / rect.height as f64;
-            if aspect > 0.3 && aspect < 3.0 {
-                let mut dark_pixels = 0;
-                let mut total_edge = 0;
-                let start_x = (rect.x - 1).max(0);
-                let start_y = (rect.y - 1).max(0);
-                let end_x = (rect.x + rect.width + 1).min(minimap.cols() - 1);
-                let end_y = (rect.y + rect.height + 1).min(minimap.rows() - 1);
-
-                for y in start_y..=end_y {
-                    for x in start_x..=end_x {
-                        if x < rect.x
-                            || x >= rect.x + rect.width
-                            || y < rect.y
-                            || y >= rect.y + rect.height
-                        {
-                            total_edge += 1;
-                            let p = minimap.at_2d::<core::Vec3b>(y, x)?;
-                            if p[0] < 120 && p[1] < 120 && p[2] < 120 {
-                                dark_pixels += 1;
-                            }
-                        }
-                    }
-                }
-
-                if total_edge > 0 && (dark_pixels as f64 / total_edge as f64) > 0.10 {
-                    pts.push(core::Point::new(
-                        rect.x + rect.width / 2,
-                        rect.y + rect.height / 2,
-                    ));
-                }
-            }
-        }
-    }
-    pts.sort_by(|a, b| a.x.cmp(&b.x));
-    Ok(pts)
-}
-
 // 【呼吸灯/闪烁帧差法】：通过前后两帧小地图相减，0.1ms 自动无视地图杂色背景，瞬间精确定位我方位置！
 fn detect_breathing_dots(prev: &core::Mat, curr: &core::Mat) -> opencv::Result<Vec<core::Point>> {
+    if prev.empty() || curr.empty() || prev.size()? != curr.size()? {
+        return Ok(Vec::new());
+    }
+
     let mut diff = core::Mat::default();
     core::absdiff(prev, curr, &mut diff)?;
 
@@ -195,46 +112,6 @@ fn detect_breathing_dots(prev: &core::Mat, curr: &core::Mat) -> opencv::Result<V
     }
     pts.sort_by(|a, b| a.x.cmp(&b.x));
     Ok(pts)
-}
-
-fn detect_camera_frame(minimap: &core::Mat) -> opencv::Result<core::Rect> {
-    let mut hsv = core::Mat::default();
-    imgproc::cvt_color(
-        minimap,
-        &mut hsv,
-        imgproc::COLOR_BGR2HSV,
-        0,
-        core::AlgorithmHint::ALGO_HINT_DEFAULT,
-    )?;
-
-    let lower_yellow_green = core::Scalar::new(15.0, 60.0, 60.0, 0.0);
-    let upper_yellow_green = core::Scalar::new(85.0, 255.0, 255.0, 0.0);
-
-    let mut mask = core::Mat::default();
-    core::in_range(&hsv, &lower_yellow_green, &upper_yellow_green, &mut mask)?;
-
-    let mut contours = core::Vector::<core::Vector<core::Point>>::new();
-    imgproc::find_contours(
-        &mask,
-        &mut contours,
-        imgproc::RETR_EXTERNAL,
-        imgproc::CHAIN_APPROX_SIMPLE,
-        core::Point::new(0, 0),
-    )?;
-
-    let mut best = core::Rect::new(0, 0, 90, 60);
-    let mut max_area = 0;
-
-    for i in 0..contours.len() {
-        let contour = contours.get(i)?;
-        let rect = opencv::geometry::bounding_rect(&contour)?;
-        let area = rect.width * rect.height;
-        if rect.width >= 40 && rect.width <= 226 && area > max_area {
-            max_area = area;
-            best = rect;
-        }
-    }
-    Ok(best)
 }
 
 fn draw_btn(
@@ -287,72 +164,29 @@ fn is_inside(x: i32, y: i32, rect: core::Rect) -> bool {
     x >= rect.x && x <= rect.x + rect.width && y >= rect.y && y <= rect.y + rect.height
 }
 
-#[cfg(target_os = "linux")]
-fn get_slurp_geometry() -> Option<(i32, i32, i32, i32)> {
-    let output = Command::new("slurp").output().ok()?;
-    let geo_str = String::from_utf8(output.stdout).ok()?;
-    let parts: Vec<&str> = geo_str.trim().split_whitespace().collect();
-    if parts.len() == 2 {
-        let xy: Vec<i32> = parts[0].split(',').filter_map(|s| s.parse().ok()).collect();
-        let wh: Vec<i32> = parts[1].split('x').filter_map(|s| s.parse().ok()).collect();
-        if xy.len() == 2 && wh.len() == 2 {
-            return Some((xy[0], xy[1], wh[0], wh[1]));
-        }
-    }
-    None
-}
-
-#[cfg(target_os = "macos")]
-fn get_slurp_geometry() -> Option<(i32, i32, i32, i32)> {
-    println!("🍎 正在 Mac 系统运行: 暂未对接 Mac 原生选区，使用默认区域...");
-    Some((0, 0, 800, 600))
-}
-
-#[cfg(target_os = "linux")]
-fn capture_rect_to_file(geo: (i32, i32, i32, i32), path: &str) {
-    let _ = Command::new("sh")
-        .arg("-c")
-        .arg(format!("grim -g \"{},{} {}x{}\" -t ppm {}.tmp && mv {}.tmp {}", geo.0, geo.1, geo.2, geo.3, path, path, path))
-        .status();
-}
-
-#[cfg(target_os = "macos")]
-fn capture_rect_to_file(geo: (i32, i32, i32, i32), path: &str) {
-    let _ = Command::new("sh")
-        .arg("-c")
-        .arg(format!("screencapture -R {},{},{},{} -x -t png {}.tmp && mv {}.tmp {}", geo.0, geo.1, geo.2, geo.3, path, path, path))
-        .status();
-}
-
-fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
+fn main() -> opencv::Result<()> {
     #[cfg(target_os = "macos")]
     println!("=== 🍎 Mac OS 环境检测成功，已自动切换底层抓图引擎 ===");
 
-    println!("👉 [步骤 1/2] 请在屏幕上框选【左上角小地图】区域...");
-    let map_geo = get_slurp_geometry().unwrap_or((0, 0, 800, 600));
+    // FIX: macOS 上原来这里直接返回写死的 (0,0,800,600)，根本没有选区；
+    // 现在走 screen::select_region，先全屏截图再拖框，并自动处理 Retina 倍率。
+    println!("👉 [步骤 1/2] 请框选【左上角小地图】区域...");
+    let Some(map_geo) = screen::select_region("步骤 1/2 小地图") else {
+        println!("❌ 已取消选区，退出。");
+        return Ok(());
+    };
     let t_w = map_geo.2;
     let t_h = map_geo.3;
 
-    println!("👉 [步骤 2/2] 请在屏幕上框选【右下角/角度/力度/数值】区域...");
-    let power_geo = get_slurp_geometry();
-    let power_crop_path = "/tmp/tnt_selected_power.png";
-    if let Some((x, y, w, h)) = power_geo {
-        let _ = Command::new("sh")
-            .arg("-c")
-            .arg(format!(
-                "grim -g \"{},{} {}x{}\" {}",
-                x, y, w, h, power_crop_path
-            ))
-            .status();
+    println!("👉 [步骤 2/2] 请框选【右下角 角度/力度 数值】区域...");
+    let power_geo = screen::select_region("步骤 2/2 角度力度数值");
+
+    // FIX: 原来这里无条件调用 grim（没有 cfg 门控），macOS 上必然 command not found。
+    if let Some(p_geo) = power_geo {
+        screen::capture_rect_to_file(p_geo, "/tmp/tnt_selected_power.png");
     } else {
-        #[cfg(target_os = "linux")]
-        let _ = Command::new("sh")
-            .arg("-c")
-            .arg("grim -g \"$(slurp)\" /tmp/tnt_selected_power.png")
-            .status();
+        println!("⚠️  未选择数值区域，角度自动识别将不可用（可手动设角度）。");
     }
-
-
 
     let window_name = "TNT Assistant HUD";
     highgui::named_window(window_name, highgui::WINDOW_AUTOSIZE)?;
@@ -413,11 +247,11 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
     let rect_wind_text = core::Rect::new(map_w_display + 125, 355, 60, 30);
     let btn_wind_p01 = core::Rect::new(map_w_display + 190, 355, 45, 30);
     let btn_wind_p1 = core::Rect::new(map_w_display + 245, 355, 45, 30);
-    
+
     let btn_auto_angle = core::Rect::new(map_w_display + 20, 395, 230, 30);
 
     let state_cb = app_state.clone();
-    let map_geo_clone = map_geo.clone();
+    let map_geo_clone = map_geo;
     highgui::set_mouse_callback(
         window_name,
         Some(Box::new(move |event, x, y, _flags| {
@@ -576,8 +410,8 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
     let cap_time_ms = Arc::new(std::sync::Mutex::new(0u128));
     let cap_time_ms_clone = cap_time_ms.clone();
 
-    let map_geo_clone = map_geo.clone();
-    let power_geo_clone = power_geo.clone();
+    let map_geo_bg = map_geo;
+    let power_geo_bg = power_geo;
 
     let shared_map = Arc::new(std::sync::Mutex::new(None::<core::Mat>));
     let shared_map_clone = shared_map.clone();
@@ -589,24 +423,25 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
     let app_state_bg = app_state.clone();
 
     thread::spawn(move || {
-        let recognizer = tnt_comput::ui::UiRecognizer::new("src/templates").expect("Failed to init recognizer");
+        let recognizer =
+            tnt_comput::ui::UiRecognizer::new("src/templates").expect("Failed to init recognizer");
         let mut prev_minimap: Option<core::Mat> = None;
         let mut last_recog_time = std::time::Instant::now();
 
-        #[cfg(target_os = "linux")]
-        let (map_path, power_path) = ("/tmp/tnt_map.ppm", "/tmp/tnt_power.ppm");
-        #[cfg(target_os = "macos")]
-        let (map_path, power_path) = ("/tmp/tnt_map.png", "/tmp/tnt_power.png");
+        // 角度多帧投票：连续 3 帧里过半才写入，消除偶发跳数字
+        let mut angle_voter = tnt_comput::detect::ValueVoter::new(3);
+
+        let (map_path, power_path) = screen::capture_paths();
 
         while r_clone.load(std::sync::atomic::Ordering::Relaxed) {
             let t0 = std::time::Instant::now();
-            
-            capture_rect_to_file(map_geo_clone, map_path);
-            
+
+            screen::capture_rect_to_file(map_geo_bg, map_path);
+
             if let Ok(m) = imgcodecs::imread(map_path, imgcodecs::IMREAD_COLOR) {
                 if !m.empty() {
                     // Background breathing dots detection
-                    if m.cols() <= 1200 && m.rows() <= 800 {
+                    if m.cols() <= 1600 && m.rows() <= 1200 {
                         if let Some(ref prev) = prev_minimap {
                             if let Ok(pts) = detect_breathing_dots(prev, &m) {
                                 if let Ok(mut lock) = shared_detected_pt_clone.lock() {
@@ -617,25 +452,35 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
                     }
                     prev_minimap = m.try_clone().ok();
 
-                    if let Ok(mut lock) = shared_map_clone.lock() { *lock = Some(m); }
+                    if let Ok(mut lock) = shared_map_clone.lock() {
+                        *lock = Some(m);
+                    }
                 }
             }
-            
-            if let Some(p_geo) = power_geo_clone {
-                capture_rect_to_file(p_geo, power_path);
-                
+
+            if let Some(p_geo) = power_geo_bg {
+                screen::capture_rect_to_file(p_geo, power_path);
+
                 if let Ok(p_mat) = imgcodecs::imread(power_path, imgcodecs::IMREAD_COLOR) {
-                    if !p_mat.empty() && p_mat.cols() <= 300 && p_mat.rows() <= 200 {
+                    // FIX: 原来的上限是 300x200，而 Retina 截图是 2 倍物理像素，
+                    // 稍大一点的选区就会让角度识别静默地永远不执行。
+                    if !p_mat.empty() && p_mat.cols() <= 1600 && p_mat.rows() <= 900 {
                         if last_recog_time.elapsed().as_millis() > 100 {
-                            if let Ok(Some(val)) = recognizer.recognize_angle_digit(&p_mat) {
-                                if let Ok(mut lock) = shared_recognized_angle_clone.lock() {
-                                    *lock = Some(val);
-                                }
-                                // Auto-sync angle if enabled
-                                if val >= 10 && val <= 90 {
-                                    if let Ok(mut m_state) = app_state_bg.lock() {
-                                        if m_state.auto_angle {
-                                            m_state.current_angle = val as f64;
+                            if let Ok((Some(val), conf)) =
+                                recognizer.recognize_angle_digit_conf(&p_mat)
+                            {
+                                if conf > 0.88 {
+                                    if let Some(stable) = angle_voter.push(val) {
+                                        if let Ok(mut lock) = shared_recognized_angle_clone.lock() {
+                                            *lock = Some(stable);
+                                        }
+                                        // Auto-sync angle if enabled
+                                        if stable >= 10 && stable <= 90 {
+                                            if let Ok(mut m_state) = app_state_bg.lock() {
+                                                if m_state.auto_angle {
+                                                    m_state.current_angle = stable as f64;
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -646,8 +491,8 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
                 }
             }
 
-            if let Ok(mut lock) = cap_time_ms_clone.lock() { 
-                *lock = t0.elapsed().as_millis(); 
+            if let Ok(mut lock) = cap_time_ms_clone.lock() {
+                *lock = t0.elapsed().as_millis();
             }
             std::thread::sleep(std::time::Duration::from_millis(40)); // 25 FPS bg capture
         }
@@ -683,7 +528,7 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
 
     loop {
         let loop_t0 = std::time::Instant::now();
-        
+
         let img = {
             let lock = shared_map.lock().unwrap();
             lock.as_ref().and_then(|m| m.try_clone().ok())
@@ -728,8 +573,6 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
                     dst_row[0..len].copy_from_slice(src_row);
                 }
             }
-
-
 
             // 【防抖抗闪内存锁】：呼吸灯熄灭的暗周期自动保持上一次坐标；同原地闪烁时微小震荡自动平滑，消除画面闪烁！
             let final_auto_p1 = if let Some(new_pt) = raw_detected_p {
@@ -1033,12 +876,7 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
         } else {
             "实机同步: 已暂停 (点击恢复)".to_string()
         };
-        let _ = draw_btn(
-            &mut canvas,
-            btn_auto_angle,
-            &pval_str,
-            st.auto_angle,
-        );
+        let _ = draw_btn(&mut canvas, btn_auto_angle, &pval_str, st.auto_angle);
 
         draw_btn(
             &mut canvas,
@@ -1214,7 +1052,7 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
         let bg_cap_ms = *cap_time_ms.lock().unwrap();
         let fps = 1000.0 / fps_t0.elapsed().as_millis().max(1) as f64;
         fps_t0 = std::time::Instant::now();
-        
+
         let perf_txt = format!("FPS:{:.0} | IO:{} Rec:{} UI:{} BG:{}", fps, t_io, t_recog, t_ui, bg_cap_ms);
         let _ = imgproc::put_text(
             &mut canvas,
