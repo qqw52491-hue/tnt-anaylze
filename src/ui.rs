@@ -24,9 +24,19 @@ pub struct RecognizerResult {
     pub wind_value: f64,
 }
 
+/// 模板匹配的判定阈值。
+///
+/// 注意：这里用的是 ZNCC（零均值归一化互相关），取值范围 -1..=1，
+/// 和旧版"未去均值的余弦相似度"完全不是一个量纲。
+/// 旧版因为像素值全为非负，任意两个数字的相似度都在 0.8 以上，
+/// 0.85 这个阈值实际上只是在卡"笔画密度"，稀疏的 3 和 7 天然吃亏。
+const SIM_MIN: f64 = 0.60;
+/// 最佳候选必须比"第二名的其他数字"高出这么多，否则视为不可信。
+const SIM_MARGIN: f64 = 0.02;
+
 pub struct UiRecognizer {
-    /// (数字, 展平的 40x40 灰度像素, 预算好的 L2 范数)
-    /// 预展平是为了让 match_digit 的热循环彻底不碰 OpenCV 的 at_2d。
+    /// (数字, 去均值后的 40x40 展平像素, 去均值后的 L2 范数)
+    /// 预展平 + 预去均值，是为了让 match_digit 的热循环彻底不碰 OpenCV 的 at_2d。
     templates: Vec<(u8, Vec<f64>, f64)>,
 }
 
@@ -51,13 +61,20 @@ impl UiRecognizer {
                 }
 
                 let mut flat = vec![0f64; 40 * 40];
-                let mut norm_sq = 0f64;
+                let mut sum = 0f64;
                 for y in 0..40 {
                     for x in 0..40 {
                         let v = *img.at_2d::<u8>(y, x)? as f64;
                         flat[(y * 40 + x) as usize] = v;
-                        norm_sq += v * v;
+                        sum += v;
                     }
+                }
+                // 去均值：这样相似度只看"形状"，不看"有多少前景像素"。
+                let mean = sum / (40.0 * 40.0);
+                let mut norm_sq = 0f64;
+                for v in flat.iter_mut() {
+                    *v -= mean;
+                    norm_sq += *v * *v;
                 }
                 templates.push((digit as u8, flat, norm_sq.sqrt()));
             }
@@ -216,6 +233,26 @@ impl UiRecognizer {
         Ok(wind_val)
     }
 
+    /// 连通域是不是一个合法的数字笔画。
+    ///
+    /// FIX: 原来是写死的 `area >= 100`。这个绝对面积门槛对 1/3/7 这种
+    /// 笔画稀疏的数字非常不友好——同样的字高，7 只有两笔、3 是三段弧，
+    /// 前景像素数可能只有 8 的一半，抗锯齿再吃掉一点就直接被丢了，
+    /// 表现就是"两位数少识别一位"。
+    /// 现在改成跟字高挂钩的相对门槛：高度已经卡住 h >= 18 了，
+    /// 噪点根本长不到这么高，面积门槛只需要排掉细长的划痕。
+    fn is_digit_component(w: i32, h: i32, area: i32) -> bool {
+        if h < 18 {
+            return false;
+        }
+        let aspect = (w as f64) / (h as f64);
+        if aspect > 3.0 {
+            return false;
+        }
+        let min_area = (((h as f64) * 1.2).max(40.0)) as i32;
+        area >= min_area
+    }
+
     pub fn binarize_and_clean(&self, roi: &core::Mat) -> opencv::Result<(core::Mat, core::Mat)> {
         const UPSCALE: i32 = 3;
 
@@ -271,9 +308,8 @@ impl UiRecognizer {
             let w = *stats.at_2d::<i32>(i, imgproc::CC_STAT_WIDTH)?;
             let h = *stats.at_2d::<i32>(i, imgproc::CC_STAT_HEIGHT)?;
             let area = *stats.at_2d::<i32>(i, imgproc::CC_STAT_AREA)?;
-            let aspect_ratio = (w as f64) / (h as f64);
 
-            if area >= 100 && h >= 18 && aspect_ratio <= 3.0 {
+            if Self::is_digit_component(w, h, area) {
                 let mut comp_mask = core::Mat::default();
                 core::compare(&labels, &Scalar::all(i as f64), &mut comp_mask, core::CMP_EQ)?;
                 final_mask.set_to(&Scalar::all(255.0), &comp_mask)?;
@@ -330,8 +366,7 @@ impl UiRecognizer {
             let w = *stats.at_2d::<i32>(i, imgproc::CC_STAT_WIDTH)?;
             let h = *stats.at_2d::<i32>(i, imgproc::CC_STAT_HEIGHT)?;
             let area = *stats.at_2d::<i32>(i, imgproc::CC_STAT_AREA)?;
-            let aspect_ratio = (w as f64) / (h as f64);
-            if area >= 100 && h >= 18 && aspect_ratio <= 3.0 {
+            if Self::is_digit_component(w, h, area) {
                 valid_rects.push(Rect::new(x, y, w, h));
             }
         }
@@ -373,10 +408,13 @@ impl UiRecognizer {
         let mut max_y = 0i32;
         let mut has_fg = false;
 
+        // FIX: 前景判定从 >50 降到 >30，与 binarize_and_clean 里 Otsu 的
+        // 兜底阈值保持一致。原来 3 和 7 的细笔画末端（tophat 响应本来就弱）
+        // 会被排除在外接框之外，导致居中和缩放都偏掉。
         for y in 0..rows {
             for x in 0..cols {
                 let val = *src.at_2d::<u8>(y, x)?;
-                if val > 50 {
+                if val > 30 {
                     if x < min_x { min_x = x; }
                     if x > max_x { max_x = x; }
                     if y < min_y { min_y = y; }
@@ -418,66 +456,97 @@ impl UiRecognizer {
         Ok(canvas)
     }
 
-    /// 模板匹配单个数字，返回 (数字, 相似度)。
+    /// 模板匹配单个数字，返回 (数字, ZNCC 相似度)。
     ///
-    /// PERF: 模板已在 new() 里预展平成 Vec<f64> 并预算好范数，
-    /// 这里的热循环完全不碰 OpenCV 的 at_2d（原来每帧 25 * 1600 * N 次 FFI 调用）。
-    /// 另外 to_template_40 已经按外接框居中过了，±2 的平移搜索是多余的，降到 ±1。
-    /// 两项合计约 15~20 倍提速。
+    /// FIX（3/7 漏识别的主因）：旧版算的是"未去均值的余弦相似度"。
+    /// 因为灰度像素恒为非负，这个量对任意两张图都偏高，而且严重依赖
+    /// 前景像素的多少：稀疏的目标（3、7）跟稠密的模板（8、0）比，
+    /// 分子只算重叠、分母却是全图范数，分数被系统性压低，
+    /// 于是同一个 0.85 阈值对 8 很宽松、对 7 几乎不可能通过。
+    /// 改成 ZNCC（先减各自均值）后，相似度只反映形状，笔画密度不再影响判定。
+    ///
+    /// PERF: 模板已在 new() 里预展平并预去均值，热循环完全不碰 at_2d。
+    /// to_template_40 已按外接框居中，平移搜索保持 ±1。
     fn match_digit(&self, target: &core::Mat) -> opencv::Result<(Option<u8>, f64)> {
         if self.templates.is_empty() {
             return Ok((None, 0.0));
         }
 
-        let mut tgt = vec![0f64; 40 * 40];
+        let mut raw = vec![0f64; 40 * 40];
         for y in 0..40 {
             for x in 0..40 {
-                tgt[(y * 40 + x) as usize] = *target.at_2d::<u8>(y, x)? as f64;
+                raw[(y * 40 + x) as usize] = *target.at_2d::<u8>(y, x)? as f64;
             }
         }
 
-        let mut max_sim = -1.0f64;
-        let mut best_digit = None;
+        // 每个数字各自的最佳得分，便于后面算"和第二名的差距"。
+        let mut per_digit = [-2.0f64; 10];
+        let mut shifted = vec![0f64; 40 * 40];
 
-        for (digit, tmpl, tmpl_norm) in &self.templates {
-            if *tmpl_norm <= 0.0 {
-                continue;
-            }
-            for dy in -1i32..=1 {
-                for dx in -1i32..=1 {
-                    let mut dot_product = 0.0f64;
-                    let mut norm_tgt = 0.0f64;
-
-                    for y in 0..40i32 {
-                        for x in 0..40i32 {
-                            let sy = y + dy;
-                            let sx = x + dx;
-                            let v_tgt = if sx >= 0 && sx < 40 && sy >= 0 && sy < 40 {
-                                tgt[(sy * 40 + sx) as usize]
-                            } else {
-                                0.0
-                            };
-                            let v_tmpl = tmpl[(y * 40 + x) as usize];
-                            dot_product += v_tgt * v_tmpl;
-                            norm_tgt += v_tgt * v_tgt;
-                        }
+        for dy in -1i32..=1 {
+            for dx in -1i32..=1 {
+                let mut sum = 0f64;
+                for y in 0..40i32 {
+                    for x in 0..40i32 {
+                        let sy = y + dy;
+                        let sx = x + dx;
+                        let v = if sx >= 0 && sx < 40 && sy >= 0 && sy < 40 {
+                            raw[(sy * 40 + sx) as usize]
+                        } else {
+                            0.0
+                        };
+                        shifted[(y * 40 + x) as usize] = v;
+                        sum += v;
                     }
+                }
 
-                    if norm_tgt > 0.0 {
-                        let sim = dot_product / (norm_tgt.sqrt() * tmpl_norm);
-                        if sim > max_sim {
-                            max_sim = sim;
-                            best_digit = Some(*digit);
-                        }
+                let mean = sum / (40.0 * 40.0);
+                let mut norm_sq = 0f64;
+                for v in shifted.iter_mut() {
+                    *v -= mean;
+                    norm_sq += *v * *v;
+                }
+                let norm = norm_sq.sqrt();
+                if norm <= 1e-6 {
+                    continue; // 全空白
+                }
+
+                for (digit, tmpl, tmpl_norm) in &self.templates {
+                    if *tmpl_norm <= 1e-6 {
+                        continue;
+                    }
+                    let mut dot = 0f64;
+                    for i in 0..(40 * 40) {
+                        dot += shifted[i] * tmpl[i];
+                    }
+                    let sim = dot / (norm * tmpl_norm);
+                    let slot = &mut per_digit[*digit as usize];
+                    if sim > *slot {
+                        *slot = sim;
                     }
                 }
             }
         }
 
-        if max_sim > 0.85 {
-            Ok((best_digit, max_sim))
+        let mut best_idx = 0usize;
+        let mut best_sim = -2.0f64;
+        for (i, v) in per_digit.iter().enumerate() {
+            if *v > best_sim {
+                best_sim = *v;
+                best_idx = i;
+            }
+        }
+        let mut second_sim = -2.0f64;
+        for (i, v) in per_digit.iter().enumerate() {
+            if i != best_idx && *v > second_sim {
+                second_sim = *v;
+            }
+        }
+
+        if best_sim >= SIM_MIN && (best_sim - second_sim) >= SIM_MARGIN {
+            Ok((Some(best_idx as u8), best_sim))
         } else {
-            Ok((None, max_sim.max(0.0)))
+            Ok((None, best_sim.max(0.0)))
         }
     }
 
@@ -489,34 +558,52 @@ impl UiRecognizer {
         let (mask, gray) = self.binarize_and_clean(angle_roi)?;
         let digit_mats = self.extract_individual_digits(&mask, &gray, 1.55)?;
 
-        let mut digits: Vec<u8> = Vec::new();
+        if digit_mats.is_empty() {
+            return Ok((None, 0.0));
+        }
+
+        // FIX: 角度最多两位。切出 3 块以上说明分割本身就错了（噪点或过分割），
+        // 旧版是 truncate(2) 硬取前两块，等于用错误的碎片拼一个看似合法的角度。
+        if digit_mats.len() > 2 {
+            return Ok((None, 0.0));
+        }
+
+        let expected = digit_mats.len();
+        let mut digits: Vec<u8> = Vec::with_capacity(expected);
         let mut conf_sum = 0.0f64;
+        let mut worst_conf = 1.0f64;
 
         for mat in digit_mats {
             let tmpl40 = self.to_template_40(&mat)?;
             let (d, c) = self.match_digit(&tmpl40)?;
-            if let Some(d) = d {
-                digits.push(d);
-                conf_sum += c;
+            match d {
+                Some(d) => {
+                    digits.push(d);
+                    conf_sum += c;
+                    if c < worst_conf {
+                        worst_conf = c;
+                    }
+                }
+                None => {
+                    // FIX（"少识别一个数字"的直接原因）：旧版是 `if let Some(d)`，
+                    // 匹配失败的那一位被静默跳过，剩下一位照样拼成角度返回。
+                    // 73 里的 3 没匹配上就返回 7，而 7 落在 0..=90 内，
+                    // 范围校验也拦不住，结果就是一个"看起来正常"的错误角度。
+                    // 现在只要有一位没认出来，整帧作废，交给上层沿用上一帧。
+                    return Ok((None, c));
+                }
             }
         }
-
-        if digits.is_empty() {
-            return Ok((None, 0.0));
-        }
-
-        // FIX: 原来任意数量的碎块都会被依次拼成一个数（3 个碎块 -> 三位数照样返回）。
-        // 角度最多两位。
-        digits.truncate(2);
 
         let val = digits.iter().fold(0i32, |acc, &d| acc * 10 + d as i32);
         let conf = conf_sum / digits.len() as f64;
 
-        // FIX: 角度物理上只可能落在 0..=90，超出就是识别错了，宁可返回 None。
+        // 角度物理上只可能落在 0..=90，超出就是识别错了，宁可返回 None。
         if !(0..=90).contains(&val) {
             return Ok((None, conf));
         }
-        Ok((Some(val), conf))
+        // 置信度取所有位里最低的那一位，避免"一位很准 + 一位勉强"被平均掩盖。
+        Ok((Some(val), worst_conf))
     }
 
     /// 角度识别 (兼容旧签名)
