@@ -28,9 +28,12 @@ pub struct RecognizerResult {
 const SIM_MIN: f64 = 0.58;
 /// 最佳候选需要领先"第二名的其他数字"的幅度。
 ///
-/// 卡得太死会适得其反：3↔、8、9 和 7↔1、9 在 ZNCC 下本来就很像，
+/// 卡得太死会适得其反：3、8、9 和 7、1、9 在 ZNCC 下本来就很像，
 /// 一帧稍糊就可能是 0.63 vs 0.62——冠军是对的，却因为领先不够被否决。
 const SIM_MARGIN: f64 = 0.005;
+
+/// 角度上限。反抛物线可以打过头顶，屏幕上会显示 91..=180。
+const ANGLE_MAX: i32 = 180;
 
 pub struct UiRecognizer {
     /// (数字, 去均值后的 40x40 展平像素, 去均值后的 L2 范数)
@@ -41,81 +44,6 @@ pub struct UiRecognizer {
 }
 
 impl UiRecognizer {
-    /// 剔除孤立小白点，只保留成规模的笔画。
-    ///
-    /// FIX（3 漏识别的真正原因）：模板库里仅有的两张 3，数字上方都粘了
-    /// 一个裁剪残留的白点。to_template_40 算外接框时把白点一起框进去，
-    /// 导致这两张模板里的 3 被压扁、下移、整体缩小——存的根本不是
-    /// "一个 3 的标准形状"，而是"一个 3 加一块空白"。拿真实的 3 去比永远对不齐，
-    /// 而 3 总共就这两张模板，两张全坏 = 3 等于没有可用模板。
-    ///
-    /// 保留面积 ≥ 最大连通域 20% 的块，而不是只留最大的一块：
-    /// 经过开运算后的 3 有可能断成上下两段弧，只留最大块会把它拆残。
-    /// 真正的裁剪杂点只有几个像素，远在这个比例之下。
-    fn strip_specks(src: &core::Mat) -> opencv::Result<core::Mat> {
-        if src.empty() || src.channels() != 1 {
-            return src.try_clone();
-        }
-
-        let mut bin = core::Mat::default();
-        imgproc::threshold(src, &mut bin, 30.0, 255.0, imgproc::THRESH_BINARY)?;
-
-        let mut labels = core::Mat::default();
-        let mut stats = core::Mat::default();
-        let mut centroids = core::Mat::default();
-        let n = imgproc::connected_components_with_stats(
-            &bin,
-            &mut labels,
-            &mut stats,
-            &mut centroids,
-            8,
-            core::CV_32S,
-        )?;
-
-        // 0 是背景，n <= 2 说明只有一块前景，没什么可剔的。
-        if n <= 2 {
-            return src.try_clone();
-        }
-
-        let mut max_area = 0i32;
-        for i in 1..n {
-            let a = *stats.at_2d::<i32>(i, imgproc::CC_STAT_AREA)?;
-            if a > max_area {
-                max_area = a;
-            }
-        }
-        // 整张图本来就没什么东西，不敲。
-        if max_area < 30 {
-            return src.try_clone();
-        }
-
-        let keep_min = ((((max_area as f64) * 0.20).ceil()) as i32).max(15);
-
-        let mut keep = core::Mat::new_rows_cols_with_default(
-            src.rows(),
-            src.cols(),
-            core::CV_8UC1,
-            Scalar::all(0.0),
-        )?;
-        for i in 1..n {
-            let a = *stats.at_2d::<i32>(i, imgproc::CC_STAT_AREA)?;
-            if a >= keep_min {
-                let mut cm = core::Mat::default();
-                core::compare(&labels, &Scalar::all(i as f64), &mut cm, core::CMP_EQ)?;
-                keep.set_to(&Scalar::all(255.0), &cm)?;
-            }
-        }
-
-        let mut out = core::Mat::new_rows_cols_with_default(
-            src.rows(),
-            src.cols(),
-            core::CV_8UC1,
-            Scalar::all(0.0),
-        )?;
-        src.copy_to_masked(&mut out, &keep)?;
-        Ok(out)
-    }
-
     /// 把一张 40x40 灰度图展平并去均值，返回 (展平像素, L2 范数)。
     fn flatten_centered(img: &core::Mat) -> opencv::Result<(Vec<f64>, f64)> {
         let mut flat = vec![0f64; 40 * 40];
@@ -157,19 +85,15 @@ impl UiRecognizer {
                 let Some(first_char) = fname.chars().next() else { continue };
                 let Some(digit) = first_char.to_digit(10) else { continue };
 
-                let raw = imgcodecs::imread(path.to_str().unwrap(), imgcodecs::IMREAD_GRAYSCALE)?;
+                let img = imgcodecs::imread(path.to_str().unwrap(), imgcodecs::IMREAD_GRAYSCALE)?;
                 // 模板必须是 40x40，否则展平就对不上了
-                if raw.empty() || raw.rows() != 40 || raw.cols() != 40 {
+                if img.empty() || img.rows() != 40 || img.cols() != 40 {
                     continue;
                 }
 
-                // 模板自身也可能带着采集时的裁剪杂点（你这两张 3 就是），
-                // 先洗一遍再入库，不需要重新采集。
-                let img = Self::strip_specks(&raw)?;
-
                 // 每张模板额外生成一张变细、一张变粗的。
                 // 同一个数字在画面里会因为抗锯齿、UPSCALE=3 插值、tophat 响应强弱
-                // 而笔画胖一圈或痦一圈，这正是样本少的数字盖不住的维度。
+                // 而笔画胖一圈或瘦一圈，这正是样本少的数字盖不住的维度。
                 let mut thin = core::Mat::default();
                 imgproc::erode(
                     &img,
@@ -528,20 +452,15 @@ impl UiRecognizer {
             return core::Mat::new_rows_cols_with_default(40, 40, core::CV_8UC1, Scalar::all(0.0));
         }
 
-        // FIX: 先剔掉孤立白点再算外接框。只要数字旁边粘一个几像素的杂点，
-        // 外接框就会被撑大，数字被连带缩小并偏移，归一化完全失效。
-        // 这同时修了两件事：实时帧里的杂点，以及用本函数新采集的模板不再被污染。
-        let cleaned_src = Self::strip_specks(src)?;
-        let src = &cleaned_src;
-
         let mut min_x = cols;
         let mut max_x = 0i32;
         let mut min_y = rows;
         let mut max_y = 0i32;
         let mut has_fg = false;
 
-        // 前景判定用 >30，与 binarize_and_clean 里 Otsu 的兜底阈值一致。
-        // 3 和 7 的细笔画末端（tophat 响应本来就弱）不会被排除在外接框之外。
+        // FIX: 前景判定从 >50 降到 >30，与 binarize_and_clean 里 Otsu 的兜底阈值一致。
+        // 原来 3 和 7 的细笔画末端（tophat 响应本来就弱）会被排除在外接框之外，
+        // 导致居中和缩放都偏掉。
         for y in 0..rows {
             for x in 0..cols {
                 let val = *src.at_2d::<u8>(y, x)?;
@@ -711,6 +630,10 @@ impl UiRecognizer {
     }
 
     /// 角度识别 (基于模板匹配)，返回 (角度, 最低一位的置信度)。
+    ///
+    /// 屏幕上的角度可以到三位数：反抛物线往身后打时会显示 91..=180。
+    /// 这里统一折回 0..=90 再交给上层，102 -> 78、109 -> 71，
+    /// 这样 tnt.rs / physics.rs 的角度上限不用动。
     pub fn recognize_angle_digit_conf(
         &self,
         angle_roi: &core::Mat,
@@ -722,8 +645,8 @@ impl UiRecognizer {
             return Ok((None, 0.0));
         }
 
-        // 角度最多两位。切出 3 块以上说明分割本身就错了（噪点或过分割）。
-        if digit_mats.len() > 2 {
+        // 角度最多三位。切出 4 块以上说明分割本身就错了（噪点或过分割）。
+        if digit_mats.len() > 3 {
             return Ok((None, 0.0));
         }
 
@@ -738,7 +661,7 @@ impl UiRecognizer {
             if best_sim < SIM_MIN || (best_sim - second_sim) < SIM_MARGIN {
                 // 只要有一位没认出来，整帧作废，交给上层沿用上一帧。
                 // 旧版是静默跳过这一位，剩下一位照样拼成角度返回，
-                // 73 会变成 7 且能通过 0..=90 校验，变成一个"看起来正常"的错角度。
+                // 73 会变成 7 且能通过范围校验，变成一个"看起来正常"的错角度。
                 if self.dump_fail {
                     self.dump_failure(&tmpl40, &per_digit);
                 }
@@ -751,12 +674,22 @@ impl UiRecognizer {
             }
         }
 
-        let val = digits.iter().fold(0i32, |acc, &d| acc * 10 + d as i32);
-
-        // 角度物理上只可能落在 0..=90，超出就是识别错了，宁可返回 None。
-        if !(0..=90).contains(&val) {
+        // 三位数只可能是 1xx（角度封顶 180），首位不是 1 就是把两位数过分割了。
+        // 放开位数限制之后，这条是挡住 92 被切成 9/2/杂点读成 923 的主要防线。
+        if digits.len() == 3 && digits[0] != 1 {
             return Ok((None, worst_conf));
         }
+
+        let val = digits.iter().fold(0i32, |acc, &d| acc * 10 + d as i32);
+
+        // 超出 0..=180 就是识别错了，宁可返回 None。
+        if !(0..=ANGLE_MAX).contains(&val) {
+            return Ok((None, worst_conf));
+        }
+
+        // 反抛物线折返：屏幕显示 95 -> 实际按 85 算，102 -> 78。
+        let val = if val > 90 { ANGLE_MAX - val } else { val };
+
         // 置信度取所有位里最低的那一位，避免"一位很准 + 一位勉强"被平均掩盖。
         Ok((Some(val), worst_conf))
     }
