@@ -11,6 +11,8 @@ enum EditMode {
     E1,
     DrawRuler1,
     DrawRuler2,
+    AngleBox1,
+    AngleBox2,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -19,6 +21,7 @@ struct AppState {
     manual_p1: Option<core::Point>,
     manual_e1: Option<core::Point>,
     manual_cam_rect: Option<core::Rect>,
+    manual_angle_rect: Option<core::Rect>,
     drag_start: Option<core::Point>,
     current_angle: f64,
     wind: f64,
@@ -287,25 +290,53 @@ fn is_inside(x: i32, y: i32, rect: core::Rect) -> bool {
     x >= rect.x && x <= rect.x + rect.width && y >= rect.y && y <= rect.y + rect.height
 }
 
-#[cfg(target_os = "linux")]
-fn get_slurp_geometry() -> Option<(i32, i32, i32, i32)> {
-    let output = Command::new("slurp").output().ok()?;
-    let geo_str = String::from_utf8(output.stdout).ok()?;
-    let parts: Vec<&str> = geo_str.trim().split_whitespace().collect();
-    if parts.len() == 2 {
-        let xy: Vec<i32> = parts[0].split(',').filter_map(|s| s.parse().ok()).collect();
-        let wh: Vec<i32> = parts[1].split('x').filter_map(|s| s.parse().ok()).collect();
-        if xy.len() == 2 && wh.len() == 2 {
-            return Some((xy[0], xy[1], wh[0], wh[1]));
-        }
+/// 用户交互式框选截图后，通过全屏截图 + 模板匹配反推出实际的屏幕坐标
+fn find_screen_position(crop_img: &core::Mat) -> Option<(i32, i32, i32, i32)> {
+    let full_path = "/tmp/tnt_full_screen.png";
+    // 静默全屏截图
+    #[cfg(target_os = "macos")]
+    let _ = Command::new("screencapture").arg("-x").arg(full_path).status();
+    #[cfg(target_os = "linux")]
+    let _ = Command::new("sh").arg("-c").arg(format!("grim {}", full_path)).status();
+
+    let full_img = imgcodecs::imread(full_path, imgcodecs::IMREAD_COLOR).ok()?;
+    if full_img.empty() || crop_img.cols() > full_img.cols() || crop_img.rows() > full_img.rows() {
+        return None;
     }
-    None
+
+    let mut match_result = core::Mat::default();
+    imgproc::match_template(&full_img, crop_img, &mut match_result, imgproc::TM_CCOEFF_NORMED, &core::no_array()).ok()?;
+    let mut max_val = 0.0;
+    let mut max_loc = core::Point::new(0, 0);
+    core::min_max_loc(&match_result, None, Some(&mut max_val), None, Some(&mut max_loc), &core::no_array()).ok()?;
+
+    if max_val > 0.5 {
+        println!("✅ 模板匹配成功 (score={:.2})，屏幕坐标: ({},{}) {}x{}", max_val, max_loc.x, max_loc.y, crop_img.cols(), crop_img.rows());
+        Some((max_loc.x, max_loc.y, crop_img.cols(), crop_img.rows()))
+    } else {
+        println!("⚠️  模板匹配得分过低 ({:.2})，使用 (0,0) 作为默认坐标", max_val);
+        None
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn select_crop_interactive(path: &str) -> bool {
+    Command::new("sh")
+        .arg("-c")
+        .arg(format!("grim -g \"$(slurp)\" {}", path))
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 #[cfg(target_os = "macos")]
-fn get_slurp_geometry() -> Option<(i32, i32, i32, i32)> {
-    println!("🍎 正在 Mac 系统运行: 暂未对接 Mac 原生选区，使用默认区域...");
-    Some((0, 0, 800, 600))
+fn select_crop_interactive(path: &str) -> bool {
+    Command::new("screencapture")
+        .arg("-i")
+        .arg(path)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 #[cfg(target_os = "linux")]
@@ -326,32 +357,48 @@ fn capture_rect_to_file(geo: (i32, i32, i32, i32), path: &str) {
 
 fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
     #[cfg(target_os = "macos")]
-    println!("=== 🍎 Mac OS 环境检测成功，已自动切换底层抓图引擎 ===");
+    println!("=== 🍎 Mac OS 环境检测成功，已自动切换原生 screencapture 截图引擎 ===");
 
-    println!("👉 [步骤 1/2] 请在屏幕上框选【左上角小地图】区域...");
-    let map_geo = get_slurp_geometry().unwrap_or((0, 0, 800, 600));
-    let t_w = map_geo.2;
-    let t_h = map_geo.3;
+    println!("👉 [步骤 1/3] 请在屏幕上框选【左上角小地图】区域...");
+    let map_crop_path = "/tmp/tnt_selected_map.png";
+    select_crop_interactive(map_crop_path);
 
-    println!("👉 [步骤 2/2] 请在屏幕上框选【右下角/角度/力度/数值】区域...");
-    let power_geo = get_slurp_geometry();
+    let initial_img = match imgcodecs::imread(map_crop_path, imgcodecs::IMREAD_COLOR) {
+        Ok(m) if !m.empty() => m,
+        _ => {
+            println!("❌ 抓取【小地图】区域失败或取消！");
+            return Ok(());
+        }
+    };
+    let t_w = initial_img.cols();
+    let t_h = initial_img.rows();
+    // 通过模板匹配反推屏幕坐标，回退到 (0,0)
+    let map_geo = find_screen_position(&initial_img).unwrap_or((0, 0, t_w, t_h));
+    println!("📍 小地图屏幕区域: ({},{}) {}x{}", map_geo.0, map_geo.1, map_geo.2, map_geo.3);
+
+    println!("👉 [步骤 2/3] 请在屏幕上框选【右下角/角度/力度/数值】区域...");
     let power_crop_path = "/tmp/tnt_selected_power.png";
-    if let Some((x, y, w, h)) = power_geo {
-        let _ = Command::new("sh")
-            .arg("-c")
-            .arg(format!(
-                "grim -g \"{},{} {}x{}\" {}",
-                x, y, w, h, power_crop_path
-            ))
-            .status();
-    } else {
-        #[cfg(target_os = "linux")]
-        let _ = Command::new("sh")
-            .arg("-c")
-            .arg("grim -g \"$(slurp)\" /tmp/tnt_selected_power.png")
-            .status();
+    select_crop_interactive(power_crop_path);
+
+    let power_img = imgcodecs::imread(power_crop_path, imgcodecs::IMREAD_COLOR)
+        .ok()
+        .filter(|m| !m.empty());
+    let power_geo = power_img.as_ref().and_then(|img| find_screen_position(img));
+    if let Some(pg) = power_geo {
+        println!("📍 数值区域屏幕坐标: ({},{}) {}x{}", pg.0, pg.1, pg.2, pg.3);
     }
 
+    println!("👉 [步骤 3/3] 请在屏幕上框选【顶部/风力/风速】区域...");
+    let wind_crop_path = "/tmp/tnt_selected_wind.png";
+    select_crop_interactive(wind_crop_path);
+
+    let wind_img = imgcodecs::imread(wind_crop_path, imgcodecs::IMREAD_COLOR)
+        .ok()
+        .filter(|m| !m.empty());
+    let wind_geo = wind_img.as_ref().and_then(|img| find_screen_position(img));
+    if let Some(wg) = wind_geo {
+        println!("📍 风力区域屏幕坐标: ({},{}) {}x{}", wg.0, wg.1, wg.2, wg.3);
+    }
 
 
     let window_name = "TNT Assistant HUD";
@@ -362,6 +409,7 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
         manual_p1: None,
         manual_e1: None,
         manual_cam_rect: None,
+        manual_angle_rect: None,
         drag_start: None,
         current_angle: 45.0,
         wind: 0.0,
@@ -378,6 +426,7 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
 
     let btn_p1 = core::Rect::new(map_w_display + 20, 30, 110, 40);
     let btn_e1 = core::Rect::new(map_w_display + 140, 30, 110, 40);
+    let btn_angle_crop = core::Rect::new(map_w_display + 260, 30, 110, 40);
 
     let btn_lock_ruler = core::Rect::new(map_w_display + 20, 80, 230, 40);
     let btn_draw_ruler = core::Rect::new(map_w_display + 20, 130, 230, 35);
@@ -458,10 +507,17 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
                     st.auto_detect = !st.auto_detect;
                 } else if is_inside(x, y, btn_lock_map) {
                     st.map_locked = !st.map_locked;
+                } else if is_inside(x, y, btn_angle_crop) {
+                    st.edit_mode = if st.edit_mode == EditMode::AngleBox1 || st.edit_mode == EditMode::AngleBox2 {
+                        EditMode::None
+                    } else {
+                        EditMode::AngleBox1
+                    };
                 } else if is_inside(x, y, btn_clear) {
                     st.manual_p1 = None;
                     st.manual_e1 = None;
                     st.manual_cam_rect = None; // Also clear manual rect!
+                    st.manual_angle_rect = None;
                     st.edit_mode = EditMode::None;
                     st.locked_px_per_unit = None; // Reset lock too
                 } else if is_inside(x, y, btn_a20) {
@@ -547,6 +603,26 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
                             // Auto-lock the ruler with the newly drawn box (0.0 triggers evaluation in drawing loop)
                             st.locked_px_per_unit = Some(0.0);
                         }
+                        EditMode::AngleBox1 => {
+                            st.drag_start = Some(pt);
+                            st.edit_mode = EditMode::AngleBox2;
+                        }
+                        EditMode::AngleBox2 => {
+                            if let Some(start) = st.drag_start {
+                                let min_x = start.x.min(pt.x);
+                                let max_x = start.x.max(pt.x);
+                                let min_y = start.y.min(pt.y);
+                                let max_y = start.y.max(pt.y);
+                                st.manual_angle_rect = Some(core::Rect::new(
+                                    (min_x as f64 / scale) as i32,
+                                    (min_y as f64 / scale) as i32,
+                                    ((max_x - min_x) as f64 / scale) as i32,
+                                    ((max_y - min_y) as f64 / scale) as i32,
+                                ));
+                            }
+                            st.drag_start = None;
+                            st.edit_mode = EditMode::None;
+                        }
                         _ => {}
                     }
                 }
@@ -559,6 +635,19 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
                         let max_y = start.y.max(y);
                         // Store in original minimap coordinates to show live preview
                         st.manual_cam_rect = Some(core::Rect::new(
+                            (min_x as f64 / scale) as i32,
+                            (min_y as f64 / scale) as i32,
+                            ((max_x - min_x) as f64 / scale) as i32,
+                            ((max_y - min_y) as f64 / scale) as i32,
+                        ));
+                    }
+                } else if st.edit_mode == EditMode::AngleBox2 {
+                    if let Some(start) = st.drag_start {
+                        let min_x = start.x.min(x);
+                        let max_x = start.x.max(x);
+                        let min_y = start.y.min(y);
+                        let max_y = start.y.max(y);
+                        st.manual_angle_rect = Some(core::Rect::new(
                             (min_x as f64 / scale) as i32,
                             (min_y as f64 / scale) as i32,
                             ((max_x - min_x) as f64 / scale) as i32,
@@ -578,6 +667,7 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
 
     let map_geo_clone = map_geo.clone();
     let power_geo_clone = power_geo.clone();
+    let wind_geo_clone = wind_geo.clone();
 
     let shared_map = Arc::new(std::sync::Mutex::new(None::<core::Mat>));
     let shared_map_clone = shared_map.clone();
@@ -592,11 +682,13 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
         let recognizer = tnt_comput::ui::UiRecognizer::new("src/templates").expect("Failed to init recognizer");
         let mut prev_minimap: Option<core::Mat> = None;
         let mut last_recog_time = std::time::Instant::now();
+        let mut last_ocr_time = std::time::Instant::now();
+        let mut wind_buffer: std::collections::VecDeque<core::Mat> = std::collections::VecDeque::new();
 
         #[cfg(target_os = "linux")]
-        let (map_path, power_path) = ("/tmp/tnt_map.ppm", "/tmp/tnt_power.ppm");
+        let (map_path, power_path, wind_path) = ("/tmp/tnt_map.ppm", "/tmp/tnt_power.ppm", "/tmp/tnt_wind.ppm");
         #[cfg(target_os = "macos")]
-        let (map_path, power_path) = ("/tmp/tnt_map.png", "/tmp/tnt_power.png");
+        let (map_path, power_path, wind_path) = ("/tmp/tnt_map.png", "/tmp/tnt_power.png", "/tmp/tnt_wind.png");
 
         while r_clone.load(std::sync::atomic::Ordering::Relaxed) {
             let t0 = std::time::Instant::now();
@@ -641,6 +733,52 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
                                 }
                             }
                             last_recog_time = std::time::Instant::now();
+                        }
+                    }
+                }
+            }
+
+            if let Some(w_geo) = wind_geo_clone {
+                capture_rect_to_file(w_geo, wind_path);
+                if let Ok(w_mat) = imgcodecs::imread(wind_path, imgcodecs::IMREAD_COLOR) {
+                    if !w_mat.empty() && w_mat.cols() <= 300 && w_mat.rows() <= 200 {
+                        // Temporal Min-Pooling logic
+                        wind_buffer.push_back(w_mat);
+                        if wind_buffer.len() > 15 {
+                            wind_buffer.pop_front();
+                        }
+
+                        if wind_buffer.len() > 0 {
+                            let mut min_mat = wind_buffer[0].try_clone().unwrap();
+                            for m in wind_buffer.iter().skip(1) {
+                                let mut temp = core::Mat::default();
+                                let _ = core::min(&min_mat, m, &mut temp);
+                                min_mat = temp;
+                            }
+                            let clean_path = "/tmp/tnt_wind_clean.png";
+                            let _ = imgcodecs::imwrite(clean_path, &min_mat, &core::Vector::new());
+
+                            // Periodically run OCR on the clean image (Option B placeholder!)
+                            if last_ocr_time.elapsed().as_millis() > 500 {
+                                if let Ok(out) = std::process::Command::new("./mac_ocr").arg(clean_path).output() {
+                                    if let Ok(s) = String::from_utf8(out.stdout) {
+                                        let text = s.trim();
+                                        if !text.is_empty() {
+                                            // Handle OCR quirks like 'B.4' -> '8.4'
+                                            let text = text.replace("B", "8").replace("b", "8").replace("O", "0").replace("o", "0");
+                                            if let Ok(w_val) = text.parse::<f64>() {
+                                                if let Ok(mut m_state) = app_state_bg.lock() {
+                                                    // Validate sanity
+                                                    if w_val >= 0.0 && w_val <= 20.0 {
+                                                        m_state.wind = w_val;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                last_ocr_time = std::time::Instant::now();
+                            }
                         }
                     }
                 }
@@ -698,7 +836,7 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
         let t_recog = t1.elapsed().as_millis();
         let t2 = std::time::Instant::now();
 
-        let canvas_w = map_w_display + 270;
+        let canvas_w = map_w_display + 310;
         let canvas_h_target = ((t_h as f64 * scale) as i32).max(580);
         let mut canvas = core::Mat::new_rows_cols_with_default(
             canvas_h_target,
@@ -907,7 +1045,7 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
                 // Draw a beautiful background box for the force recommendation
                 imgproc::rectangle(
                     &mut canvas,
-                    core::Rect::new(map_w_display + 10, y_offset - 35, 260, 80),
+                    core::Rect::new(map_w_display + 10, y_offset - 35, 300, 80),
                     core::Scalar::new(0.0, 50.0, 0.0, 0.0),
                     -1,
                     imgproc::LINE_8,
@@ -916,7 +1054,7 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
                 .unwrap();
                 imgproc::rectangle(
                     &mut canvas,
-                    core::Rect::new(map_w_display + 10, y_offset - 35, 260, 80),
+                    core::Rect::new(map_w_display + 10, y_offset - 35, 300, 80),
                     core::Scalar::new(0.0, 255.0, 0.0, 0.0),
                     2,
                     imgproc::LINE_8,
@@ -949,16 +1087,16 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
                 );
 
                 let res_txt = if st.is_fixed_angle {
-                    format!("锁定角度: {:.0}°   力度: {:.1}", final_angle, force)
+                    format!("锁定: {:.0}° 力度: {:.1} 2/3: {:.1}", final_angle, force, force * 2.0 / 3.0)
                 } else {
-                    format!("推荐角度: {:.0}°   力度: {:.1}", final_angle, force)
+                    format!("推荐: {:.0}° 力度: {:.1} 2/3: {:.1}", final_angle, force, force * 2.0 / 3.0)
                 };
                 let _ = imgproc::put_text(
                     &mut canvas,
                     &res_txt,
                     core::Point::new(map_w_display + 15, y_offset + 15),
                     imgproc::FONT_HERSHEY_SIMPLEX,
-                    0.6,
+                    0.55,
                     core::Scalar::new(0.0, 255.0, 0.0, 0.0),
                     2,
                     imgproc::LINE_AA,
@@ -1052,8 +1190,14 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
             "敌方 (Enemy)",
             st.edit_mode == EditMode::E1,
         )?;
+        draw_btn(
+            &mut canvas,
+            btn_angle_crop,
+            "框选角度",
+            st.edit_mode == EditMode::AngleBox1 || st.edit_mode == EditMode::AngleBox2,
+        )?;
 
-        let lock_lbl = if st.locked_px_per_unit.is_some() {
+        let lock_label = if st.locked_px_per_unit.is_some() {
             "[已锁定] 解锁尺子"
         } else {
             "[未锁定] 锁定距离尺"
@@ -1061,7 +1205,7 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
         draw_btn(
             &mut canvas,
             btn_lock_ruler,
-            lock_lbl,
+            lock_label,
             st.locked_px_per_unit.is_some(),
         )?;
 
@@ -1262,12 +1406,12 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
         } else if key == 8 || key == 127 {
             // Backspace
             wind_input_buf.pop();
-        } else if key == '1' as i32 {
-            // 快捷键 1: 切换我方标注模式 (EditMode::P1)
+        } else if key == 'z' as i32 || key == 'Z' as i32 {
+            // 快捷键 Z: 切换我方标注模式 (EditMode::P1)
             let mut st = app_state.lock().unwrap();
             st.edit_mode = if st.edit_mode == EditMode::P1 { EditMode::None } else { EditMode::P1 };
-        } else if key == '2' as i32 {
-            // 快捷键 2: 切换敌方标注模式 (EditMode::E1)
+        } else if key == 'x' as i32 || key == 'X' as i32 {
+            // 快捷键 X: 切换敌方标注模式 (EditMode::E1)
             let mut st = app_state.lock().unwrap();
             st.edit_mode = if st.edit_mode == EditMode::E1 { EditMode::None } else { EditMode::E1 };
         } else if key == 'c' as i32 || key == 'C' as i32 {

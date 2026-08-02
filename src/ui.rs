@@ -203,7 +203,7 @@ impl UiRecognizer {
         Ok(wind_val)
     }
 
-    fn binarize_and_clean(&self, roi: &core::Mat) -> opencv::Result<(core::Mat, core::Mat)> {
+    pub fn binarize_and_clean(&self, roi: &core::Mat) -> opencv::Result<(core::Mat, core::Mat)> {
         const UPSCALE: i32 = 3;
         
         let gray = if roi.channels() == 3 {
@@ -304,7 +304,7 @@ impl UiRecognizer {
         Ok(cuts.windows(2).filter(|w| w[1] - w[0] >= 3).map(|w| Rect::new(r.x + w[0], r.y, w[1] - w[0], r.height)).collect())
     }
 
-    fn extract_individual_digits(&self, mask: &core::Mat, gray: &core::Mat, split_ratio: f64) -> opencv::Result<Vec<core::Mat>> {
+    pub fn extract_individual_digits(&self, mask: &core::Mat, gray: &core::Mat, split_ratio: f64) -> opencv::Result<Vec<core::Mat>> {
         let mut labels = core::Mat::default();
         let mut stats = core::Mat::default();
         let mut centroids = core::Mat::default();
@@ -347,7 +347,7 @@ impl UiRecognizer {
         Ok(digit_mats)
     }
 
-    fn to_template_40(&self, src: &core::Mat) -> opencv::Result<core::Mat> {
+    pub fn to_template_40(&self, src: &core::Mat) -> opencv::Result<core::Mat> {
         let cols = src.cols();
         let rows = src.rows();
         if cols == 0 || rows == 0 {
