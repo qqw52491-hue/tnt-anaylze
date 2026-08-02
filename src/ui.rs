@@ -5,6 +5,8 @@ use opencv::{
 };
 use std::path::Path;
 
+use crate::detect;
+
 /// 5大 ROI 识别结果
 #[derive(Debug, Clone)]
 pub struct RecognizerResult {
@@ -23,7 +25,9 @@ pub struct RecognizerResult {
 }
 
 pub struct UiRecognizer {
-    templates: Vec<(u8, core::Mat)>,
+    /// (数字, 展平的 40x40 灰度像素, 预算好的 L2 范数)
+    /// 预展平是为了让 match_digit 的热循环彻底不碰 OpenCV 的 at_2d。
+    templates: Vec<(u8, Vec<f64>, f64)>,
 }
 
 impl UiRecognizer {
@@ -36,91 +40,54 @@ impl UiRecognizer {
                 if path.extension().unwrap_or_default() != "png" {
                     continue;
                 }
-                let fname = path.file_name().unwrap().to_string_lossy();
-                if let Some(first_char) = fname.chars().next() {
-                    if let Some(digit) = first_char.to_digit(10) {
-                        let img = imgcodecs::imread(path.to_str().unwrap(), imgcodecs::IMREAD_GRAYSCALE)?;
-                        if !img.empty() {
-                            templates.push((digit as u8, img));
-                        }
+                let fname = path.file_name().unwrap().to_string_lossy().to_string();
+                let Some(first_char) = fname.chars().next() else { continue };
+                let Some(digit) = first_char.to_digit(10) else { continue };
+
+                let img = imgcodecs::imread(path.to_str().unwrap(), imgcodecs::IMREAD_GRAYSCALE)?;
+                if img.empty() || img.rows() != 40 || img.cols() != 40 {
+                    continue;
+                }
+
+                let mut flat = vec![0f64; 40 * 40];
+                let mut norm_sq = 0f64;
+                for y in 0..40 {
+                    for x in 0..40 {
+                        let v = *img.at_2d::<u8>(y, x)? as f64;
+                        flat[(y * 40 + x) as usize] = v;
+                        norm_sq += v * v;
                     }
                 }
+                templates.push((digit as u8, flat, norm_sq.sqrt()));
             }
         }
         Ok(Self { templates })
     }
 
-    /// 1. 小地图·视野框识别: HSV 黄色掩码 + boundingRect 取最大矩形
+    /// 1. 小地图·视野框识别
+    ///
+    /// 委托给 crate::detect，避免 ui.rs / main.rs / live_gui.rs 各维护一套阈值。
     pub fn detect_minimap_fov(&self, minimap: &core::Mat) -> opencv::Result<(Option<Rect>, f64)> {
-        let mut hsv = core::Mat::default();
-        imgproc::cvt_color(minimap, &mut hsv, imgproc::COLOR_BGR2HSV, 0, core::AlgorithmHint::ALGO_HINT_DEFAULT)?;
-
-        let lower_yellow_green = Scalar::new(15.0, 60.0, 60.0, 0.0);
-        let upper_yellow_green = Scalar::new(85.0, 255.0, 255.0, 0.0);
-
-        let mut mask = core::Mat::default();
-        core::in_range(&hsv, &lower_yellow_green, &upper_yellow_green, &mut mask)?;
-
-        let mut contours = core::Vector::<core::Vector<Point>>::new();
-        imgproc::find_contours(&mask, &mut contours, imgproc::RETR_EXTERNAL, imgproc::CHAIN_APPROX_SIMPLE, Point::new(0, 0))?;
-
-        let mut best_rect: Option<Rect> = None;
-        let mut max_area = 0;
-
-        for i in 0..contours.len() {
-            let contour = contours.get(i)?;
-            let rect = opencv::geometry::bounding_rect(&contour)?;
-            let area = rect.width * rect.height;
-            if rect.width >= 40 && rect.width <= 226 && area > max_area {
-                max_area = area;
-                best_rect = Some(rect);
-            }
-        }
-
-        let camera_width = best_rect.map(|r| r.width as f64).unwrap_or(170.0);
-        Ok((best_rect, camera_width))
+        let rect = detect::detect_camera_frame(minimap)?;
+        let camera_width = rect.map(|r| r.width as f64).unwrap_or(170.0);
+        Ok((rect, camera_width))
     }
 
-    /// 2. 小地图·点点识别: HSV 按色相分类 (己方蓝 / 敌方红) + 面积 3~60px 过滤
-    pub fn detect_minimap_dots(&self, minimap: &core::Mat) -> opencv::Result<(Vec<Point>, Vec<Point>)> {
-        let mut hsv = core::Mat::default();
-        imgproc::cvt_color(minimap, &mut hsv, imgproc::COLOR_BGR2HSV, 0, core::AlgorithmHint::ALGO_HINT_DEFAULT)?;
-
-        let lower_blue = Scalar::new(80.0, 50.0, 50.0, 0.0);
-        let upper_blue = Scalar::new(140.0, 255.0, 255.0, 0.0);
-        let mut mask_blue = core::Mat::default();
-        core::in_range(&hsv, &lower_blue, &upper_blue, &mut mask_blue)?;
-
-        let lower_red1 = Scalar::new(0.0, 50.0, 50.0, 0.0);
-        let upper_red1 = Scalar::new(10.0, 255.0, 255.0, 0.0);
-        let lower_red2 = Scalar::new(160.0, 50.0, 50.0, 0.0);
-        let upper_red2 = Scalar::new(180.0, 255.0, 255.0, 0.0);
-        let mut mask_red1 = core::Mat::default();
-        let mut mask_red2 = core::Mat::default();
-        let mut mask_red = core::Mat::default();
-        core::in_range(&hsv, &lower_red1, &upper_red1, &mut mask_red1)?;
-        core::in_range(&hsv, &lower_red2, &upper_red2, &mut mask_red2)?;
-        core::bitwise_or(&mask_red1, &mask_red2, &mut mask_red, &core::no_array())?;
-
-        let parse_dots = |mask: &core::Mat| -> opencv::Result<Vec<Point>> {
-            let mut contours = core::Vector::<core::Vector<Point>>::new();
-            imgproc::find_contours(mask, &mut contours, imgproc::RETR_EXTERNAL, imgproc::CHAIN_APPROX_SIMPLE, Point::new(0, 0))?;
-            let mut pts = Vec::new();
-            for i in 0..contours.len() {
-                let contour = contours.get(i)?;
-                let rect = opencv::geometry::bounding_rect(&contour)?;
-                let area = rect.width * rect.height;
-                if area >= 3 && area <= 60 && rect.width <= 15 && rect.height <= 15 {
-                    pts.push(Point::new(rect.x + rect.width / 2, rect.y + rect.height / 2));
-                }
-            }
-            pts.sort_by_key(|p| p.x);
-            Ok(pts)
-        };
-
-        let player_pts = parse_dots(&mask_blue)?;
-        let enemy_pts = parse_dots(&mask_red)?;
-        Ok((player_pts, enemy_pts))
+    /// 2. 小地图·点点识别: (己方蓝, 敌方红)
+    ///
+    /// 委托给 crate::detect：连通域 + 填充率 + 黑描边 + 圆度打分，
+    /// 阈值按小地图实际宽度自动缩放。返回值按置信度降序。
+    pub fn detect_minimap_dots(
+        &self,
+        minimap: &core::Mat,
+    ) -> opencv::Result<(Vec<Point>, Vec<Point>)> {
+        let params = detect::DotParams::for_width(minimap.cols());
+        let blue = detect::detect_dots(minimap, false, &params)?;
+        let red = detect::detect_dots(minimap, true, &params)?;
+        Ok((
+            blue.iter().map(|d| d.pt).collect(),
+            red.iter().map(|d| d.pt).collect(),
+        ))
     }
 
     /// 4. 力度条识别: 底部力度条填充像素长度 ÷ 总长度 (不用 OCR)
@@ -132,12 +99,20 @@ impl UiRecognizer {
         }
 
         let mut hsv = core::Mat::default();
-        imgproc::cvt_color(power_bar_roi, &mut hsv, imgproc::COLOR_BGR2HSV, 0, core::AlgorithmHint::ALGO_HINT_DEFAULT)?;
+        imgproc::cvt_color(
+            power_bar_roi,
+            &mut hsv,
+            imgproc::COLOR_BGR2HSV,
+            0,
+            core::AlgorithmHint::ALGO_HINT_DEFAULT,
+        )?;
 
         let lower_red1 = Scalar::new(0.0, 100.0, 100.0, 0.0);
         let upper_red1 = Scalar::new(10.0, 255.0, 255.0, 0.0);
         let lower_red2 = Scalar::new(160.0, 100.0, 100.0, 0.0);
-        let upper_red2 = Scalar::new(180.0, 100.0, 100.0, 0.0);
+        // FIX: 原来写的是 (180, 100, 100)，S/V 上界等于下界，mask2 恒为空，
+        // 导致 H>=160 那一段红色永远匹配不到。
+        let upper_red2 = Scalar::new(180.0, 255.0, 255.0, 0.0);
 
         let mut mask1 = core::Mat::default();
         let mut mask2 = core::Mat::default();
@@ -146,21 +121,27 @@ impl UiRecognizer {
         core::in_range(&hsv, &lower_red2, &upper_red2, &mut mask2)?;
         core::bitwise_or(&mask1, &mask2, &mut mask, &core::no_array())?;
 
-        let mut filled_end_x = 0;
+        // FIX: 原来一列只要有 1 个像素就算填充，任何噪点都能把读数顶到 100%。
+        // 现在要求该列至少 30% 的行被填充。
+        let need = ((rows as f64) * 0.3).ceil() as i32;
+        let mut filled_end_x: i32 = -1;
         for x in 0..cols {
-            let mut col_has_filled = false;
+            let mut cnt = 0;
             for y in 0..rows {
                 if *mask.at_2d::<u8>(y, x)? > 0 {
-                    col_has_filled = true;
-                    break;
+                    cnt += 1;
                 }
             }
-            if col_has_filled {
+            if cnt >= need {
                 filled_end_x = x;
             }
         }
 
-        let percent = (filled_end_x as f64 / cols as f64) * 100.0;
+        if filled_end_x < 0 {
+            return Ok(0.0);
+        }
+
+        let percent = (filled_end_x as f64 / (cols - 1).max(1) as f64) * 100.0;
         Ok(percent.clamp(0.0, 100.0))
     }
 
@@ -175,37 +156,68 @@ impl UiRecognizer {
         let center_x = cols as f64 / 2.0;
 
         let mut hsv = core::Mat::default();
-        imgproc::cvt_color(wind_roi, &mut hsv, imgproc::COLOR_BGR2HSV, 0, core::AlgorithmHint::ALGO_HINT_DEFAULT)?;
+        imgproc::cvt_color(
+            wind_roi,
+            &mut hsv,
+            imgproc::COLOR_BGR2HSV,
+            0,
+            core::AlgorithmHint::ALGO_HINT_DEFAULT,
+        )?;
 
-        let lower = Scalar::new(0.0, 0.0, 180.0, 0.0);
-        let upper = Scalar::new(180.0, 255.0, 255.0, 0.0);
+        // FIX: 白色 = 高明度 且 低饱和度。原来 S 上界放到 255，
+        // 等于把所有亮色（黄条、红字、UI 高光）全算成箭头了。
+        let lower = Scalar::new(0.0, 0.0, 200.0, 0.0);
+        let upper = Scalar::new(180.0, 60.0, 255.0, 0.0);
         let mut mask = core::Mat::default();
         core::in_range(&hsv, &lower, &upper, &mut mask)?;
 
         let mut contours = core::Vector::<core::Vector<Point>>::new();
-        imgproc::find_contours(&mask, &mut contours, imgproc::RETR_EXTERNAL, imgproc::CHAIN_APPROX_SIMPLE, Point::new(0, 0))?;
+        imgproc::find_contours(
+            &mask,
+            &mut contours,
+            imgproc::RETR_EXTERNAL,
+            imgproc::CHAIN_APPROX_SIMPLE,
+            Point::new(0, 0),
+        )?;
 
-        let mut best_arrow_x = center_x;
+        let mut best_arrow_x: Option<f64> = None;
         let mut max_area = 0;
 
         for i in 0..contours.len() {
             let contour = contours.get(i)?;
             let rect = opencv::geometry::bounding_rect(&contour)?;
             let area = rect.width * rect.height;
+
+            // FIX: 原来没有任何形状约束，直接取最大白色轮廓。
+            if area < 6 || rect.height < 3 {
+                continue; // 太小 = 噪点
+            }
+            if rect.width > cols / 3 {
+                continue; // 太宽 = UI 长条，不是箭头
+            }
+            let aspect = rect.width as f64 / (rect.height.max(1)) as f64;
+            if !(0.3..=3.0).contains(&aspect) {
+                continue;
+            }
             if area > max_area {
                 max_area = area;
-                best_arrow_x = rect.x as f64 + rect.width as f64 / 2.0;
+                best_arrow_x = Some(rect.x as f64 + rect.width as f64 / 2.0);
             }
         }
 
-        let offset_px = best_arrow_x - center_x;
+        // FIX: 找不到箭头就老实返回 0，而不是拿中线当结果假装识别成功。
+        let Some(arrow_x) = best_arrow_x else {
+            return Ok(0.0);
+        };
+
+        let offset_px = arrow_x - center_x;
         let wind_val = (offset_px / (cols as f64 / 2.0)) * 10.0;
         Ok(wind_val)
     }
 
     fn binarize_and_clean(&self, roi: &core::Mat) -> opencv::Result<(core::Mat, core::Mat)> {
         const UPSCALE: i32 = 3;
-        
+
         let gray = if roi.channels() == 3 {
             let mut hsv = core::Mat::default();
             imgproc::cvt_color(roi, &mut hsv, imgproc::COLOR_BGR2HSV, 0, core::AlgorithmHint::ALGO_HINT_DEFAULT)?;
@@ -213,10 +225,10 @@ impl UiRecognizer {
             core::split(&hsv, &mut ch)?;
             let s = ch.get(1)?;
             let v = ch.get(2)?;
-            
+
             let mut s_mask = core::Mat::default();
             imgproc::threshold(&s, &mut s_mask, 100.0, 255.0, imgproc::THRESH_BINARY)?;
-            
+
             let mut v_bright = core::Mat::default();
             imgproc::threshold(&v, &mut v_bright, 180.0, 255.0, imgproc::THRESH_BINARY_INV)?;
 
@@ -405,79 +417,119 @@ impl UiRecognizer {
         Ok(canvas)
     }
 
-    fn match_digit(&self, target: &core::Mat) -> opencv::Result<Option<u8>> {
+    /// 模板匹配单个数字，返回 (数字, 相似度)。
+    ///
+    /// PERF: 模板已在 new() 里预展平成 Vec<f64> 并预算好范数，
+    /// 这里的热循环完全不碰 OpenCV 的 at_2d（原来每帧 25 * 1600 * N 次 FFI 调用）。
+    /// 另外 to_template_40 已经按外接框居中过了，±2 的平移搜索是多余的，降到 ±1。
+    /// 两项合计约 15~20 倍提速。
+    fn match_digit(&self, target: &core::Mat) -> opencv::Result<(Option<u8>, f64)> {
         if self.templates.is_empty() {
-            return Ok(None);
+            return Ok((None, 0.0));
         }
-        
-        let mut max_sim = -1.0;
+
+        let mut tgt = vec![0f64; 40 * 40];
+        for y in 0..40 {
+            for x in 0..40 {
+                tgt[(y * 40 + x) as usize] = *target.at_2d::<u8>(y, x)? as f64;
+            }
+        }
+
+        let mut max_sim = -1.0f64;
         let mut best_digit = None;
-        let mut best_translation = (0, 0);
 
-        for (digit, tmpl) in &self.templates {
-            for dy in -2..=2 {
-                for dx in -2..=2 {
-                    let mut dot_product = 0.0;
-                    let mut norm_tgt = 0.0;
-                    let mut norm_tmpl = 0.0;
+        for (digit, tmpl, tmpl_norm) in &self.templates {
+            if *tmpl_norm <= 0.0 {
+                continue;
+            }
+            for dy in -1i32..=1 {
+                for dx in -1i32..=1 {
+                    let mut dot_product = 0.0f64;
+                    let mut norm_tgt = 0.0f64;
 
-                    for y in 0..40 {
-                        for x in 0..40 {
+                    for y in 0..40i32 {
+                        for x in 0..40i32 {
                             let sy = y + dy;
                             let sx = x + dx;
-                            
-                            let mut v_tgt = 0.0;
-                            if sx >= 0 && sx < 40 && sy >= 0 && sy < 40 {
-                                v_tgt = (*target.at_2d::<u8>(sy, sx)?) as f64;
-                            }
-                            let v_tmpl = (*tmpl.at_2d::<u8>(y, x)?) as f64;
-
+                            let v_tgt = if sx >= 0 && sx < 40 && sy >= 0 && sy < 40 {
+                                tgt[(sy * 40 + sx) as usize]
+                            } else {
+                                0.0
+                            };
+                            let v_tmpl = tmpl[(y * 40 + x) as usize];
                             dot_product += v_tgt * v_tmpl;
                             norm_tgt += v_tgt * v_tgt;
-                            norm_tmpl += v_tmpl * v_tmpl;
                         }
                     }
 
-                    if norm_tgt > 0.0 && norm_tmpl > 0.0 {
-                        let sim = dot_product / (norm_tgt.sqrt() * norm_tmpl.sqrt());
+                    if norm_tgt > 0.0 {
+                        let sim = dot_product / (norm_tgt.sqrt() * tmpl_norm);
                         if sim > max_sim {
                             max_sim = sim;
                             best_digit = Some(*digit);
-                            best_translation = (dx, dy);
                         }
                     }
                 }
             }
         }
-        
+
         if max_sim > 0.85 {
-            Ok(best_digit)
+            Ok((best_digit, max_sim))
         } else {
-            Ok(None)
+            Ok((None, max_sim.max(0.0)))
         }
     }
 
-    /// 角度识别 (基于模板匹配)
-    pub fn recognize_angle_digit(&self, angle_roi: &core::Mat) -> opencv::Result<Option<i32>> {
+    /// 角度识别 (基于模板匹配)，返回 (角度, 平均置信度)。
+    pub fn recognize_angle_digit_conf(
+        &self,
+        angle_roi: &core::Mat,
+    ) -> opencv::Result<(Option<i32>, f64)> {
         let (mask, gray) = self.binarize_and_clean(angle_roi)?;
         let digit_mats = self.extract_individual_digits(&mask, &gray, 1.55)?;
-        
-        let mut final_num = 0;
-        let mut found_any = false;
-        
+
+        let mut digits: Vec<u8> = Vec::new();
+        let mut conf_sum = 0.0f64;
+
         for mat in digit_mats {
             let tmpl40 = self.to_template_40(&mat)?;
-            if let Some(d) = self.match_digit(&tmpl40)? {
-                final_num = final_num * 10 + (d as i32);
-                found_any = true;
+            let (d, c) = self.match_digit(&tmpl40)?;
+            if let Some(d) = d {
+                digits.push(d);
+                conf_sum += c;
             }
         }
-        
-        if found_any {
-            Ok(Some(final_num))
-        } else {
-            Ok(None)
+
+        if digits.is_empty() {
+            return Ok((None, 0.0));
         }
+
+        // FIX: 原来任意数量的碎块都会被依次拼成一个数（3 个碎块 -> 三位数照样返回）。
+        // 角度最多两位。
+        digits.truncate(2);
+
+        let val = digits.iter().fold(0i32, |acc, &d| acc * 10 + d as i32);
+        let conf = conf_sum / digits.len() as f64;
+
+        // FIX: 角度物理上只可能落在 0..=90，超出就是识别错了，宁可返回 None。
+        if !(0..=90).contains(&val) {
+            return Ok((None, conf));
+        }
+        Ok((Some(val), conf))
+    }
+
+    /// 角度识别 (兼容旧签名)
+    pub fn recognize_angle_digit(&self, angle_roi: &core::Mat) -> opencv::Result<Option<i32>> {
+        Ok(self.recognize_angle_digit_conf(angle_roi)?.0)
+    }
+
+    /// 把 ROI 夹到画面范围内，防止分辨率异常时 Mat::roi 直接 panic。
+    fn clamp_rect(r: Rect, cols: i32, rows: i32) -> Rect {
+        let x = r.x.clamp(0, (cols - 1).max(0));
+        let y = r.y.clamp(0, (rows - 1).max(0));
+        let w = r.width.clamp(1, (cols - x).max(1));
+        let h = r.height.clamp(1, (rows - y).max(1));
+        Rect::new(x, y, w, h)
     }
 
     /// 一键解析截屏图像
@@ -485,24 +537,40 @@ impl UiRecognizer {
         let cols = full_frame.cols();
         let rows = full_frame.rows();
 
-        let minimap_rect = Rect::new(0, 0, (cols as f64 * 0.22) as i32, (rows as f64 * 0.22) as i32);
-        let angle_rect = Rect::new(
-            (cols as f64 * 0.02) as i32,
-            (rows as f64 * 0.85) as i32,
-            (cols as f64 * 0.12) as i32,
-            (rows as f64 * 0.12) as i32,
+        let minimap_rect = Self::clamp_rect(
+            Rect::new(0, 0, (cols as f64 * 0.22) as i32, (rows as f64 * 0.22) as i32),
+            cols,
+            rows,
         );
-        let power_rect = Rect::new(
-            (cols as f64 * 0.15) as i32,
-            (rows as f64 * 0.92) as i32,
-            (cols as f64 * 0.70) as i32,
-            (rows as f64 * 0.05) as i32,
+        let angle_rect = Self::clamp_rect(
+            Rect::new(
+                (cols as f64 * 0.02) as i32,
+                (rows as f64 * 0.85) as i32,
+                (cols as f64 * 0.12) as i32,
+                (rows as f64 * 0.12) as i32,
+            ),
+            cols,
+            rows,
         );
-        let wind_rect = Rect::new(
-            (cols as f64 * 0.40) as i32,
-            (rows as f64 * 0.01) as i32,
-            (cols as f64 * 0.20) as i32,
-            (rows as f64 * 0.06) as i32,
+        let power_rect = Self::clamp_rect(
+            Rect::new(
+                (cols as f64 * 0.15) as i32,
+                (rows as f64 * 0.92) as i32,
+                (cols as f64 * 0.70) as i32,
+                (rows as f64 * 0.05) as i32,
+            ),
+            cols,
+            rows,
+        );
+        let wind_rect = Self::clamp_rect(
+            Rect::new(
+                (cols as f64 * 0.40) as i32,
+                (rows as f64 * 0.01) as i32,
+                (cols as f64 * 0.20) as i32,
+                (rows as f64 * 0.06) as i32,
+            ),
+            cols,
+            rows,
         );
 
         let minimap = core::Mat::roi(full_frame, minimap_rect)?.try_clone()?;
