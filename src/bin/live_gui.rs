@@ -35,33 +35,33 @@ struct AppState {
 
 use tnt_comput::physics::*;
 
-fn compute_fixed_trajectory(dx_units: f64, dy_units: f64, angle_deg: f64, wind: f64) -> (f64, f64) {
+fn compute_fixed_trajectory(dx_units: f64, dy_units: f64, angle_deg: f64, wind: f64) -> Option<(f64, f64)> {
     let mut eff_angle = angle_deg;
-    let is_reverse = eff_angle > 90.0;
-    if is_reverse {
+    if eff_angle > 90.0 {
         eff_angle = 180.0 - eff_angle;
     }
 
+    let is_reverse = dx_units < 0.0;
     let wind_power = wind * (if is_reverse { -1.0 } else { 1.0 });
     let dist = dx_units.abs();
 
     // 调用全新的底层物理引擎，同时传入高低差 dy_units
-    let final_power = power_for_angle(eff_angle, dist, dy_units, wind_power).unwrap_or(100.0);
-    (final_power.clamp(1.0, 100.0), angle_deg)
+    let final_power = power_for_angle(eff_angle, dist, dy_units, wind_power)?;
+    Some((final_power, angle_deg))
 }
 
-fn compute_trajectory(dx_units: f64, dy_units: f64, angle_deg: f64, wind: f64) -> (f64, f64) {
+fn compute_trajectory(dx_units: f64, dy_units: f64, angle_deg: f64, wind: f64) -> Option<(f64, f64)> {
     let mut eff_angle = angle_deg;
-    let is_reverse = eff_angle > 90.0;
-    if is_reverse {
+    if eff_angle > 90.0 {
         eff_angle = 180.0 - eff_angle;
     }
 
+    let is_reverse = dx_units < 0.0;
     let wind_power = wind * (if is_reverse { -1.0 } else { 1.0 });
     let dist = dx_units.abs();
 
     // 使用新的 power_for_angle 和 calc_angle 传递 dy_units
-    let base_power = power_for_angle(eff_angle, dist, dy_units, 0.0).unwrap_or(100.0);
+    let base_power = power_for_angle(eff_angle, dist, dy_units, 0.0)?;
     let mut final_angle = calc_angle(dist, dy_units, base_power, wind_power, eff_angle);
 
     final_angle = final_angle.clamp(15.0, 89.0);
@@ -70,7 +70,7 @@ fn compute_trajectory(dx_units: f64, dy_units: f64, angle_deg: f64, wind: f64) -
         final_angle = 180.0 - final_angle;
     }
 
-    (base_power.clamp(1.0, 100.0), final_angle)
+    Some((base_power, final_angle))
 }
 
 fn find_dots(minimap: &core::Mat, is_red: bool) -> opencv::Result<Vec<core::Point>> {
@@ -818,6 +818,7 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
     let mut wind_input_buf = String::new();
     let mut last_stable_p1: Option<core::Point> = None;
     let mut fps_t0 = std::time::Instant::now();
+    let mut last_toggle_time = std::time::Instant::now() - std::time::Duration::from_secs(1); // 防抖时间戳
 
     loop {
         let loop_t0 = std::time::Instant::now();
@@ -837,7 +838,8 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
         let t2 = std::time::Instant::now();
 
         let canvas_w = map_w_display + 310;
-        let canvas_h_target = ((t_h as f64 * scale) as i32).max(580);
+        let map_h_display = (t_h as f64 * scale) as i32;
+        let canvas_h_target = map_h_display.max(580);
         let mut canvas = core::Mat::new_rows_cols_with_default(
             canvas_h_target,
             canvas_w,
@@ -1036,72 +1038,132 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
                 let orig_dy = -(e.y - p.y) as f64 / scale;
                 let dy = orig_dy / px_per_unit;
 
-                let (force, final_angle) = if st.is_fixed_angle {
+                let trajectory_res = if st.is_fixed_angle {
                     compute_fixed_trajectory(dx, dy, st.current_angle, st.wind)
                 } else {
                     compute_trajectory(dx, dy, st.current_angle, st.wind)
                 };
 
-                // Draw a beautiful background box for the force recommendation
-                imgproc::rectangle(
-                    &mut canvas,
-                    core::Rect::new(map_w_display + 10, y_offset - 35, 300, 80),
-                    core::Scalar::new(0.0, 50.0, 0.0, 0.0),
-                    -1,
-                    imgproc::LINE_8,
-                    0,
-                )
-                .unwrap();
-                imgproc::rectangle(
-                    &mut canvas,
-                    core::Rect::new(map_w_display + 10, y_offset - 35, 300, 80),
-                    core::Scalar::new(0.0, 255.0, 0.0, 0.0),
-                    2,
-                    imgproc::LINE_8,
-                    0,
-                )
-                .unwrap();
+                match trajectory_res {
+                    Some((force, final_angle)) => {
+                        // Draw a beautiful background box for the force recommendation
+                        imgproc::rectangle(
+                            &mut canvas,
+                            core::Rect::new(map_w_display + 10, y_offset - 35, 300, 80),
+                            core::Scalar::new(0.0, 50.0, 0.0, 0.0),
+                            -1,
+                            imgproc::LINE_8,
+                            0,
+                        )
+                        .unwrap();
+                        imgproc::rectangle(
+                            &mut canvas,
+                            core::Rect::new(map_w_display + 10, y_offset - 35, 300, 80),
+                            core::Scalar::new(0.0, 255.0, 0.0, 0.0),
+                            2,
+                            imgproc::LINE_8,
+                            0,
+                        )
+                        .unwrap();
 
-                let mode_str = if st.is_fixed_angle {
-                    "[定角打法]"
-                } else {
-                    "[变角打法]"
-                };
-                let title = format!(
-                    "{}  风力: {:.1}  X距: {:.1}  Y高: {:.1}",
-                    mode_str,
-                    st.wind,
-                    dx.abs(),
-                    dy
-                );
-                let _ = imgproc::put_text(
-                    &mut canvas,
-                    &title,
-                    core::Point::new(map_w_display + 15, y_offset - 10),
-                    imgproc::FONT_HERSHEY_SIMPLEX,
-                    0.45,
-                    core::Scalar::new(200.0, 200.0, 200.0, 0.0),
-                    1,
-                    imgproc::LINE_AA,
-                    false,
-                );
+                        let mode_str = if st.is_fixed_angle {
+                            "[定角打法]"
+                        } else {
+                            "[变角打法]"
+                        };
+                        let title = format!(
+                            "{}  风力: {:.1}  X距: {:.1}  Y高: {:.1}",
+                            mode_str,
+                            st.wind,
+                            dx.abs(),
+                            dy
+                        );
+                        let _ = imgproc::put_text(
+                            &mut canvas,
+                            &title,
+                            core::Point::new(map_w_display + 15, y_offset - 10),
+                            imgproc::FONT_HERSHEY_SIMPLEX,
+                            0.45,
+                            core::Scalar::new(200.0, 200.0, 200.0, 0.0),
+                            1,
+                            imgproc::LINE_AA,
+                            false,
+                        );
 
-                let res_txt = if st.is_fixed_angle {
-                    format!("锁定: {:.0}° 力度: {:.1} 2/3: {:.1}", final_angle, force, force * 2.0 / 3.0)
-                } else {
-                    format!("推荐: {:.0}° 力度: {:.1} 2/3: {:.1}", final_angle, force, force * 2.0 / 3.0)
-                };
-                let _ = imgproc::put_text(
-                    &mut canvas,
-                    &res_txt,
-                    core::Point::new(map_w_display + 15, y_offset + 15),
-                    imgproc::FONT_HERSHEY_SIMPLEX,
-                    0.55,
-                    core::Scalar::new(0.0, 255.0, 0.0, 0.0),
-                    2,
-                    imgproc::LINE_AA,
-                    false,
-                );
+                        let res_txt = if st.is_fixed_angle {
+                            format!("锁定: {:.0}° 力度: {:.1} 2/3: {:.1}", final_angle, force, force * 2.0 / 3.0)
+                        } else {
+                            format!("推荐: {:.0}° 力度: {:.1} 2/3: {:.1}", final_angle, force, force * 2.0 / 3.0)
+                        };
+                        let _ = imgproc::put_text(
+                            &mut canvas,
+                            &res_txt,
+                            core::Point::new(map_w_display + 15, y_offset + 15),
+                            imgproc::FONT_HERSHEY_SIMPLEX,
+                            0.55,
+                            core::Scalar::new(0.0, 255.0, 0.0, 0.0),
+                            2,
+                            imgproc::LINE_AA,
+                            false,
+                        );
+
+                        // Draw trajectory dots on the minimap
+                        let mut draw_angle = final_angle;
+                        let is_reverse = e.x < p.x;
+                        if is_reverse && draw_angle <= 90.0 {
+                            draw_angle = 180.0 - draw_angle;
+                        } else if !is_reverse && draw_angle > 90.0 {
+                            draw_angle = 180.0 - draw_angle;
+                        }
+
+                        // 物理引擎原生支持真实的物理世界坐标系（角度>90代表向左，风向带符号）
+                        // 直接传入真实的风力和真实的角度（左射就是 >90），然后原封不动叠加到 img_x 即可。
+                        let path = tnt_comput::physics::simulate_path(draw_angle, force, st.wind);
+                        for (sim_x, sim_y) in path {
+                            let img_x = p.x as f64 + sim_x * scale * px_per_unit;
+                            let img_y = p.y as f64 - sim_y * scale * px_per_unit;
+
+                            // Stop if out of bounds of the minimap
+                            if img_x < 0.0 || img_x > map_w_display as f64 || img_y > map_h_display as f64 {
+                                break;
+                            }
+                            if img_y >= 0.0 {
+                                let _ = imgproc::circle(
+                                    &mut canvas,
+                                    core::Point::new(img_x as i32, img_y as i32),
+                                    2,
+                                    core::Scalar::new(255.0, 255.0, 0.0, 0.0),
+                                    -1,
+                                    imgproc::LINE_AA,
+                                    0,
+                                );
+                            }
+                        }
+                    }
+                    None => {
+                        // Draw Unreachable box
+                        imgproc::rectangle(
+                            &mut canvas,
+                            core::Rect::new(map_w_display + 10, y_offset - 35, 300, 80),
+                            core::Scalar::new(0.0, 0.0, 50.0, 0.0),
+                            -1,
+                            imgproc::LINE_8,
+                            0,
+                        )
+                        .unwrap();
+                        let _ = imgproc::put_text(
+                            &mut canvas,
+                            "❌ 目标不可达 (Unreachable)",
+                            core::Point::new(map_w_display + 20, y_offset + 5),
+                            imgproc::FONT_HERSHEY_SIMPLEX,
+                            0.7,
+                            core::Scalar::new(0.0, 0.0, 255.0, 0.0),
+                            2,
+                            imgproc::LINE_AA,
+                            false,
+                        );
+                    }
+                }
 
                 if let Some(pval) = power_recognized_val {
                     let power_txt = format!("右下角实时读数: {}", pval);
@@ -1379,6 +1441,7 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
         }
 
         let key = highgui::wait_key(15)?;
+        let debounce_ok = last_toggle_time.elapsed() > std::time::Duration::from_millis(300);
         let is_visible =
             highgui::get_window_property(window_name, highgui::WND_PROP_VISIBLE).unwrap_or(1.0);
         let exit_req = app_state.lock().unwrap().exit_requested;
@@ -1406,21 +1469,24 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
         } else if key == 8 || key == 127 {
             // Backspace
             wind_input_buf.pop();
-        } else if key == 'z' as i32 || key == 'Z' as i32 {
+        } else if debounce_ok && (key == 'z' as i32 || key == 'Z' as i32) {
             // 快捷键 Z: 切换我方标注模式 (EditMode::P1)
             let mut st = app_state.lock().unwrap();
             st.edit_mode = if st.edit_mode == EditMode::P1 { EditMode::None } else { EditMode::P1 };
-        } else if key == 'x' as i32 || key == 'X' as i32 {
+            last_toggle_time = std::time::Instant::now();
+        } else if debounce_ok && (key == 'x' as i32 || key == 'X' as i32) {
             // 快捷键 X: 切换敌方标注模式 (EditMode::E1)
             let mut st = app_state.lock().unwrap();
             st.edit_mode = if st.edit_mode == EditMode::E1 { EditMode::None } else { EditMode::E1 };
-        } else if key == 'c' as i32 || key == 'C' as i32 {
+            last_toggle_time = std::time::Instant::now();
+        } else if debounce_ok && (key == 'c' as i32 || key == 'C' as i32) {
             // 快捷键 C: 清空手动标记
             let mut st = app_state.lock().unwrap();
             st.manual_p1 = None;
             st.manual_e1 = None;
             st.edit_mode = EditMode::None;
-        } else if key == 'r' as i32 || key == 'R' as i32 {
+            last_toggle_time = std::time::Instant::now();
+        } else if debounce_ok && (key == 'r' as i32 || key == 'R' as i32) {
             // 快捷键 R: 锁定/解锁距离尺
             let mut st = app_state.lock().unwrap();
             if st.locked_px_per_unit.is_some() {
@@ -1428,17 +1494,21 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
             } else {
                 st.locked_px_per_unit = Some(0.0);
             }
-        } else if key == 'a' as i32 || key == 'A' as i32 {
+            last_toggle_time = std::time::Instant::now();
+        } else if debounce_ok && (key == 'a' as i32 || key == 'A' as i32) {
             // 快捷键 A: 切换自动识别开关
             let mut st = app_state.lock().unwrap();
             st.auto_detect = !st.auto_detect;
-        } else if key == 'l' as i32 || key == 'L' as i32 {
+            last_toggle_time = std::time::Instant::now();
+        } else if debounce_ok && (key == 'l' as i32 || key == 'L' as i32) {
             // 快捷键 L: 锁定/追踪地图区域
             let mut st = app_state.lock().unwrap();
             st.map_locked = !st.map_locked;
-        } else if key == 'm' as i32 || key == 'M' as i32 {
+            last_toggle_time = std::time::Instant::now();
+        } else if debounce_ok && (key == 'm' as i32 || key == 'M' as i32) {
             let mut st = app_state.lock().unwrap();
             st.is_fixed_angle = !st.is_fixed_angle;
+            last_toggle_time = std::time::Instant::now();
         } else if key == 65362 || key == 0x260000 || key == 82 {
             // Up arrow
             if let Ok(mut m_state) = app_state.lock() {
