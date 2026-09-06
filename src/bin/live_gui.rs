@@ -2,7 +2,6 @@ use opencv::{core, highgui, imgcodecs, imgproc, prelude::*};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum EditMode {
@@ -11,8 +10,6 @@ enum EditMode {
     E1,
     DrawRuler1,
     DrawRuler2,
-    AngleBox1,
-    AngleBox2,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -21,16 +18,23 @@ struct AppState {
     manual_p1: Option<core::Point>,
     manual_e1: Option<core::Point>,
     manual_cam_rect: Option<core::Rect>,
-    manual_angle_rect: Option<core::Rect>,
     drag_start: Option<core::Point>,
     current_angle: f64,
     wind: f64,
     locked_px_per_unit: Option<f64>,
-    map_locked: bool,
-    auto_detect: bool,
+    /// 大地图模式:整张地图的宽度代表多少游戏距离(12/16/18/20/22)
+    map_units: f64,
+    /// 当前是否大地图模式(运行时可切换)
+    big_map: bool,
+    /// 显示缩放系数:canvas 像素 / 截图像素,切换模式时重算
+    disp_scale: f64,
+    /// 当前地图源尺寸(截图像素)
+    src_w: i32,
+    src_h: i32,
     auto_angle: bool,
     is_fixed_angle: bool,
     exit_requested: bool,
+    switch_requested: bool,
 }
 
 use tnt_comput::physics::*;
@@ -41,8 +45,7 @@ fn compute_fixed_trajectory(dx_units: f64, dy_units: f64, angle_deg: f64, wind: 
         eff_angle = 180.0 - eff_angle;
     }
 
-    let is_reverse = dx_units < 0.0;
-    let wind_power = wind * (if is_reverse { -1.0 } else { 1.0 });
+    let wind_power = wind; // 用户输入的是相对风力（正=顺风，负=逆风），物理引擎统一按向右打计算，所以直接传入即可
     let dist = dx_units.abs();
 
     // 调用全新的底层物理引擎，同时传入高低差 dy_units
@@ -57,7 +60,7 @@ fn compute_trajectory(dx_units: f64, dy_units: f64, angle_deg: f64, wind: f64) -
     }
 
     let is_reverse = dx_units < 0.0;
-    let wind_power = wind * (if is_reverse { -1.0 } else { 1.0 });
+    let wind_power = wind; // 用户输入的是相对风力（正=顺风，负=逆风）
     let dist = dx_units.abs();
 
     // 使用新的 power_for_angle 和 calc_angle 传递 dy_units
@@ -71,173 +74,6 @@ fn compute_trajectory(dx_units: f64, dy_units: f64, angle_deg: f64, wind: f64) -
     }
 
     Some((base_power, final_angle))
-}
-
-fn find_dots(minimap: &core::Mat, is_red: bool) -> opencv::Result<Vec<core::Point>> {
-    let mut hsv = core::Mat::default();
-    imgproc::cvt_color(
-        minimap,
-        &mut hsv,
-        imgproc::COLOR_BGR2HSV,
-        0,
-        core::AlgorithmHint::ALGO_HINT_DEFAULT,
-    )?;
-
-    let (lower1, upper1, lower2, upper2) = if is_red {
-        (
-            core::Scalar::new(0.0, 80.0, 80.0, 0.0),
-            core::Scalar::new(20.0, 255.0, 255.0, 0.0),
-            core::Scalar::new(160.0, 80.0, 80.0, 0.0),
-            core::Scalar::new(180.0, 255.0, 255.0, 0.0),
-        )
-    } else {
-        (
-            core::Scalar::new(80.0, 80.0, 80.0, 0.0),
-            core::Scalar::new(150.0, 255.0, 255.0, 0.0),
-            core::Scalar::new(80.0, 80.0, 80.0, 0.0),
-            core::Scalar::new(150.0, 255.0, 255.0, 0.0),
-        )
-    };
-
-    let mut mask1 = core::Mat::default();
-    let mut mask2 = core::Mat::default();
-    let mut mask = core::Mat::default();
-    core::in_range(&hsv, &lower1, &upper1, &mut mask1)?;
-    core::in_range(&hsv, &lower2, &upper2, &mut mask2)?;
-    core::bitwise_or(&mask1, &mask2, &mut mask, &core::no_array())?;
-
-    let mut contours = core::Vector::<core::Vector<core::Point>>::new();
-    imgproc::find_contours(
-        &mask,
-        &mut contours,
-        imgproc::RETR_EXTERNAL,
-        imgproc::CHAIN_APPROX_SIMPLE,
-        core::Point::new(0, 0),
-    )?;
-
-    let mut pts = Vec::new();
-    for i in 0..contours.len() {
-        let contour = contours.get(i)?;
-        let rect = opencv::geometry::bounding_rect(&contour)?;
-        let area = rect.width * rect.height;
-
-        if area >= 9 && area <= 600 && rect.width <= 30 && rect.height <= 30 {
-            let aspect = rect.width as f64 / rect.height as f64;
-            if aspect > 0.3 && aspect < 3.0 {
-                let mut dark_pixels = 0;
-                let mut total_edge = 0;
-                let start_x = (rect.x - 1).max(0);
-                let start_y = (rect.y - 1).max(0);
-                let end_x = (rect.x + rect.width + 1).min(minimap.cols() - 1);
-                let end_y = (rect.y + rect.height + 1).min(minimap.rows() - 1);
-
-                for y in start_y..=end_y {
-                    for x in start_x..=end_x {
-                        if x < rect.x
-                            || x >= rect.x + rect.width
-                            || y < rect.y
-                            || y >= rect.y + rect.height
-                        {
-                            total_edge += 1;
-                            let p = minimap.at_2d::<core::Vec3b>(y, x)?;
-                            if p[0] < 120 && p[1] < 120 && p[2] < 120 {
-                                dark_pixels += 1;
-                            }
-                        }
-                    }
-                }
-
-                if total_edge > 0 && (dark_pixels as f64 / total_edge as f64) > 0.10 {
-                    pts.push(core::Point::new(
-                        rect.x + rect.width / 2,
-                        rect.y + rect.height / 2,
-                    ));
-                }
-            }
-        }
-    }
-    pts.sort_by(|a, b| a.x.cmp(&b.x));
-    Ok(pts)
-}
-
-// 【呼吸灯/闪烁帧差法】：通过前后两帧小地图相减，0.1ms 自动无视地图杂色背景，瞬间精确定位我方位置！
-fn detect_breathing_dots(prev: &core::Mat, curr: &core::Mat) -> opencv::Result<Vec<core::Point>> {
-    let mut diff = core::Mat::default();
-    core::absdiff(prev, curr, &mut diff)?;
-
-    let mut gray_diff = core::Mat::default();
-    imgproc::cvt_color(
-        &diff,
-        &mut gray_diff,
-        imgproc::COLOR_BGR2GRAY,
-        0,
-        core::AlgorithmHint::ALGO_HINT_DEFAULT,
-    )?;
-
-    let mut mask = core::Mat::default();
-    imgproc::threshold(&gray_diff, &mut mask, 20.0, 255.0, imgproc::THRESH_BINARY)?;
-
-    let mut contours = core::Vector::<core::Vector<core::Point>>::new();
-    imgproc::find_contours(
-        &mask,
-        &mut contours,
-        imgproc::RETR_EXTERNAL,
-        imgproc::CHAIN_APPROX_SIMPLE,
-        core::Point::new(0, 0),
-    )?;
-
-    let mut pts = Vec::new();
-    for i in 0..contours.len() {
-        let contour = contours.get(i)?;
-        let rect = opencv::geometry::bounding_rect(&contour)?;
-        let area = rect.width * rect.height;
-        if area >= 4 && area <= 400 && rect.width <= 25 && rect.height <= 25 {
-            let center = core::Point::new(rect.x + rect.width / 2, rect.y + rect.height / 2);
-            pts.push(center);
-        }
-    }
-    pts.sort_by(|a, b| a.x.cmp(&b.x));
-    Ok(pts)
-}
-
-fn detect_camera_frame(minimap: &core::Mat) -> opencv::Result<core::Rect> {
-    let mut hsv = core::Mat::default();
-    imgproc::cvt_color(
-        minimap,
-        &mut hsv,
-        imgproc::COLOR_BGR2HSV,
-        0,
-        core::AlgorithmHint::ALGO_HINT_DEFAULT,
-    )?;
-
-    let lower_yellow_green = core::Scalar::new(15.0, 60.0, 60.0, 0.0);
-    let upper_yellow_green = core::Scalar::new(85.0, 255.0, 255.0, 0.0);
-
-    let mut mask = core::Mat::default();
-    core::in_range(&hsv, &lower_yellow_green, &upper_yellow_green, &mut mask)?;
-
-    let mut contours = core::Vector::<core::Vector<core::Point>>::new();
-    imgproc::find_contours(
-        &mask,
-        &mut contours,
-        imgproc::RETR_EXTERNAL,
-        imgproc::CHAIN_APPROX_SIMPLE,
-        core::Point::new(0, 0),
-    )?;
-
-    let mut best = core::Rect::new(0, 0, 90, 60);
-    let mut max_area = 0;
-
-    for i in 0..contours.len() {
-        let contour = contours.get(i)?;
-        let rect = opencv::geometry::bounding_rect(&contour)?;
-        let area = rect.width * rect.height;
-        if rect.width >= 40 && rect.width <= 226 && area > max_area {
-            max_area = area;
-            best = rect;
-        }
-    }
-    Ok(best)
 }
 
 fn draw_btn(
@@ -349,9 +185,11 @@ fn capture_rect_to_file(geo: (i32, i32, i32, i32), path: &str) {
 
 #[cfg(target_os = "macos")]
 fn capture_rect_to_file(geo: (i32, i32, i32, i32), path: &str) {
-    let _ = Command::new("sh")
-        .arg("-c")
-        .arg(format!("screencapture -R {},{},{},{} -x -t png {}.tmp && mv {}.tmp {}", geo.0, geo.1, geo.2, geo.3, path, path, path))
+    let _ = Command::new("screencapture")
+        .arg("-R")
+        .arg(format!("{},{},{},{}", geo.0, geo.1, geo.2, geo.3))
+        .arg("-x")
+        .arg(path)
         .status();
 }
 
@@ -359,7 +197,17 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
     #[cfg(target_os = "macos")]
     println!("=== 🍎 Mac OS 环境检测成功，已自动切换原生 screencapture 截图引擎 ===");
 
-    println!("👉 [步骤 1/3] 请在屏幕上框选【左上角小地图】区域...");
+    println!("👉 [模式选择] 回车 = 小地图模式(实时刷新); 输入 2 = 大地图模式(框选整张静态地图):");
+    let mut mode_buf = String::new();
+    let _ = std::io::stdin().read_line(&mut mode_buf);
+    let big_map_mode = mode_buf.trim() == "2";
+
+    if big_map_mode {
+        println!("👉 [步骤 1/2] 请框选【整张游戏地图】区域(整屏宽度 = 12/16/18/20/22 按钮)
+    提示: 画面实时刷新;点我方/敌方后直接出力度");
+    } else {
+        println!("👉 [步骤 1/2] 请在屏幕上框选【左上角小地图】区域...");
+    }
     let map_crop_path = "/tmp/tnt_selected_map.png";
     select_crop_interactive(map_crop_path);
 
@@ -376,7 +224,7 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
     let map_geo = find_screen_position(&initial_img).unwrap_or((0, 0, t_w, t_h));
     println!("📍 小地图屏幕区域: ({},{}) {}x{}", map_geo.0, map_geo.1, map_geo.2, map_geo.3);
 
-    println!("👉 [步骤 2/3] 请在屏幕上框选【右下角/角度/力度/数值】区域...");
+    println!("👉 [步骤 2/2] 请在屏幕上框选【右下角/角度/数值】区域...");
     let power_crop_path = "/tmp/tnt_selected_power.png";
     select_crop_interactive(power_crop_path);
 
@@ -388,56 +236,64 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
         println!("📍 数值区域屏幕坐标: ({},{}) {}x{}", pg.0, pg.1, pg.2, pg.3);
     }
 
-    println!("👉 [步骤 3/3] 请在屏幕上框选【顶部/风力/风速】区域...");
-    let wind_crop_path = "/tmp/tnt_selected_wind.png";
-    select_crop_interactive(wind_crop_path);
-
-    let wind_img = imgcodecs::imread(wind_crop_path, imgcodecs::IMREAD_COLOR)
-        .ok()
-        .filter(|m| !m.empty());
-    let wind_geo = wind_img.as_ref().and_then(|img| find_screen_position(img));
-    if let Some(wg) = wind_geo {
-        println!("📍 风力区域屏幕坐标: ({},{}) {}x{}", wg.0, wg.1, wg.2, wg.3);
-    }
-
 
     let window_name = "TNT Assistant HUD";
     highgui::named_window(window_name, highgui::WINDOW_AUTOSIZE)?;
+
+    // 显示缩放:大地图缩到 ~452px 宽(和小地图显示尺寸一致),小地图沿用放大规则
+    let scale = if big_map_mode {
+        (452.0 / t_w as f64).min(2.0)
+    } else if t_w > 600 {
+        1.0
+    } else {
+        2.0
+    };
 
     let app_state = Arc::new(Mutex::new(AppState {
         edit_mode: EditMode::None,
         manual_p1: None,
         manual_e1: None,
         manual_cam_rect: None,
-        manual_angle_rect: None,
         drag_start: None,
         current_angle: 45.0,
         wind: 0.0,
         locked_px_per_unit: None,
-        map_locked: true,
-        auto_detect: true,
+        map_units: 12.0,
+        big_map: big_map_mode,
+        disp_scale: scale,
+        src_w: t_w,
+        src_h: t_h,
         auto_angle: true,
         is_fixed_angle: true,
         exit_requested: false,
+        switch_requested: false,
     }));
 
-    let scale = if t_w > 600 { 1.0 } else { 2.0 };
     let map_w_display = (t_w as f64 * scale) as i32;
+
+    // 大地图模式:整屏宽默认 12 距,启动即自动锁尺(12/16/18/20/22 按钮可切换)
+    if big_map_mode {
+        app_state.lock().unwrap().locked_px_per_unit = Some(t_w as f64 / 12.0);
+    }
 
     let btn_p1 = core::Rect::new(map_w_display + 20, 30, 110, 40);
     let btn_e1 = core::Rect::new(map_w_display + 140, 30, 110, 40);
-    let btn_angle_crop = core::Rect::new(map_w_display + 260, 30, 110, 40);
+    // 大/小地图模式切换(点击后弹交互框选新区域)
+    let btn_mode_switch = core::Rect::new(map_w_display + 260, 30, 110, 40);
 
     let btn_lock_ruler = core::Rect::new(map_w_display + 20, 80, 230, 40);
     let btn_draw_ruler = core::Rect::new(map_w_display + 20, 130, 230, 35);
 
     let btn_exit = core::Rect::new(map_w_display + 150, 5, 100, 30);
 
-    // New feature buttons
-    let btn_auto_detect = core::Rect::new(map_w_display + 20, 175, 110, 30);
-    let btn_lock_map = core::Rect::new(map_w_display + 140, 175, 110, 30);
-
     let btn_clear = core::Rect::new(map_w_display + 20, 210, 230, 25);
+
+    // 大地图模式:整屏距离档位(小地图模式下仅占位,点击无效)
+    let btn_u12 = core::Rect::new(map_w_display + 20, 175, 52, 30);
+    let btn_u16 = core::Rect::new(map_w_display + 77, 175, 52, 30);
+    let btn_u18 = core::Rect::new(map_w_display + 134, 175, 52, 30);
+    let btn_u20 = core::Rect::new(map_w_display + 191, 175, 52, 30);
+    let btn_u22 = core::Rect::new(map_w_display + 248, 175, 52, 30);
 
     // Preset Angle Buttons
     let btn_a20 = core::Rect::new(map_w_display + 20, 240, 50, 30);
@@ -462,18 +318,14 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
     let rect_wind_text = core::Rect::new(map_w_display + 125, 355, 60, 30);
     let btn_wind_p01 = core::Rect::new(map_w_display + 190, 355, 45, 30);
     let btn_wind_p1 = core::Rect::new(map_w_display + 245, 355, 45, 30);
-    
+
     let btn_auto_angle = core::Rect::new(map_w_display + 20, 395, 230, 30);
 
     let state_cb = app_state.clone();
-    let map_geo_clone = map_geo.clone();
     highgui::set_mouse_callback(
         window_name,
         Some(Box::new(move |event, x, y, _flags| {
             let mut st = state_cb.lock().unwrap();
-            let t_w = map_geo_clone.2;
-            let scale = if t_w > 600 { 1.0 } else { 2.0 };
-            let map_w_display = (t_w as f64 * scale) as i32;
 
             if event == highgui::EVENT_LBUTTONDOWN {
                 // Buttons
@@ -503,23 +355,13 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
                     } else {
                         EditMode::DrawRuler1
                     };
-                } else if is_inside(x, y, btn_auto_detect) {
-                    st.auto_detect = !st.auto_detect;
-                } else if is_inside(x, y, btn_lock_map) {
-                    st.map_locked = !st.map_locked;
-                } else if is_inside(x, y, btn_angle_crop) {
-                    st.edit_mode = if st.edit_mode == EditMode::AngleBox1 || st.edit_mode == EditMode::AngleBox2 {
-                        EditMode::None
-                    } else {
-                        EditMode::AngleBox1
-                    };
                 } else if is_inside(x, y, btn_clear) {
+                    // 只清标记。比例尺锁定和标记无关,保留(清了就会出现
+                    // "明明锁定了却提示请先锁定"的问题)
                     st.manual_p1 = None;
                     st.manual_e1 = None;
-                    st.manual_cam_rect = None; // Also clear manual rect!
-                    st.manual_angle_rect = None;
+                    st.manual_cam_rect = None;
                     st.edit_mode = EditMode::None;
-                    st.locked_px_per_unit = None; // Reset lock too
                 } else if is_inside(x, y, btn_a20) {
                     st.current_angle = 20.0;
                     st.auto_angle = false;
@@ -566,6 +408,33 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
                     st.wind += 0.1;
                 } else if is_inside(x, y, btn_wind_p1) {
                     st.wind += 1.0;
+                } else if is_inside(x, y, btn_u12)
+                    || is_inside(x, y, btn_u16)
+                    || is_inside(x, y, btn_u18)
+                    || is_inside(x, y, btn_u20)
+                    || is_inside(x, y, btn_u22)
+                {
+                    // 大地图模式:整屏宽度 = 所选距离,立刻按新档位重锁尺子。
+                    // 小地图模式不响应(比例尺走手动标尺),只吞掉这次点击。
+                    let units = if is_inside(x, y, btn_u12) {
+                        12.0
+                    } else if is_inside(x, y, btn_u16) {
+                        16.0
+                    } else if is_inside(x, y, btn_u18) {
+                        18.0
+                    } else if is_inside(x, y, btn_u20) {
+                        20.0
+                    } else {
+                        22.0
+                    };
+                    if st.big_map {
+                        st.map_units = units;
+                        st.locked_px_per_unit = Some(st.src_w as f64 / units);
+                    }
+                } else if is_inside(x, y, btn_mode_switch) {
+                    // 运行时切换大/小地图:标记 switch_requested,
+                    // 由 UI 线程弹交互框选(回调里不能阻塞,会死锁)
+                    st.switch_requested = true;
                 } else if is_inside(x, y, btn_exit) {
                     st.exit_requested = true;
                 }
@@ -592,36 +461,16 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
                                 let min_y = start.y.min(pt.y);
                                 let max_y = start.y.max(pt.y);
                                 st.manual_cam_rect = Some(core::Rect::new(
-                                    (min_x as f64 / scale) as i32,
-                                    (min_y as f64 / scale) as i32,
-                                    ((max_x - min_x) as f64 / scale) as i32,
-                                    ((max_y - min_y) as f64 / scale) as i32,
+                                    (min_x as f64 / st.disp_scale) as i32,
+                                    (min_y as f64 / st.disp_scale) as i32,
+                                    ((max_x - min_x) as f64 / st.disp_scale) as i32,
+                                    ((max_y - min_y) as f64 / st.disp_scale) as i32,
                                 ));
                             }
                             st.drag_start = None;
                             st.edit_mode = EditMode::None;
                             // Auto-lock the ruler with the newly drawn box (0.0 triggers evaluation in drawing loop)
                             st.locked_px_per_unit = Some(0.0);
-                        }
-                        EditMode::AngleBox1 => {
-                            st.drag_start = Some(pt);
-                            st.edit_mode = EditMode::AngleBox2;
-                        }
-                        EditMode::AngleBox2 => {
-                            if let Some(start) = st.drag_start {
-                                let min_x = start.x.min(pt.x);
-                                let max_x = start.x.max(pt.x);
-                                let min_y = start.y.min(pt.y);
-                                let max_y = start.y.max(pt.y);
-                                st.manual_angle_rect = Some(core::Rect::new(
-                                    (min_x as f64 / scale) as i32,
-                                    (min_y as f64 / scale) as i32,
-                                    ((max_x - min_x) as f64 / scale) as i32,
-                                    ((max_y - min_y) as f64 / scale) as i32,
-                                ));
-                            }
-                            st.drag_start = None;
-                            st.edit_mode = EditMode::None;
                         }
                         _ => {}
                     }
@@ -635,23 +484,10 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
                         let max_y = start.y.max(y);
                         // Store in original minimap coordinates to show live preview
                         st.manual_cam_rect = Some(core::Rect::new(
-                            (min_x as f64 / scale) as i32,
-                            (min_y as f64 / scale) as i32,
-                            ((max_x - min_x) as f64 / scale) as i32,
-                            ((max_y - min_y) as f64 / scale) as i32,
-                        ));
-                    }
-                } else if st.edit_mode == EditMode::AngleBox2 {
-                    if let Some(start) = st.drag_start {
-                        let min_x = start.x.min(x);
-                        let max_x = start.x.max(x);
-                        let min_y = start.y.min(y);
-                        let max_y = start.y.max(y);
-                        st.manual_angle_rect = Some(core::Rect::new(
-                            (min_x as f64 / scale) as i32,
-                            (min_y as f64 / scale) as i32,
-                            ((max_x - min_x) as f64 / scale) as i32,
-                            ((max_y - min_y) as f64 / scale) as i32,
+                            (min_x as f64 / st.disp_scale) as i32,
+                            (min_y as f64 / st.disp_scale) as i32,
+                            ((max_x - min_x) as f64 / st.disp_scale) as i32,
+                            ((max_y - min_y) as f64 / st.disp_scale) as i32,
                         ));
                     }
                 }
@@ -665,61 +501,50 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
     let cap_time_ms = Arc::new(std::sync::Mutex::new(0u128));
     let cap_time_ms_clone = cap_time_ms.clone();
 
-    let map_geo_clone = map_geo.clone();
+    // 地图截图区域放共享变量:运行时切换模式后,后台线程下一轮就用新区域
+    let map_geo_shared = Arc::new(std::sync::Mutex::new(map_geo));
+    let map_geo_shared_clone = map_geo_shared.clone();
     let power_geo_clone = power_geo.clone();
-    let wind_geo_clone = wind_geo.clone();
 
     let shared_map = Arc::new(std::sync::Mutex::new(None::<core::Mat>));
     let shared_map_clone = shared_map.clone();
-    let shared_detected_pt = Arc::new(std::sync::Mutex::new(None::<core::Point>));
-    let shared_detected_pt_clone = shared_detected_pt.clone();
     let shared_recognized_angle = Arc::new(std::sync::Mutex::new(None::<i32>));
     let shared_recognized_angle_clone = shared_recognized_angle.clone();
 
     let app_state_bg = app_state.clone();
 
     thread::spawn(move || {
-        let recognizer = tnt_comput::ui::UiRecognizer::new("src/templates").expect("Failed to init recognizer");
-        let mut prev_minimap: Option<core::Mat> = None;
+        let recognizer =
+            tnt_comput::ui::UiRecognizer::new("src/templates").expect("Failed to init recognizer");
         let mut last_recog_time = std::time::Instant::now();
-        let mut last_ocr_time = std::time::Instant::now();
-        let mut wind_buffer: std::collections::VecDeque<core::Mat> = std::collections::VecDeque::new();
 
         #[cfg(target_os = "linux")]
-        let (map_path, power_path, wind_path) = ("/tmp/tnt_map.ppm", "/tmp/tnt_power.ppm", "/tmp/tnt_wind.ppm");
+        let (map_path, power_path) = ("/tmp/tnt_map.ppm", "/tmp/tnt_power.ppm");
         #[cfg(target_os = "macos")]
-        let (map_path, power_path, wind_path) = ("/tmp/tnt_map.png", "/tmp/tnt_power.png", "/tmp/tnt_wind.png");
+        let (map_path, power_path) = ("/tmp/tnt_map.png", "/tmp/tnt_power.png");
 
         while r_clone.load(std::sync::atomic::Ordering::Relaxed) {
             let t0 = std::time::Instant::now();
-            
-            capture_rect_to_file(map_geo_clone, map_path);
-            
+
+            // 实测(2560x1440):单次小区域截图 ~51ms,而大图的 PNG 编解码要贵得多,
+            // 所以"并集成一张大图"反而不如"各自抓小图"快。
+            // 地图每轮都抓(小地图/大地图都实时),保证点击跟手;
+            // 角度框 200ms 一次(OCR ~5Hz,同步足够)。
+            capture_rect_to_file(*map_geo_shared_clone.lock().unwrap(), map_path);
             if let Ok(m) = imgcodecs::imread(map_path, imgcodecs::IMREAD_COLOR) {
                 if !m.empty() {
-                    // Background breathing dots detection
-                    if m.cols() <= 1200 && m.rows() <= 800 {
-                        if let Some(ref prev) = prev_minimap {
-                            if let Ok(pts) = detect_breathing_dots(prev, &m) {
-                                if let Ok(mut lock) = shared_detected_pt_clone.lock() {
-                                    *lock = if !pts.is_empty() { Some(pts[0]) } else { None };
-                                }
-                            }
-                        }
+                    if let Ok(mut lock) = shared_map_clone.lock() {
+                        *lock = Some(m);
                     }
-                    prev_minimap = m.try_clone().ok();
-
-                    if let Ok(mut lock) = shared_map_clone.lock() { *lock = Some(m); }
                 }
             }
-            
-            if let Some(p_geo) = power_geo_clone {
-                capture_rect_to_file(p_geo, power_path);
-                
-                if let Ok(p_mat) = imgcodecs::imread(power_path, imgcodecs::IMREAD_COLOR) {
-                    if !p_mat.empty() && p_mat.cols() <= 300 && p_mat.rows() <= 200 {
-                        if last_recog_time.elapsed().as_millis() > 100 {
-                            if let Ok(Some(val)) = recognizer.recognize_angle_digit(&p_mat) {
+
+            if let Some(pg) = power_geo_clone {
+                if last_recog_time.elapsed().as_millis() > 200 {
+                    capture_rect_to_file(pg, power_path);
+                    if let Ok(p) = imgcodecs::imread(power_path, imgcodecs::IMREAD_COLOR) {
+                        if !p.empty() {
+                            if let Ok(Some(val)) = recognizer.recognize_angle_digit(&p) {
                                 if let Ok(mut lock) = shared_recognized_angle_clone.lock() {
                                     *lock = Some(val);
                                 }
@@ -732,62 +557,16 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
                                     }
                                 }
                             }
-                            last_recog_time = std::time::Instant::now();
                         }
                     }
+                    last_recog_time = std::time::Instant::now();
                 }
             }
 
-            if let Some(w_geo) = wind_geo_clone {
-                capture_rect_to_file(w_geo, wind_path);
-                if let Ok(w_mat) = imgcodecs::imread(wind_path, imgcodecs::IMREAD_COLOR) {
-                    if !w_mat.empty() && w_mat.cols() <= 300 && w_mat.rows() <= 200 {
-                        // Temporal Min-Pooling logic
-                        wind_buffer.push_back(w_mat);
-                        if wind_buffer.len() > 15 {
-                            wind_buffer.pop_front();
-                        }
-
-                        if wind_buffer.len() > 0 {
-                            let mut min_mat = wind_buffer[0].try_clone().unwrap();
-                            for m in wind_buffer.iter().skip(1) {
-                                let mut temp = core::Mat::default();
-                                let _ = core::min(&min_mat, m, &mut temp);
-                                min_mat = temp;
-                            }
-                            let clean_path = "/tmp/tnt_wind_clean.png";
-                            let _ = imgcodecs::imwrite(clean_path, &min_mat, &core::Vector::new());
-
-                            // Periodically run OCR on the clean image (Option B placeholder!)
-                            if last_ocr_time.elapsed().as_millis() > 500 {
-                                if let Ok(out) = std::process::Command::new("./mac_ocr").arg(clean_path).output() {
-                                    if let Ok(s) = String::from_utf8(out.stdout) {
-                                        let text = s.trim();
-                                        if !text.is_empty() {
-                                            // Handle OCR quirks like 'B.4' -> '8.4'
-                                            let text = text.replace("B", "8").replace("b", "8").replace("O", "0").replace("o", "0");
-                                            if let Ok(w_val) = text.parse::<f64>() {
-                                                if let Ok(mut m_state) = app_state_bg.lock() {
-                                                    // Validate sanity
-                                                    if w_val >= 0.0 && w_val <= 20.0 {
-                                                        m_state.wind = w_val;
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                last_ocr_time = std::time::Instant::now();
-                            }
-                        }
-                    }
-                }
+            if let Ok(mut lock) = cap_time_ms_clone.lock() {
+                *lock = t0.elapsed().as_millis();
             }
-
-            if let Ok(mut lock) = cap_time_ms_clone.lock() { 
-                *lock = t0.elapsed().as_millis(); 
-            }
-            std::thread::sleep(std::time::Duration::from_millis(40)); // 25 FPS bg capture
+            std::thread::sleep(std::time::Duration::from_millis(40));
         }
     });
 
@@ -816,13 +595,15 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
     highgui::wait_key(100)?;
 
     let mut wind_input_buf = String::new();
-    let mut last_stable_p1: Option<core::Point> = None;
+    // 弹道缓存：点位/角度/风没变就不重算。定角模式约 70 次全程仿真，
+    // 不可达时更是 600+ 次采样，每帧重算是纯浪费。
+    let mut traj_memo: Option<((f64, f64, f64, f64, bool), Option<(f64, f64)>)> = None;
     let mut fps_t0 = std::time::Instant::now();
     let mut last_toggle_time = std::time::Instant::now() - std::time::Duration::from_secs(1); // 防抖时间戳
 
     loop {
         let loop_t0 = std::time::Instant::now();
-        
+
         let img = {
             let lock = shared_map.lock().unwrap();
             lock.as_ref().and_then(|m| m.try_clone().ok())
@@ -832,12 +613,16 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
         let t1 = std::time::Instant::now();
 
         let power_recognized_val = *shared_recognized_angle.lock().unwrap();
-        let raw_detected_p = *shared_detected_pt.lock().unwrap();
 
         let t_recog = t1.elapsed().as_millis();
         let t2 = std::time::Instant::now();
 
         let canvas_w = map_w_display + 310;
+        let st = *app_state.lock().unwrap();
+        // 模式切换后这些会变,每帧从状态里取(遮蔽外层的启动值)
+        let t_w = st.src_w;
+        let t_h = st.src_h;
+        let scale = st.disp_scale;
         let map_h_display = (t_h as f64 * scale) as i32;
         let canvas_h_target = map_h_display.max(580);
         let mut canvas = core::Mat::new_rows_cols_with_default(
@@ -846,7 +631,6 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
             core::CV_8UC3,
             core::Scalar::new(30.0, 30.0, 30.0, 0.0),
         )?;
-        let st = *app_state.lock().unwrap();
 
         if let Some(minimap) = img {
             let mut map_display = core::Mat::default();
@@ -871,32 +655,6 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
 
 
 
-            // 【防抖抗闪内存锁】：呼吸灯熄灭的暗周期自动保持上一次坐标；同原地闪烁时微小震荡自动平滑，消除画面闪烁！
-            let final_auto_p1 = if let Some(new_pt) = raw_detected_p {
-                if let Some(last_pt) = last_stable_p1 {
-                    let dx = (new_pt.x - last_pt.x) as f64;
-                    let dy = (new_pt.y - last_pt.y) as f64;
-                    if (dx * dx + dy * dy) < 400.0 {
-                        // 20px 阈值范围内认为是原地呼吸
-                        Some(last_pt)
-                    } else {
-                        last_stable_p1 = Some(new_pt);
-                        Some(new_pt)
-                    }
-                } else {
-                    last_stable_p1 = Some(new_pt);
-                    Some(new_pt)
-                }
-            } else {
-                last_stable_p1
-            };
-
-            let auto_p = if let Some(p) = final_auto_p1 {
-                vec![p]
-            } else {
-                Vec::new()
-            };
-            let auto_e: Vec<core::Point> = Vec::new();
             let cam_rect = st.manual_cam_rect.unwrap_or(core::Rect::new(0, 0, t_w, t_h));
 
             let to_scr = |p: core::Point| {
@@ -934,8 +692,16 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
             let mut current_px_per_unit = cam_rect.width as f64 / 12.0;
             if let Some(locked) = st.locked_px_per_unit {
                 if locked == 0.0 {
+                    // 大地图且没画过手动标尺:整屏宽 = map_units 距;
+                    // 画了标尺就仍按标尺算,两种都能用
+                    let v = if st.big_map && st.manual_cam_rect.is_none() {
+                        t_w as f64 / st.map_units
+                    } else {
+                        current_px_per_unit
+                    };
+                    current_px_per_unit = v;
                     if let Ok(mut m_state) = app_state.lock() {
-                        m_state.locked_px_per_unit = Some(current_px_per_unit);
+                        m_state.locked_px_per_unit = Some(v);
                     }
                 } else {
                     current_px_per_unit = locked;
@@ -943,20 +709,13 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
             }
             let px_per_unit = current_px_per_unit;
 
-            let p1 = st.manual_p1.or_else(|| {
-                auto_p.get(0).map(|p| {
-                    core::Point::new((p.x as f64 * scale) as i32, (p.y as f64 * scale) as i32)
-                })
-            });
-            let e1 = st.manual_e1.or_else(|| {
-                auto_e.get(0).map(|p| {
-                    core::Point::new((p.x as f64 * scale) as i32, (p.y as f64 * scale) as i32)
-                })
-            });
+            // 全手动模式：图像识别只剩角度数字 OCR，点位全部靠点击标注。
+            let p1 = st.manual_p1;
+            let e1 = st.manual_e1;
 
             let draw_pt =
                 |c: &mut core::Mat, pt: core::Point, label: &str, is_red: bool, is_manual: bool| {
-                    // pt is now EXACTLY in canvas pixels (whether from manual click or auto_p scaled up)
+                    // 手动点击的坐标已经是 canvas 像素，直接画。
                     let cx = pt.x;
                     let cy = pt.y;
                     let color = if is_red {
@@ -1038,10 +797,18 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
                 let orig_dy = -(e.y - p.y) as f64 / scale;
                 let dy = orig_dy / px_per_unit;
 
-                let trajectory_res = if st.is_fixed_angle {
-                    compute_fixed_trajectory(dx, dy, st.current_angle, st.wind)
-                } else {
-                    compute_trajectory(dx, dy, st.current_angle, st.wind)
+                let key = (dx, dy, st.current_angle, st.wind, st.is_fixed_angle);
+                let trajectory_res = match traj_memo {
+                    Some((k, v)) if k == key => v,
+                    _ => {
+                        let r = if st.is_fixed_angle {
+                            compute_fixed_trajectory(dx, dy, st.current_angle, st.wind)
+                        } else {
+                            compute_trajectory(dx, dy, st.current_angle, st.wind)
+                        };
+                        traj_memo = Some((key, r));
+                        r
+                    }
                 };
 
                 match trajectory_res {
@@ -1117,8 +884,10 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
                         }
 
                         // 物理引擎原生支持真实的物理世界坐标系（角度>90代表向左，风向带符号）
-                        // 直接传入真实的风力和真实的角度（左射就是 >90），然后原封不动叠加到 img_x 即可。
-                        let path = tnt_comput::physics::simulate_path(draw_angle, force, st.wind);
+                        // 用户输入的是相对风力（正=顺风），但在画图时，我们要把它转成绝对世界的风向。
+                        // 如果向左打，顺风就是向左吹（绝对世界里的负风向）。
+                        let sim_wind = if is_reverse { -st.wind } else { st.wind };
+                        let path = tnt_comput::physics::simulate_path(draw_angle, force, sim_wind);
                         for (sim_x, sim_y) in path {
                             let img_x = p.x as f64 + sim_x * scale * px_per_unit;
                             let img_y = p.y as f64 - sim_y * scale * px_per_unit;
@@ -1254,9 +1023,9 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
         )?;
         draw_btn(
             &mut canvas,
-            btn_angle_crop,
-            "框选角度",
-            st.edit_mode == EditMode::AngleBox1 || st.edit_mode == EditMode::AngleBox2,
+            btn_mode_switch,
+            if st.big_map { "MINI MAP" } else { "BIG MAP" },
+            false,
         )?;
 
         let lock_label = if st.locked_px_per_unit.is_some() {
@@ -1285,21 +1054,39 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
             st.edit_mode == EditMode::DrawRuler1 || st.edit_mode == EditMode::DrawRuler2,
         )?;
 
-        let auto_lbl = if st.auto_detect {
-            "自动识别: 开"
-        } else {
-            "自动识别: 关"
-        };
-        draw_btn(&mut canvas, btn_auto_detect, auto_lbl, st.auto_detect)?;
-
-        let map_lbl = if st.map_locked {
-            "地图区域: 锁定"
-        } else {
-            "地图区域: 追踪"
-        };
-        draw_btn(&mut canvas, btn_lock_map, map_lbl, st.map_locked)?;
-
         draw_btn(&mut canvas, btn_clear, "清空手动标记", false)?;
+
+        // 大地图整屏距离档位(小地图模式下灰显不响应)
+        draw_btn(
+            &mut canvas,
+            btn_u12,
+            "12",
+            st.big_map && (st.map_units - 12.0).abs() < 0.1,
+        )?;
+        draw_btn(
+            &mut canvas,
+            btn_u16,
+            "16",
+            st.big_map && (st.map_units - 16.0).abs() < 0.1,
+        )?;
+        draw_btn(
+            &mut canvas,
+            btn_u18,
+            "18",
+            st.big_map && (st.map_units - 18.0).abs() < 0.1,
+        )?;
+        draw_btn(
+            &mut canvas,
+            btn_u20,
+            "20",
+            st.big_map && (st.map_units - 20.0).abs() < 0.1,
+        )?;
+        draw_btn(
+            &mut canvas,
+            btn_u22,
+            "22",
+            st.big_map && (st.map_units - 22.0).abs() < 0.1,
+        )?;
         // Draw preset angle buttons
         draw_btn(
             &mut canvas,
@@ -1383,13 +1170,13 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
         draw_btn(&mut canvas, btn_wind_p01, "+0.1", false)?;
         draw_btn(&mut canvas, btn_wind_p1, "+1.0", false)?;
 
-        let hint_txt = "提示: 敲数字后 [回车]=风速, [空格]=角度";
+        let hint_txt = "提示: 数字[回车]=风速, [空格]=角度, 支持负号";
         let _ = imgproc::put_text(
             &mut canvas,
             hint_txt,
-            core::Point::new(map_w_display + 5, 385),
+            core::Point::new(map_w_display + 5, 420),
             imgproc::FONT_HERSHEY_SIMPLEX,
-            0.4,
+            0.38,
             core::Scalar::new(180.0, 255.0, 180.0, 0.0),
             1,
             imgproc::LINE_AA,
@@ -1495,16 +1282,6 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
                 st.locked_px_per_unit = Some(0.0);
             }
             last_toggle_time = std::time::Instant::now();
-        } else if debounce_ok && (key == 'a' as i32 || key == 'A' as i32) {
-            // 快捷键 A: 切换自动识别开关
-            let mut st = app_state.lock().unwrap();
-            st.auto_detect = !st.auto_detect;
-            last_toggle_time = std::time::Instant::now();
-        } else if debounce_ok && (key == 'l' as i32 || key == 'L' as i32) {
-            // 快捷键 L: 锁定/追踪地图区域
-            let mut st = app_state.lock().unwrap();
-            st.map_locked = !st.map_locked;
-            last_toggle_time = std::time::Instant::now();
         } else if debounce_ok && (key == 'm' as i32 || key == 'M' as i32) {
             let mut st = app_state.lock().unwrap();
             st.is_fixed_angle = !st.is_fixed_angle;
@@ -1525,6 +1302,52 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
             let ch = (key & 0xFF) as u8 as char;
             if ch.is_ascii_digit() || ch == '.' || ch == '-' {
                 wind_input_buf.push(ch);
+            }
+        }
+
+        // 运行时切换大/小地图模式:交互框选新区域 → 换图源 → 重算缩放和比例尺。
+        // 点位属于旧图,全部作废;大地图自动按档位锁尺,小地图重新画尺子。
+        if app_state.lock().unwrap().switch_requested {
+            app_state.lock().unwrap().switch_requested = false;
+            let to_big = !app_state.lock().unwrap().big_map;
+            println!(
+                "👉 [切换模式] 请框选【{}】区域...",
+                if to_big { "整张游戏地图" } else { "左上角小地图" }
+            );
+            let crop_path = "/tmp/tnt_mode_switch.png";
+            if select_crop_interactive(crop_path) {
+                if let Ok(new_img) = imgcodecs::imread(crop_path, imgcodecs::IMREAD_COLOR) {
+                    if !new_img.empty() {
+                        let nw = new_img.cols();
+                        let nh = new_img.rows();
+                        let geo = find_screen_position(&new_img).unwrap_or((0, 0, nw, nh));
+                        *map_geo_shared.lock().unwrap() = geo;
+                        *shared_map.lock().unwrap() = None; // 丢弃旧区域画面,等新图
+                        let new_scale = (map_w_display as f64 / nw as f64).min(2.0);
+                        let mut stg = app_state.lock().unwrap();
+                        stg.big_map = to_big;
+                        stg.src_w = nw;
+                        stg.src_h = nh;
+                        stg.disp_scale = new_scale;
+                        stg.manual_p1 = None;
+                        stg.manual_e1 = None;
+                        stg.manual_cam_rect = None;
+                        if to_big {
+                            stg.locked_px_per_unit = Some(nw as f64 / stg.map_units);
+                        } else {
+                            stg.locked_px_per_unit = None;
+                        }
+                        println!(
+                            "✅ 已切换到{} ({}x{}, 显示缩放 {:.2})",
+                            if to_big { "大地图" } else { "小地图" },
+                            nw,
+                            nh,
+                            new_scale
+                        );
+                    }
+                }
+            } else {
+                println!("⚠️ 未完成框选,保持原模式");
             }
         }
     }
