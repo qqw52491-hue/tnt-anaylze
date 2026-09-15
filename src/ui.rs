@@ -45,6 +45,12 @@ const HOLE_PENALTY: f64 = 0.15;
 /// 宽高比差异的扣分系数。专治 1↔7：1 又窄又高（约 0.3），7 明显宽（约 0.6）。
 const ASPECT_PENALTY: f64 = 0.50;
 
+/// "吸收过碎片"的数字的原始分门槛。
+/// 拼出来的数字字形天然残一些，但残得不一样：被 ROI 裁掉再拼回去的
+/// 窄 9 看着像个 0，原始分能到 0.7——比正常门限高得多。所以拼过的
+/// 数字要拿更高的原始分才放行，认不出就整帧作废。
+const SIM_MIN_ABSORBED: f64 = 0.75;
+
 pub struct UiRecognizer {
     /// (数字, 去均值后的 40x40 展平像素, L2 范数, 洞数, 宽高比)
     /// 预展平 + 预去均值，是为了让热循环彻底不碰 OpenCV 的 at_2d。
@@ -383,7 +389,9 @@ impl UiRecognizer {
         area >= min_area
     }
 
-    pub fn binarize_and_clean(&self, roi: &core::Mat) -> opencv::Result<(core::Mat, core::Mat)> {
+    /// 返回 (组件mask, tophat灰度, combo灰度)。
+    /// combo = max(tophat, blackhat) ∩ 膨胀mask,只用于"吸收过碎片"的断笔数字。
+    pub fn binarize_and_clean(&self, roi: &core::Mat) -> opencv::Result<(core::Mat, core::Mat, core::Mat)> {
         const UPSCALE: i32 = 3;
 
         let gray = if roi.channels() == 3 {
@@ -417,6 +425,16 @@ impl UiRecognizer {
         let mut tophat = core::Mat::default();
         imgproc::morphology_ex(&up, &mut tophat, imgproc::MORPH_TOPHAT, &k, Point::new(-1, -1), 1, core::BORDER_REPLICATE, imgproc::morphology_default_border_value()?)?;
 
+        // 黑帽(亮底上的暗笔画)。数字压到白色圆盘/亮地形上时笔画是"暗"的,
+        // tophat 看不见 -> 7 的斜笔在亮斑区域整段消失。识别用灰度取
+        // max(tophat, blackhat),亮底暗笔画也能捞回来。
+        // 注意:blackhat 只进灰度图,不进组件 mask——组件仍按亮笔画定位,
+        // 否则暗色背景结构会炸出一堆假连通域。
+        let mut blackhat = core::Mat::default();
+        imgproc::morphology_ex(&up, &mut blackhat, imgproc::MORPH_BLACKHAT, &k, Point::new(-1, -1), 1, core::BORDER_REPLICATE, imgproc::morphology_default_border_value()?)?;
+        let mut combo = core::Mat::default();
+        core::max(&tophat, &blackhat, &mut combo)?;
+
         let mut mask = core::Mat::default();
         let otsu_thresh = imgproc::threshold(&tophat, &mut mask, 0.0, 255.0, imgproc::THRESH_BINARY | imgproc::THRESH_OTSU)?;
         if otsu_thresh < 30.0 {
@@ -439,17 +457,33 @@ impl UiRecognizer {
             let h = *stats.at_2d::<i32>(i, imgproc::CC_STAT_HEIGHT)?;
             let area = *stats.at_2d::<i32>(i, imgproc::CC_STAT_AREA)?;
 
-            if Self::is_digit_component(w, h, area) {
+            // 数字形连通域之外,把"疑似数字碎片"也保留下来:瞄准线/描边会把数字
+            // 切成两半(实测 7 的横杠整条断开),碎片若在 final_mask 里被抹掉,
+            // 后面 extract_individual_digits 的碎片吸收就没有素材可用。
+            // 碎片本身不会被当成数字,只作为拼接候选参与行内校验。
+            if Self::is_digit_component(w, h, area) || (area >= 30 && w <= 90 && h <= 45) {
                 let mut comp_mask = core::Mat::default();
                 core::compare(&labels, &Scalar::all(i as f64), &mut comp_mask, core::CMP_EQ)?;
                 final_mask.set_to(&Scalar::all(255.0), &comp_mask)?;
             }
         }
 
+        // 两份灰度:
+        // - gray_out:tophat ∩ final_mask,给正常数字用,笔画干净利落
+        // - combo_out:max(tophat,blackhat) ∩ 膨胀的 final_mask,只给"吸收过碎片"
+        //   的断笔数字用——膨胀把连通域之间的断口(如被瞄准线切断的 7 斜笔上段、
+        //   亮斑上的暗色笔段)圈进裁剪域。combo 不能给正常数字用:黑帽描边会让
+        //   笔画变糊(实测干净的 9 会因此认成 5)。
         let mut gray_out = core::Mat::new_rows_cols_with_default(cleaned.rows(), cleaned.cols(), core::CV_8UC1, Scalar::all(0.0))?;
         tophat.copy_to_masked(&mut gray_out, &final_mask)?;
 
-        Ok((final_mask, gray_out))
+        let k_dil = imgproc::get_structuring_element(imgproc::MORPH_ELLIPSE, core::Size::new(11, 11), Point::new(-1, -1))?;
+        let mut mask_dil = core::Mat::default();
+        imgproc::dilate(&final_mask, &mut mask_dil, &k_dil, Point::new(-1, -1), 1, core::BORDER_CONSTANT, imgproc::morphology_default_border_value()?)?;
+        let mut combo_out = core::Mat::new_rows_cols_with_default(cleaned.rows(), cleaned.cols(), core::CV_8UC1, Scalar::all(0.0))?;
+        combo.copy_to_masked(&mut combo_out, &mask_dil)?;
+
+        Ok((final_mask, gray_out, combo_out))
     }
 
     fn split_by_valley(&self, mask: &core::Mat, r: Rect, num_parts: i32) -> opencv::Result<Vec<Rect>> {
@@ -483,13 +517,16 @@ impl UiRecognizer {
         Ok(cuts.windows(2).filter(|w| w[1] - w[0] >= 3).map(|w| Rect::new(r.x + w[0], r.y, w[1] - w[0], r.height)).collect())
     }
 
-    pub fn extract_individual_digits(&self, mask: &core::Mat, gray: &core::Mat, split_ratio: f64) -> opencv::Result<Vec<core::Mat>> {
+    /// 返回每位数字的灰度块和"是否吸收过碎片"标记。
+    /// 吸收过碎片的数字是拼出来的,上层要用更严的置信度门限。
+    pub fn extract_individual_digits(&self, mask: &core::Mat, gray: &core::Mat, gray_combo: &core::Mat, split_ratio: f64, allow_absorb: bool) -> opencv::Result<Vec<(core::Mat, bool)>> {
         let mut labels = core::Mat::default();
         let mut stats = core::Mat::default();
         let mut centroids = core::Mat::default();
         let num_labels = imgproc::connected_components_with_stats(mask, &mut labels, &mut stats, &mut centroids, 8, core::CV_32S)?;
 
-        let mut valid_rects = Vec::new();
+        let mut valid_rects: Vec<(Rect, bool)> = Vec::new();
+        let mut frag_rects = Vec::new();
         for i in 1..num_labels {
             let x = *stats.at_2d::<i32>(i, imgproc::CC_STAT_LEFT)?;
             let y = *stats.at_2d::<i32>(i, imgproc::CC_STAT_TOP)?;
@@ -497,30 +534,157 @@ impl UiRecognizer {
             let h = *stats.at_2d::<i32>(i, imgproc::CC_STAT_HEIGHT)?;
             let area = *stats.at_2d::<i32>(i, imgproc::CC_STAT_AREA)?;
             if Self::is_digit_component(w, h, area) {
-                valid_rects.push(Rect::new(x, y, w, h));
+                valid_rects.push((Rect::new(x, y, w, h), false));
+            } else if allow_absorb && area >= 30 && w <= 90 && h <= 45 {
+                // 碎片只在第二遍收集:第一遍保持和旧版一致的组件集合,
+                // 否则同一行里的碎块会触发"残片否决"把好帧也毙掉。
+                frag_rects.push(Rect::new(x, y, w, h));
             }
         }
-        valid_rects.sort_by_key(|r| r.x);
+
+        // 吸回数字碎片(仅 allow_absorb 时):瞄准线/描边会把一个数字切成
+        // "数字形连通域 + 短条碎块"(实测 7 的横杠就是这么和斜笔断开的,
+        // 横杠高不够直接被上面过滤丢弃)。碎块与某数字横向重叠过半、纵向间距
+        // 在数字高度 45% 以内,就并回该数字的外接框。
+        // 贴边碎片不吸——分不清是边缘杂斑还是被裁掉的数字残肢。
+        // 只在第二遍启用:好端端的数字吸上杂块反而把字形搞脏。
+        if allow_absorb {
+            let cols = mask.cols();
+            let rows = mask.rows();
+            let at_edge = |r: &Rect| {
+                r.x <= 1
+                    || r.y <= 1
+                    || r.x + r.width >= cols - 1
+                    || r.y + r.height >= rows - 1
+            };
+            let mut used = vec![false; frag_rects.len()];
+            for (fi, f) in frag_rects.iter().enumerate() {
+                if at_edge(f) {
+                    continue;
+                }
+                let mut best: Option<usize> = None;
+                let mut best_ov = 0i32;
+                for (i, (d, _)) in valid_rects.iter().enumerate() {
+                    let x_ov = (d.x + d.width).min(f.x + f.width) - d.x.max(f.x);
+                    let gap = (f.y - (d.y + d.height)).max(d.y - (f.y + f.height));
+                    if x_ov * 2 > f.width
+                        && x_ov > best_ov
+                        && gap <= (d.height as f64 * 0.45) as i32
+                        && f.width <= d.width * 2
+                        && f.height <= d.height
+                    {
+                        best = Some(i);
+                        best_ov = x_ov;
+                    }
+                }
+                if let Some(i) = best {
+                    let d = valid_rects[i].0;
+                    let nx = d.x.min(f.x);
+                    let ny = d.y.min(f.y);
+                    valid_rects[i] = (
+                        Rect::new(
+                            nx,
+                            ny,
+                            (d.x + d.width).max(f.x + f.width) - nx,
+                            (d.y + d.height).max(f.y + f.height) - ny,
+                        ),
+                        true,
+                    );
+                    used[fi] = true;
+                }
+            }
+            frag_rects = frag_rects
+                .iter()
+                .zip(used.iter())
+                .filter(|&(_, u)| !u)
+                .map(|(r, _)| *r)
+                .collect();
+        }
+
+        // 同一串角度数字:高度一致、纵向位置同一行。杂斑(圆盘装饰/箭头/徽章碎片)
+        // 高矮和中线都对不上,按中位高度 + 中线偏移把离群的剔掉,再排序。
+        // 杂斑比数字多时中位数落在杂斑上 -> 剔光 -> 空 -> 上层沿用上一帧,不读错。
+        if !valid_rects.is_empty() {
+            let mut hs: Vec<i32> = valid_rects.iter().map(|r| r.0.height).collect();
+            hs.sort();
+            let med_h = hs[hs.len() / 2] as f64;
+            let mut cys: Vec<f64> = valid_rects
+                .iter()
+                .map(|r| r.0.y as f64 + r.0.height as f64 / 2.0)
+                .collect();
+            cys.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let med_cy = cys[cys.len() / 2];
+            let (kept, dropped): (Vec<(Rect, bool)>, Vec<(Rect, bool)>) =
+                valid_rects.into_iter().partition(|r| {
+                    let h = r.0.height as f64;
+                    let cy = r.0.y as f64 + h / 2.0;
+                    h >= med_h * 0.7
+                        && h <= med_h * 1.4
+                        && (cy - med_cy).abs() <= med_h * 0.35
+                });
+
+            if !kept.is_empty() {
+                let band_top = kept.iter().map(|r| r.0.y).min().unwrap();
+                let band_bot = kept.iter().map(|r| r.0.y + r.0.height).max().unwrap();
+
+                // FIX: 两道防"裁半个字"的闸。
+                // 1) 留下的数字里有贴边的 -> 多半被框选裁掉一半(实测 "4" 剩半边
+                //    认成 "1"、"9" 缺角认成 "0"),读出来也是能过校验的错角度。
+                // 2) 被剔掉的东西若还挤在数字行里(纵向重叠超自身一半),多半
+                //    是裁残的碎片——亮核不一定贴边,闸 1 抓不到。
+                // 两种情况都宁可整帧作废沿用上一帧稳定值,也不读半个字。
+                // 注意只能查"同一行":别的行的贴边杂斑(比如左上徽章角)
+                // 已被聚类剔掉,不该连累整帧。
+                let cols = mask.cols();
+                let rows = mask.rows();
+                if kept.iter().any(|r| {
+                    r.0.x <= 1
+                        || r.0.y <= 1
+                        || r.0.x + r.0.width >= cols - 1
+                        || r.0.y + r.0.height >= rows - 1
+                }) || dropped
+                    .iter()
+                    .map(|r| &r.0)
+                    .chain(frag_rects.iter())
+                    .any(|r| {
+                        let ov = (r.y + r.height).min(band_bot) - r.y.max(band_top);
+                        ov * 2 > r.height
+                    })
+                {
+                    return Ok(Vec::new());
+                }
+            }
+            valid_rects = kept;
+        }
+
+        valid_rects.sort_by_key(|r| r.0.x);
 
         let k_erode = imgproc::get_structuring_element(imgproc::MORPH_RECT, core::Size::new(2, 2), core::Point::new(-1, -1))?;
         let mut eroded_mask = core::Mat::default();
         imgproc::erode(mask, &mut eroded_mask, &k_erode, core::Point::new(-1, -1), 1, core::BORDER_CONSTANT, imgproc::morphology_default_border_value()?)?;
 
-        let mut final_rects = Vec::new();
-        for r in valid_rects {
+        let mut final_rects: Vec<(Rect, bool)> = Vec::new();
+        for (r, absorbed) in valid_rects {
             let expect_w = (((r.height as f64) * 0.62).round() as i32).max(6);
             if r.width > (expect_w as f64 * split_ratio) as i32 {
                 let num_parts = ((r.width as f64) / (expect_w as f64)).round().max(2.0) as i32;
-                final_rects.extend(self.split_by_valley(&eroded_mask, r, num_parts)?);
+                final_rects.extend(
+                    self.split_by_valley(&eroded_mask, r, num_parts)?
+                        .into_iter()
+                        .map(|sr| (sr, absorbed)),
+                );
             } else {
-                final_rects.push(r);
+                final_rects.push((r, absorbed));
             }
         }
 
         let mut digit_mats = Vec::new();
-        for rect in final_rects {
-            let digit_roi = core::Mat::roi(gray, rect)?;
-            digit_mats.push(digit_roi.try_clone()?);
+        for (rect, absorbed) in final_rects {
+            // 拼过的数字从 combo 灰度里取——黑帽能把亮底上的暗笔段捞回来;
+            // 正常数字保持 tophat 灰度,避免描边晕墨把字形弄糊。
+            let src = if absorbed { gray_combo } else { gray };
+            let digit_roi = core::Mat::roi(src, rect)?;
+            digit_mats.push((digit_roi.try_clone()?, absorbed));
         }
         Ok(digit_mats)
     }
@@ -584,6 +748,18 @@ impl UiRecognizer {
             }
         }
         Ok(canvas)
+    }
+
+    /// 调试入口：返回每个数字的 (修正分, 原始 ZNCC) 供 cli_recognize 打印前三名。
+    pub fn score_digits_debug(
+        &self,
+        target: &core::Mat,
+    ) -> opencv::Result<Vec<(u8, f64, f64)>> {
+        let (adj, raw) = self.score_digits(target)?;
+        let mut v: Vec<(u8, f64, f64)> =
+            (0..10u8).map(|d| (d, adj[d as usize], raw[d as usize])).collect();
+        v.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        Ok(v)
     }
 
     /// 算出 0..9 每个数字的得分，返回 (修正后得分, 对应的原始 ZNCC 得分)。
@@ -734,9 +910,32 @@ impl UiRecognizer {
         &self,
         angle_roi: &core::Mat,
     ) -> opencv::Result<(Option<i32>, f64)> {
-        let (mask, gray) = self.binarize_and_clean(angle_roi)?;
-        let digit_mats = self.extract_individual_digits(&mask, &gray, 1.55)?;
+        let (mask, gray, gray_combo) = self.binarize_and_clean(angle_roi)?;
 
+        // 第一遍:不做碎片吸收,组件集合与判分门限都和旧版一致。
+        // 好端端的帧不会受到碎片逻辑的任何影响。
+        let mats = self.extract_individual_digits(&mask, &gray, &gray_combo, 1.55, false)?;
+        let first = self.score_digit_mats(mats)?;
+        if first.0.is_some() {
+            return Ok(first);
+        }
+
+        // 第二遍:碎片吸收修复断笔(瞄准线/亮斑把数字切断的场景)。
+        // 拼过的位要走更严的 SIM_MIN_ABSORBED 门限,防"裁残的 9 拼回去读成 0"。
+        let mats2 = self.extract_individual_digits(&mask, &gray, &gray_combo, 1.55, true)?;
+        let second = self.score_digit_mats(mats2)?;
+        if second.0.is_some() {
+            return Ok(second);
+        }
+        Ok((None, first.1.max(second.1)))
+    }
+
+    /// 对一组数字灰度块逐个模板匹配,拼成角度值。
+    /// 只要有一位认不出来整帧作废——旧版静默跳过该位,73 会变成 7 还合法。
+    fn score_digit_mats(
+        &self,
+        digit_mats: Vec<(core::Mat, bool)>,
+    ) -> opencv::Result<(Option<i32>, f64)> {
         if digit_mats.is_empty() {
             return Ok((None, 0.0));
         }
@@ -749,13 +948,14 @@ impl UiRecognizer {
         let mut digits: Vec<u8> = Vec::with_capacity(digit_mats.len());
         let mut worst_conf = 1.0f64;
 
-        for mat in digit_mats {
+        for (mat, absorbed) in digit_mats {
             let tmpl40 = self.to_template_40(&mat)?;
             let (adj, raw_at_best) = self.score_digits(&tmpl40)?;
             let (best_idx, best_adj, second_adj) = Self::pick_best(&adj);
             let best_raw = raw_at_best[best_idx];
 
-            if best_raw < SIM_MIN || (best_adj - second_adj) < SIM_MARGIN {
+            let min_raw = if absorbed { SIM_MIN_ABSORBED } else { SIM_MIN };
+            if best_raw < min_raw || (best_adj - second_adj) < SIM_MARGIN {
                 // 只要有一位没认出来，整帧作废，交给上层沿用上一帧。
                 // 旧版是静默跳过这一位，剩下一位照样拼成角度返回，
                 // 73 会变成 7 且能通过范围校验，变成一个"看起来正常"的错角度。

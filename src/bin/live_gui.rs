@@ -35,6 +35,12 @@ struct AppState {
     is_fixed_angle: bool,
     exit_requested: bool,
     switch_requested: bool,
+    /// 点了"识别视野框"按钮 -> 主循环对当前小地图跑一次检测
+    cam_detect_requested: bool,
+    /// 识别结果提示(成功/失败) + 过期时间
+    cam_detect_msg: Option<(&'static str, std::time::Instant)>,
+    /// 手动画完标尺 -> 主循环尝试把左右边吸附到检测到的框边
+    snap_pending: bool,
 }
 
 use tnt_comput::physics::*;
@@ -189,6 +195,8 @@ fn capture_rect_to_file(geo: (i32, i32, i32, i32), path: &str) {
         .arg("-R")
         .arg(format!("{},{},{},{}", geo.0, geo.1, geo.2, geo.3))
         .arg("-x")
+        .arg("-t")
+        .arg("png")
         .arg(path)
         .status();
 }
@@ -224,14 +232,19 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
     let map_geo = find_screen_position(&initial_img).unwrap_or((0, 0, t_w, t_h));
     println!("📍 小地图屏幕区域: ({},{}) {}x{}", map_geo.0, map_geo.1, map_geo.2, map_geo.3);
 
-    println!("👉 [步骤 2/2] 请在屏幕上框选【右下角/角度/数值】区域...");
+    println!("👉 [步骤 2/2] 请框选【左下角圆盘里的角度数字】——框要紧贴数字本身,别把圆盘边缘/箭头/其他数字框进来...");
     let power_crop_path = "/tmp/tnt_selected_power.png";
     select_crop_interactive(power_crop_path);
 
     let power_img = imgcodecs::imread(power_crop_path, imgcodecs::IMREAD_COLOR)
         .ok()
         .filter(|m| !m.empty());
-    let power_geo = power_img.as_ref().and_then(|img| find_screen_position(img));
+    let power_geo = power_img
+        .as_ref()
+        .and_then(|img| find_screen_position(img))
+        // 外扩 10px:框紧贴数字时,换值后宽字形(8/9)会贴到截图边被"贴边否决"误伤,
+        // 多抓一圈边距让否决只作用于真被裁的帧
+        .map(|(x, y, w, h)| (x.saturating_sub(10), y.saturating_sub(10), w + 20, h + 20));
     if let Some(pg) = power_geo {
         println!("📍 数值区域屏幕坐标: ({},{}) {}x{}", pg.0, pg.1, pg.2, pg.3);
     }
@@ -267,6 +280,9 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
         is_fixed_angle: true,
         exit_requested: false,
         switch_requested: false,
+        cam_detect_requested: false,
+        cam_detect_msg: None,
+        snap_pending: false,
     }));
 
     let map_w_display = (t_w as f64 * scale) as i32;
@@ -282,7 +298,8 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
     let btn_mode_switch = core::Rect::new(map_w_display + 260, 30, 110, 40);
 
     let btn_lock_ruler = core::Rect::new(map_w_display + 20, 80, 230, 40);
-    let btn_draw_ruler = core::Rect::new(map_w_display + 20, 130, 230, 35);
+    let btn_draw_ruler = core::Rect::new(map_w_display + 20, 130, 110, 35);
+    let btn_detect_cam = core::Rect::new(map_w_display + 140, 130, 110, 35);
 
     let btn_exit = core::Rect::new(map_w_display + 150, 5, 100, 30);
 
@@ -355,6 +372,9 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
                     } else {
                         EditMode::DrawRuler1
                     };
+                } else if is_inside(x, y, btn_detect_cam) {
+                    // 触发一次视野框识别:主循环里拿到当前小地图后执行
+                    st.cam_detect_requested = true;
                 } else if is_inside(x, y, btn_clear) {
                     // 只清标记。比例尺锁定和标记无关,保留(清了就会出现
                     // "明明锁定了却提示请先锁定"的问题)
@@ -471,6 +491,8 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
                             st.edit_mode = EditMode::None;
                             // Auto-lock the ruler with the newly drawn box (0.0 triggers evaluation in drawing loop)
                             st.locked_px_per_unit = Some(0.0);
+                            // 触发一次吸附:把手画的左右边贴到检测到的框边上
+                            st.snap_pending = true;
                         }
                         _ => {}
                     }
@@ -517,6 +539,12 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
         let recognizer =
             tnt_comput::ui::UiRecognizer::new("src/templates").expect("Failed to init recognizer");
         let mut last_recog_time = std::time::Instant::now();
+        // 角度 OCR 抗抖:有效帧里连续 3 取 2 一致才采信(复用 detect.rs 的投票器)。
+        // 注意投票队列只进成功帧,失败帧跳过不清空——失败帧在这套识别器里是常态。
+        let mut angle_voter = tnt_comput::detect::ValueVoter::new(3);
+        let mut last_size_warn = std::time::Instant::now();
+        let mut last_misread_dbg = std::time::Instant::now();
+        let mut last_none_dbg = std::time::Instant::now();
 
         #[cfg(target_os = "linux")]
         let (map_path, power_path) = ("/tmp/tnt_map.ppm", "/tmp/tnt_power.ppm");
@@ -540,21 +568,66 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
             }
 
             if let Some(pg) = power_geo_clone {
-                if last_recog_time.elapsed().as_millis() > 200 {
+                if last_recog_time.elapsed().as_millis() > 100 {
                     capture_rect_to_file(pg, power_path);
                     if let Ok(p) = imgcodecs::imread(power_path, imgcodecs::IMREAD_COLOR) {
                         if !p.empty() {
-                            if let Ok(Some(val)) = recognizer.recognize_angle_digit(&p) {
-                                if let Ok(mut lock) = shared_recognized_angle_clone.lock() {
-                                    *lock = Some(val);
+                            // ROI 框太大时 OCR 不可信(旧版就有这道门槛,重构时弄丢了):
+                            // 大框里的 UI 杂点会被当成数字,自动同步就会写错角度
+                            if p.cols() > 300 || p.rows() > 200 {
+                                if last_size_warn.elapsed().as_millis() > 5000 {
+                                    last_size_warn = std::time::Instant::now();
+                                    println!(
+                                        "⚠️ 角度区域 {}x{} 超过 300x200,OCR 跳过 —— 请重新框选小一点的角度框",
+                                        p.cols(),
+                                        p.rows()
+                                    );
                                 }
-                                // Auto-sync angle if enabled
-                                if val >= 10 && val <= 90 {
-                                    if let Ok(mut m_state) = app_state_bg.lock() {
-                                        if m_state.auto_angle {
-                                            m_state.current_angle = val as f64;
+                            } else {
+                                // TNT_DUMP_FAIL=1 时把原始 ROI 也落盘,方便事后分析误读帧
+                                if std::env::var("TNT_DUMP_FAIL").is_ok() {
+                                    let _ = imgcodecs::imwrite(
+                                        "/tmp/tnt_roi_last.png",
+                                        &p,
+                                        &core::Vector::new(),
+                                    );
+                                }
+                                match recognizer.recognize_angle_digit(&p) {
+                                    Ok(Some(val)) => {
+                                        if let Some(stable) = angle_voter.push(val) {
+                                            if stable != val
+                                                && last_misread_dbg.elapsed().as_millis() > 1000
+                                            {
+                                                last_misread_dbg = std::time::Instant::now();
+                                                println!(
+                                                    "🔍 角度OCR: 本帧读到 {}, 与稳定值 {} 不符,已丢弃",
+                                                    val, stable
+                                                );
+                                            }
+                                            if let Ok(mut lock) = shared_recognized_angle_clone.lock()
+                                            {
+                                                *lock = Some(stable);
+                                            }
+                                            // Auto-sync angle if enabled
+                                            if stable >= 10 && stable <= 90 {
+                                                if let Ok(mut m_state) = app_state_bg.lock() {
+                                                    if m_state.auto_angle {
+                                                        m_state.current_angle = stable as f64;
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
+                                    Ok(None) => {
+                                        // 失败帧在这套识别器里很常见(ui.rs 设计就是整帧作废、
+                                        // 沿用上一次),所以不清投票——只跳过本帧,
+                                        // 否则成功帧永远攒不够 2 帧,同步会卡死
+                                        if last_none_dbg.elapsed().as_millis() > 1000 {
+                                            last_none_dbg = std::time::Instant::now();
+                                            println!("🔍 角度OCR: 本帧未识别(保留已有投票)");
+                                        }
+                                    }
+                                    Err(_) => {}
                                 }
                             }
                         }
@@ -655,20 +728,80 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
 
 
 
-            let cam_rect = st.manual_cam_rect.unwrap_or(core::Rect::new(0, 0, t_w, t_h));
+            // 按钮触发的视野框识别:识别到就把框设为标尺并锁定(宽度=12距)
+            let mut det_rect: Option<core::Rect> = None;
+            if st.cam_detect_requested {
+                det_rect = tnt_comput::detect::detect_camera_frame(&minimap)
+                    .ok()
+                    .flatten();
+                let mut m = app_state.lock().unwrap();
+                m.cam_detect_requested = false;
+                match det_rect {
+                    Some(r) => {
+                        m.manual_cam_rect = Some(r);
+                        m.locked_px_per_unit = Some(0.0); // 触发锁尺
+                        m.cam_detect_msg = Some((
+                            "视野框已识别并锁定",
+                            std::time::Instant::now(),
+                        ));
+                    }
+                    None => {
+                        m.cam_detect_msg = Some((
+                            "视野框识别失败,请手动画标尺",
+                            std::time::Instant::now(),
+                        ));
+                    }
+                }
+            }
+
+            // 手动画完标尺后,把左右边吸附到最近的检测框边(更准)
+            if st.snap_pending {
+                let snapped = st.manual_cam_rect.and_then(|r| {
+                    tnt_comput::detect::snap_camera_frame(&minimap, &r)
+                        .ok()
+                        .flatten()
+                });
+                let mut m = app_state.lock().unwrap();
+                m.snap_pending = false;
+                match snapped {
+                    Some(r) => {
+                        m.manual_cam_rect = Some(r);
+                        m.cam_detect_msg = Some((
+                            "已吸附到视野框边",
+                            std::time::Instant::now(),
+                        ));
+                    }
+                    None => {
+                        m.cam_detect_msg = Some((
+                            "未检测到框边,按手画为准",
+                            std::time::Instant::now(),
+                        ));
+                    }
+                }
+            }
+
+            let cam_rect = st
+                .manual_cam_rect
+                .or(det_rect)
+                .unwrap_or(core::Rect::new(0, 0, t_w, t_h));
 
             let to_scr = |p: core::Point| {
                 core::Point::new((p.x as f64 * scale) as i32, (p.y as f64 * scale) as i32)
             };
 
-            // 绘制摄像机白框（黄框代表手动）
+            // 绘制摄像机框（黄框=手动标尺/识别框）
             let cam_p1 = to_scr(core::Point::new(cam_rect.x, cam_rect.y));
             let cam_p2 = to_scr(core::Point::new(
                 cam_rect.x + cam_rect.width,
                 cam_rect.y + cam_rect.height,
             ));
-            if st.manual_cam_rect.is_some() && st.locked_px_per_unit.is_none() {
-                let box_color = core::Scalar::new(0.0, 255.0, 255.0, 0.0);
+            if st.manual_cam_rect.is_some() || det_rect.is_some() {
+                // 未锁=黄框(待定),已锁=绿框(比例尺生效中)
+                let box_color = if st.locked_px_per_unit.is_some() {
+                    core::Scalar::new(0.0, 255.0, 0.0, 0.0)
+                } else {
+                    core::Scalar::new(0.0, 255.0, 255.0, 0.0)
+                };
                 let _ = imgproc::rectangle(
                     &mut canvas,
                     core::Rect::new(cam_p1.x, cam_p1.y, cam_p2.x - cam_p1.x, cam_p2.y - cam_p1.y),
@@ -685,8 +818,29 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
                     let _ = imgproc::line(&mut canvas, core::Point::new(tick_x, cam_p2.y - 10), core::Point::new(tick_x, cam_p2.y), box_color, 1, imgproc::LINE_AA, 0);
                 }
 
-                let cam_txt = format!("CAMERA {}x{}", cam_rect.width, cam_rect.height);
-                let _ = imgproc::put_text(&mut canvas, &cam_txt, core::Point::new(cam_p1.x, (cam_p1.y - 5).max(10)), imgproc::FONT_HERSHEY_SIMPLEX, 0.4, core::Scalar::new(0.0, 255.0, 255.0, 0.0), 1, imgproc::LINE_8, false);
+                let cam_txt = format!(
+                    "CAMERA {}x{}",
+                    cam_rect.width,
+                    cam_rect.height
+                );
+                let _ = imgproc::put_text(&mut canvas, &cam_txt, core::Point::new(cam_p1.x, (cam_p1.y - 5).max(10)), imgproc::FONT_HERSHEY_SIMPLEX, 0.4, box_color, 1, imgproc::LINE_8, false);
+            }
+
+            // 识别结果提示(2 秒内显示在地图顶部)
+            if let Some((msg, t)) = st.cam_detect_msg {
+                if t.elapsed().as_secs() < 2 {
+                    let _ = imgproc::put_text(
+                        &mut canvas,
+                        msg,
+                        core::Point::new(10, 20),
+                        imgproc::FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        core::Scalar::new(0.0, 255.0, 255.0, 0.0),
+                        2,
+                        imgproc::LINE_AA,
+                        false,
+                    );
+                }
             }
 
             let mut current_px_per_unit = cam_rect.width as f64 / 12.0;
@@ -1053,6 +1207,7 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
             ruler_lbl,
             st.edit_mode == EditMode::DrawRuler1 || st.edit_mode == EditMode::DrawRuler2,
         )?;
+        draw_btn(&mut canvas, btn_detect_cam, "识别视野框", st.cam_detect_requested)?;
 
         draw_btn(&mut canvas, btn_clear, "清空手动标记", false)?;
 
