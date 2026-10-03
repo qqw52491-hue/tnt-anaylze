@@ -12,3 +12,11 @@
 !src/templates/
 !src/templates/*.png
 test_xcap
+stt/*.bin
+stt/sherpa-onnx-*/
+
+# 本地编译产物/运行数据
+mac_stt
+stt_rec
+wind_key.txt
+wind_pairs.csv

@@ -5,6 +5,7 @@ edition = "2024"
 default-run = "tnt-comput"
 
 [dependencies]
+flate2 = "1.1.10"
 image = "0.25"
 imageproc = "0.25"
 opencv = { version = "0.99.1", features = ["clang-runtime"] }

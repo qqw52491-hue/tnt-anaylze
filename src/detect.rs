@@ -382,31 +382,53 @@ struct ColScan {
 }
 
 /// 提垂直边缘 + 扫描每列的亮线边/同hue软边特征。
-fn scan_columns(minimap: &core::Mat) -> opencv::Result<Option<ColScan>> {
+/// 多帧时边缘图取 OR:框线是"流动的光",单帧可能整条消失,
+/// 任一帧亮过就算存在;hue/sat/val 图取最后一帧(罩色是稳定的)。
+fn scan_columns(frames: &[core::Mat]) -> opencv::Result<Option<ColScan>> {
+    let Some(minimap) = frames.last() else {
+        return Ok(None);
+    };
     let w = minimap.cols();
     let h = minimap.rows();
     if w < 30 || h < 30 {
         return Ok(None);
     }
 
-    let mut gray = core::Mat::default();
-    imgproc::cvt_color(
-        minimap,
-        &mut gray,
-        imgproc::COLOR_BGR2GRAY,
-        0,
-        core::AlgorithmHint::ALGO_HINT_DEFAULT,
-    )?;
-    let mut blurred = core::Mat::default();
-    imgproc::gaussian_blur(
-        &gray,
-        &mut blurred,
-        core::Size::new(3, 3),
-        0.0,
-        0.0,
-        core::BORDER_DEFAULT,
-        core::AlgorithmHint::ALGO_HINT_DEFAULT,
-    )?;
+    let (wu, hu) = (w as usize, h as usize);
+    let mut ecol = vec![vec![false; wu]; hu];
+    const EDGE_T: i32 = 7;
+    for frame in frames {
+        if frame.cols() != w || frame.rows() != h {
+            continue;
+        }
+        let mut gray = core::Mat::default();
+        imgproc::cvt_color(
+            frame,
+            &mut gray,
+            imgproc::COLOR_BGR2GRAY,
+            0,
+            core::AlgorithmHint::ALGO_HINT_DEFAULT,
+        )?;
+        let mut blurred = core::Mat::default();
+        imgproc::gaussian_blur(
+            &gray,
+            &mut blurred,
+            core::Size::new(3, 3),
+            0.0,
+            0.0,
+            core::BORDER_DEFAULT,
+            core::AlgorithmHint::ALGO_HINT_DEFAULT,
+        )?;
+        for y in 0..h {
+            for x in 0..w.saturating_sub(2) {
+                let (a, b) = (*blurred.at_2d::<u8>(y, x)?, *blurred.at_2d::<u8>(y, x + 2)?);
+                if (b as i32 - a as i32).abs() > EDGE_T {
+                    ecol[y as usize][x as usize] = true;
+                }
+            }
+        }
+    }
+
     let mut hsv = core::Mat::default();
     imgproc::cvt_color(
         minimap,
@@ -415,28 +437,15 @@ fn scan_columns(minimap: &core::Mat) -> opencv::Result<Option<ColScan>> {
         0,
         core::AlgorithmHint::ALGO_HINT_DEFAULT,
     )?;
-
-    let (wu, hu) = (w as usize, h as usize);
-    let mut g = vec![vec![0u8; wu]; hu];
     let mut huemap = vec![vec![0u8; wu]; hu];
     let mut satmap = vec![vec![0u8; wu]; hu];
     let mut valmap = vec![vec![0u8; wu]; hu];
     for y in 0..h {
         for x in 0..w {
-            g[y as usize][x as usize] = *blurred.at_2d::<u8>(y, x)?;
             let px = hsv.at_2d::<core::Vec3b>(y, x)?;
             huemap[y as usize][x as usize] = px[0];
             satmap[y as usize][x as usize] = px[1];
             valmap[y as usize][x as usize] = px[2];
-        }
-    }
-
-    // 垂直边缘：相邻两列灰度跳变（框线是软边，阈值放低）
-    const EDGE_T: i32 = 7;
-    let mut ecol = vec![vec![false; wu]; hu];
-    for y in 0..hu {
-        for x in 0..wu.saturating_sub(2) {
-            ecol[y][x] = (g[y][x + 2] as i32 - g[y][x] as i32).abs() > EDGE_T;
         }
     }
     // 边缘带：软框线的边缘像素散在 ±1 列里,按 3 列的 OR 算
@@ -575,7 +584,7 @@ impl ColScan {
 
 /// 视野框检测（全图扫描）。返回 (左,右) 竖边张成的矩形。
 pub fn detect_camera_frame(minimap: &core::Mat) -> opencv::Result<Option<Rect>> {
-    let Some(scan) = scan_columns(minimap)? else {
+    let Some(scan) = scan_columns(std::slice::from_ref(minimap))? else {
         return Ok(None);
     };
     let w = scan.w;
@@ -627,14 +636,77 @@ pub fn detect_camera_frame(minimap: &core::Mat) -> opencv::Result<Option<Rect>> 
     Ok(best.map(|(_, x1, y1, x2, y2)| Rect::new(x1, y1, x2 - x1, y2 - y1)))
 }
 
+/// 局部 hue 环形方差图(积像加速)。罩色框内部被罩成均匀色 -> 方差极小;
+/// 地图纹理区方差大。单位:度。
+fn hue_stdmap(sat: &[Vec<u8>], hue: &[Vec<u8>], w: usize, h: usize) -> Vec<Vec<f64>> {
+    let (mut is_, mut ic_, mut in_) = (
+        vec![vec![0f64; w + 1]; h + 1],
+        vec![vec![0f64; w + 1]; h + 1],
+        vec![vec![0f64; w + 1]; h + 1],
+    );
+    for y in 0..h {
+        for x in 0..w {
+            let (mut s, mut c, mut n) = (0.0, 0.0, 0.0);
+            if sat[y][x] > 60 {
+                let r = (hue[y][x] as f64 * 2.0).to_radians();
+                s = r.sin();
+                c = r.cos();
+                n = 1.0;
+            }
+            is_[y + 1][x + 1] = is_[y][x + 1] + is_[y + 1][x] - is_[y][x] + s;
+            ic_[y + 1][x + 1] = ic_[y][x + 1] + ic_[y + 1][x] - ic_[y][x] + c;
+            in_[y + 1][x + 1] = in_[y][x + 1] + in_[y + 1][x] - in_[y][x] + n;
+        }
+    }
+    let rect_sum = |m: &[Vec<f64>], x0: i32, y0: i32, x1: i32, y1: i32| -> f64 {
+        let (x0, y0, x1, y1) = (
+            x0.max(0) as usize,
+            y0.max(0) as usize,
+            (x1.min(w as i32 - 1) + 1) as usize,
+            (y1.min(h as i32 - 1) + 1) as usize,
+        );
+        if x0 >= x1 || y0 >= y1 {
+            return 0.0;
+        }
+        m[y1][x1] - m[y0][x1] - m[y1][x0] + m[y0][x0]
+    };
+    const K: i32 = 7; // 15x15 窗
+    let mut out = vec![vec![0f64; w]; h];
+    for y in 0..h as i32 {
+        for x in 0..w as i32 {
+            let (x0, y0, x1, y1) = (x - K, y - K, x + K, y + K);
+            let n = rect_sum(&in_, x0, y0, x1, y1);
+            if n < 20.0 {
+                out[y as usize][x as usize] = 90.0;
+                continue;
+            }
+            let s = rect_sum(&is_, x0, y0, x1, y1) / n;
+            let c = rect_sum(&ic_, x0, y0, x1, y1) / n;
+            let rr = (s * s + c * c).sqrt().clamp(1e-9, 1.0);
+            out[y as usize][x as usize] = (-2.0 * rr.ln()).sqrt().to_degrees() / 2.0;
+        }
+    }
+    out
+}
+
 /// 贴边吸附：用户手画大致视野框 roi,左右两边各自在 ±40% 宽范围内
 /// 找"roi 纵向窗口内边缘密度最高"的列并吸过去。哪边找不到就保留手画位置。
 /// 只吸附宽度——上下沿始终用手画的。
 pub fn snap_camera_frame(minimap: &core::Mat, roi: &Rect) -> opencv::Result<Option<Rect>> {
-    let Some(scan) = scan_columns(minimap)? else {
+    snap_camera_frame_burst(std::slice::from_ref(minimap), roi)
+}
+
+/// 多帧版吸附:框边是"流动的光"会周期性变亮,对最近几帧的边缘取 OR,
+/// 淡掉的边也能捞回来。调用方负责攒帧(~10帧)。
+pub fn snap_camera_frame_burst(
+    frames: &[core::Mat],
+    roi: &Rect,
+) -> opencv::Result<Option<Rect>> {
+    let Some(scan) = scan_columns(frames)? else {
         return Ok(None);
     };
     let (w, h) = (scan.w, scan.h);
+    let stdmap = hue_stdmap(&scan.satmap, &scan.huemap, w as usize, h as usize);
     let (rw, rh) = (roi.width.max(1), roi.height.max(1));
     // 竖边应纵贯手画框的高度;窗口放宽 30% 容错
     let (y0, y1) = (
@@ -703,11 +775,37 @@ pub fn snap_camera_frame(minimap: &core::Mat, roi: &Rect) -> opencv::Result<Opti
         let t = ((x - side).abs() as f64 / span as f64).min(1.0);
         (1.0 - t) * (1.0 - t)
     };
-    let snap_side = |side: i32| -> Option<i32> {
+    // 贴条内 hue 方差均值(罩色区会很低)
+    let strip_std = |xa: i32, xb: i32| -> f64 {
+        let xa = xa.max(0);
+        let xb = xb.min(w - 1);
+        if xa > xb {
+            return 90.0;
+        }
+        let (mut s, mut n) = (0.0, 0i32);
+        for y in y0..=y1 {
+            for x in xa..=xb {
+                s += stdmap[y as usize][x as usize];
+                n += 1;
+            }
+        }
+        if n == 0 {
+            90.0
+        } else {
+            s / n as f64
+        }
+    };
+
+    // inside_dir: +1 = 内部在右侧(左边), -1 = 内部在左侧(右边)
+    let snap_side = |side: i32, inside_dir: i32| -> Option<i32> {
         let lo = (side - span).max(0);
         let hi = (side + span).min(w - 1);
         let mut scored: Vec<(f64, f64, f64, i32)> = Vec::new();
         for x in lo..=hi {
+            // 距图缘 <6px 的列基本是地图边框;真框边贴图缘时吸不动也只是退回手画
+            if x < 6 || x > w - 7 {
+                continue;
+            }
             let xa = (x - 1).max(0) as usize;
             let xb = ((x + 1) as usize).min(scan.ecol[0].len() - 1);
             let mut n = 0i32;
@@ -724,33 +822,68 @@ pub fn snap_camera_frame(minimap: &core::Mat, roi: &Rect) -> opencv::Result<Opti
                 }
                 _ => 0.0,
             };
-            let score = den * (0.5 + step.min(40.0) / 40.0) * decay(x, side);
-            scored.push((score, den, step, x));
+            // 内平外花:罩色框内侧方差远低于外侧 -> flatstep 大
+            let (ia, ib, oa, ob) = if inside_dir > 0 {
+                (x + 2, x + 12, x - 12, x - 2)
+            } else {
+                (x - 12, x - 2, x + 2, x + 12)
+            };
+            let flatstep = strip_std(oa, ob) - strip_std(ia, ib);
+            let score = (den * (0.5 + step.min(40.0) / 40.0)
+                + (flatstep / 25.0).clamp(-0.5, 1.0) * 0.5)
+                * decay(x, side);
+            scored.push((score, den, flatstep, x));
         }
         if debug {
             let mut top = scored.clone();
             top.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
             eprintln!("snap side={} top:", side);
             for (s, d, st, x) in top.iter().take(6) {
-                eprintln!("  x{}: score={:.3} den={:.2} step={:.0}", x, s, d, st);
+                eprintln!("  x{}: score={:.3} den={:.2} flatstep={:.0}", x, s, d, st);
             }
         }
-        let (_, den, _, x) = scored
+        // 先过闸再比分:淡框边得分可能输给近处杂讯,但杂讯过不了闸
+        // (den>=0.10 有线边,或 flatstep>=15 内侧是罩色平坦区)
+        scored
             .into_iter()
-            .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap())?;
-        (den >= 0.20).then_some(x)
+            .filter(|(_, den, fs, _)| *den >= 0.10 || *fs >= 15.0)
+            .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap())
+            .map(|(_, _, _, x)| x)
     };
 
-    let left = snap_side(roi.x).unwrap_or(roi.x);
+    let left = snap_side(roi.x, 1).unwrap_or(roi.x);
     // 左边定了,罩色 hue 就能取出来——右边要求"内侧贴条像罩色、外侧不像"的
     // 台阶(drop)。无边框罩色时所有 drop≈0,退回普通密度打分。
     let right = {
         let in_hi = (rw / 3).min(70).max(10);
-        let h_in = mean_hue(left + 8, left + in_hi);
+        // 只有内侧 hue 与"全图主导色"显著不同时 h_in 才是罩色框色;
+        // 线框/素色图内侧就是普通地图色,drop 闸会乱命中结构边
+        let map_dom = {
+            let mut hist = [0i32; 36];
+            for y in 0..h {
+                for x in 0..w {
+                    if scan.satmap[y as usize][x as usize] > 80 {
+                        hist[(scan.huemap[y as usize][x as usize] as usize / 5).min(35)] += 1;
+                    }
+                }
+            }
+            hist.iter()
+                .enumerate()
+                .max_by_key(|(_, v)| *v)
+                .map(|(k, _)| k as f64 * 5.0)
+                .unwrap_or(0.0)
+        };
+        let h_in = mean_hue(left + 8, left + in_hi).filter(|&he| {
+            let d = (he - map_dom).abs() % 180.0;
+            d.min(180.0 - d) > 15.0
+        });
         let lo = (roi.x + roi.width - span).max(left + w * 10 / 100);
         let hi = (roi.x + roi.width + span).min(w - 1);
         let mut scored: Vec<(f64, f64, f64, i32)> = Vec::new();
         for x in lo..=hi {
+            if x < 6 || x > w - 7 {
+                continue;
+            }
             let xa = (x - 1).max(0) as usize;
             let xb = ((x + 1) as usize).min(scan.ecol[0].len() - 1);
             let mut n = 0i32;
@@ -765,25 +898,28 @@ pub fn snap_camera_frame(minimap: &core::Mat, roi: &Rect) -> opencv::Result<Opti
                 None => 0.0,
             };
             let dc = decay(x, roi.x + roi.width);
+            // 内部在左侧:内侧贴条[x-12,x-2],外侧[x+2,x+12]
+            let flatstep = strip_std(x + 2, x + 12) - strip_std(x - 12, x - 2);
             let score = if drop >= 0.15 && den >= 0.20 {
                 den * (0.2 + drop) + 10.0 // 过闸的优先一大截(罩色台阶已够特异,不再衰减)
             } else {
-                den * 0.5 * dc
+                (den * 0.5 + (flatstep / 25.0).clamp(-0.5, 1.0) * 0.5) * dc
             };
-            scored.push((score, den, drop, x));
+            scored.push((score, den, flatstep, x));
         }
         if debug {
             let mut top = scored.clone();
             top.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
             eprintln!("snap side=R(drop) h_in={:?} top:", h_in);
             for (s, d, dr, x) in top.iter().take(6) {
-                eprintln!("  x{}: score={:.3} den={:.2} drop={:.2}", x, s, d, dr);
+                eprintln!("  x{}: score={:.3} den={:.2} flatstep={:.0}", x, s, d, dr);
             }
         }
         scored
             .into_iter()
+            .filter(|(_, den, fs, _)| *den >= 0.10 || *fs >= 15.0)
             .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap())
-            .and_then(|(_, den, _, x)| (den >= 0.20).then_some(x))
+            .map(|(_, _, _, x)| x)
             .unwrap_or(roi.x + roi.width)
     };
     if left == roi.x && right == roi.x + roi.width {
@@ -891,17 +1027,54 @@ impl ValueVoter {
     }
 
     pub fn push(&mut self, v: i32) -> Option<i32> {
+        self.push_fuzzy(v, 0)
+    }
+
+    /// 容差匹配:|x-c|<=tol 视为同值。OCR 相邻数字误读(16/17)时能聚类,
+    /// 避免读数抖动导致稳定值永远翻不过来
+    pub fn push_fuzzy(&mut self, v: i32, tol: i32) -> Option<i32> {
         self.buf.push(v);
         if self.buf.len() > self.cap {
             self.buf.remove(0);
         }
         let need = self.cap / 2 + 1;
         for &c in self.buf.iter() {
-            if self.buf.iter().filter(|&&x| x == c).count() >= need {
+            if self.buf.iter().filter(|&&x| (x - c).abs() <= tol).count() >= need {
                 return Some(c);
             }
         }
         None
+    }
+
+    pub fn clear(&mut self) {
+        self.buf.clear();
+    }
+}
+
+/// 中位数投票:保留最近 cap 个成功读数,满半数后每帧输出中位数。
+/// 对 ±2 以内的 OCR 抖动免疫([82,83,85,89]→85),单个离群值也不翻票;
+/// 比"3取2一致"收敛快得多——读数抖动时一致条件可能永远凑不齐。
+pub struct MedianVoter {
+    buf: Vec<i32>,
+    cap: usize,
+}
+
+impl MedianVoter {
+    pub fn new(cap: usize) -> Self {
+        Self { buf: Vec::new(), cap: cap.max(3) }
+    }
+
+    pub fn push(&mut self, v: i32) -> Option<i32> {
+        self.buf.push(v);
+        if self.buf.len() > self.cap {
+            self.buf.remove(0);
+        }
+        if self.buf.len() < self.cap / 2 + 1 {
+            return None;
+        }
+        let mut s = self.buf.clone();
+        s.sort_unstable();
+        Some(s[s.len() / 2])
     }
 
     pub fn clear(&mut self) {

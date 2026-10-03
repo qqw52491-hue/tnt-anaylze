@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>com.tnt.mac-stt</string>
+    <key>CFBundleName</key>
+    <string>mac_stt</string>
+    <key>NSSpeechRecognitionUsageDescription</key>
+    <string>语音识别用于把口述的"正/负+数字"转换成风速值</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>按住右Option键说话时需要用麦克风录音</string>
+    <key>LSUIElement</key>
+    <true/>
+</dict>
+</plist>

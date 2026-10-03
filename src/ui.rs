@@ -901,6 +901,166 @@ impl UiRecognizer {
         eprintln!("[ui] 匹配失败 -> {}  前三名: {}", path, top.join("  "));
     }
 
+    /// 表盘几何法读角度:青色圆环bbox定圆心→环内提白色虚线珠子→
+    /// 只取离圆心最近的45颗(发射口附近,抛物线还没弯曲,方向≈瞄准角)→
+    /// RANSAC找"过圆心±0.2R"的最内线→PCA方向角。
+    /// 比数字OCR稳得多:表盘半透明会污染数字,但虚线颜色仍然好提;
+    /// 且量的是几何方向,不存在"8认成3"。
+    /// 要求角度框包含整个表盘;表盘没显示/圆环缺失返回None。
+    /// 值域 0..=90:左瞄镜像折回右向,与物理的角度上限约定一致。
+    /// 实测 5/5 命中:43→43.1, 61→60.6, 6→5.9, 23→22.6, 98→83.4
+    pub fn recognize_angle_dial(&self, roi: &core::Mat) -> opencv::Result<Option<i32>> {
+        let (w, h) = (roi.cols(), roi.rows());
+        if w < 60 || h < 60 {
+            return Ok(None);
+        }
+        // 1) 青色圆环(b>140,g>120,r<130)的包围盒 → 圆心+半径;
+        //    框若裁掉圆环一侧,bbox中心会偏→角度整体偏1°。
+        //    检测宽高比失衡时用完整方向的直径反推缺侧圆心。
+        let (mut x0, mut x1, mut y0, mut y1, mut ring_n) =
+            (i32::MAX, 0i32, i32::MAX, 0i32, 0i32);
+        for y in 0..h {
+            for x in 0..w {
+                let px = roi.at_2d::<core::Vec3b>(y, x)?;
+                let (b, g, r) = (px[0] as i32, px[1] as i32, px[2] as i32);
+                if b > 140 && g > 120 && r < 130 && (b - r) > 60 {
+                    x0 = x0.min(x);
+                    x1 = x1.max(x);
+                    y0 = y0.min(y);
+                    y1 = y1.max(y);
+                    ring_n += 1;
+                }
+            }
+        }
+        if ring_n < 100 {
+            return Ok(None); // 表盘/圆环没显示
+        }
+        let (bw, bh) = ((x1 - x0).max(1), (y1 - y0).max(1));
+        let (rx, ry) = (bw as f64 / 2.0, bh as f64 / 2.0);
+        let mut cx = (x0 + x1) as f64 / 2.0;
+        let mut cy = (y0 + y1) as f64 / 2.0;
+        // 某方向跨度明显小于另一方向 → 该方向被裁,用另一侧直径补圆心
+        if bh < (bw as f64 * 0.85) as i32 {
+            // 上/下各1/5带的环点数,少的一侧是缺侧
+            let (mut top, mut bot) = (0i32, 0i32);
+            for y in 0..h {
+                for x in 0..w {
+                    let px = roi.at_2d::<core::Vec3b>(y, x)?;
+                    let (b, g, r) = (px[0] as i32, px[1] as i32, px[2] as i32);
+                    if !(b > 140 && g > 120 && r < 130 && (b - r) > 60) {
+                        continue;
+                    }
+                    if y < y0 + bh / 5 {
+                        top += 1;
+                    } else if y > y1 - bh / 5 {
+                        bot += 1;
+                    }
+                }
+            }
+            cy = if bot < top { y0 as f64 + rx } else { y1 as f64 - rx };
+        }
+        if bw < (bh as f64 * 0.85) as i32 {
+            let (mut lft, mut rgt) = (0i32, 0i32);
+            for y in 0..h {
+                for x in 0..w {
+                    let px = roi.at_2d::<core::Vec3b>(y, x)?;
+                    let (b, g, r) = (px[0] as i32, px[1] as i32, px[2] as i32);
+                    if !(b > 140 && g > 120 && r < 130 && (b - r) > 60) {
+                        continue;
+                    }
+                    if x < x0 + bw / 5 {
+                        lft += 1;
+                    } else if x > x1 - bw / 5 {
+                        rgt += 1;
+                    }
+                }
+            }
+            cx = if rgt < lft { x0 as f64 + ry } else { x1 as f64 - ry };
+        }
+        let rdia = rx.max(ry);
+        if rdia < 30.0 {
+            return Ok(None);
+        }
+        // 2) 白色珠子(相对圆心):内圈[0.25R,0.70R],跳过中心横线带|dy|<5
+        let mut pts: Vec<(f64, f64, f64)> = Vec::new(); // (r, dx, dy)
+        for y in 0..h {
+            for x in 0..w {
+                let dx = x as f64 - cx;
+                let dy = y as f64 - cy;
+                let r = (dx * dx + dy * dy).sqrt();
+                if r < rdia * 0.25 || r > rdia * 0.70 || dy.abs() < 5.0 {
+                    continue;
+                }
+                let px = roi.at_2d::<core::Vec3b>(y, x)?;
+                let (b, g, rr) = (px[0] as i32, px[1] as i32, px[2] as i32);
+                if b > 190 && g > 190 && rr > 190 {
+                    pts.push((r, dx, dy));
+                }
+            }
+        }
+        if pts.len() < 12 {
+            return Ok(None);
+        }
+        // 3) 只留最近45颗:发射口前段近似直线,远处抛物线弯向垂直会带偏
+        pts.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        let near: Vec<(f64, f64)> = pts[..pts.len().min(45)]
+            .iter()
+            .map(|p| (p.1, p.2))
+            .collect();
+        // 4) RANSAC:点对定线,要求过圆心±0.2R(场景杂线被淘汰),
+        //    内点(±3px)最多者胜;确定性LCG不用引rand
+        let mut rng = 0x9e3779b9u64;
+        let mut best_inliers: Vec<(f64, f64)> = Vec::new();
+        for _ in 0..400 {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            let i = (rng as usize) % near.len();
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            let j = (rng as usize) % near.len();
+            if i == j {
+                continue;
+            }
+            let (ax, ay) = near[i];
+            let (bx, by) = near[j];
+            let (dx, dy) = (bx - ax, by - ay);
+            let len = (dx * dx + dy * dy).sqrt();
+            if len < 1.0 {
+                continue;
+            }
+            let (ux, uy) = (dx / len, dy / len);
+            let c = ax * uy - ay * ux;
+            if c.abs() > rdia * 0.2 {
+                continue;
+            }
+            let inl: Vec<(f64, f64)> = near
+                .iter()
+                .filter(|p| (p.0 * uy - p.1 * ux - c).abs() < 3.0)
+                .cloned()
+                .collect();
+            if inl.len() > best_inliers.len() {
+                best_inliers = inl;
+            }
+        }
+        if best_inliers.len() < 10 {
+            return Ok(None);
+        }
+        // 5) PCA 主方向 → 0..90
+        let n = best_inliers.len() as f64;
+        let mx = best_inliers.iter().map(|p| p.0).sum::<f64>() / n;
+        let my = best_inliers.iter().map(|p| p.1).sum::<f64>() / n;
+        let sxy: f64 = best_inliers.iter().map(|p| (p.0 - mx) * (p.1 - my)).sum();
+        let sxx: f64 = best_inliers.iter().map(|p| (p.0 - mx) * (p.0 - mx)).sum();
+        let syy: f64 = best_inliers.iter().map(|p| (p.1 - my) * (p.1 - my)).sum();
+        let mut ang = (0.5 * (2.0 * sxy).atan2(sxx - syy)).to_degrees().abs();
+        if ang > 90.0 {
+            ang = 180.0 - ang;
+        }
+        Ok(Some(ang.round() as i32))
+    }
+
     /// 角度识别 (基于模板匹配)，返回 (角度, 最低一位的置信度)。
     ///
     /// 屏幕上的角度可以到三位数：反抛物线往身后打时会显示 91..=180。
@@ -994,6 +1154,246 @@ impl UiRecognizer {
     /// 角度识别 (兼容旧签名)
     pub fn recognize_angle_digit(&self, angle_roi: &core::Mat) -> opencv::Result<Option<i32>> {
         Ok(self.recognize_angle_digit_conf(angle_roi)?.0)
+    }
+
+    /// 风速识别:顶部"箭头 + 数字(可带小数点)"指示。
+    /// 返回带符号的绝对风速(正=向右吹,负=向左吹),认不出来返回 None。
+    /// 复用角度数字的二值化/模板管线;数字认不全整帧作废——沿用上次稳定值也不读错。
+    pub fn recognize_wind(&self, roi: &core::Mat) -> opencv::Result<Option<f64>> {
+        let (mask, gray, _combo) = self.binarize_and_clean(roi)?;
+        if mask.cols() < 15 || mask.rows() < 10 {
+            return Ok(None);
+        }
+
+        let mut labels = core::Mat::default();
+        let mut stats = core::Mat::default();
+        let mut cents = core::Mat::default();
+        let num = imgproc::connected_components_with_stats(
+            &mask, &mut labels, &mut stats, &mut cents, 8, core::CV_32S,
+        )?;
+
+        let mut comps: Vec<Rect> = Vec::new();
+        for i in 1..num {
+            let x = *stats.at_2d::<i32>(i, imgproc::CC_STAT_LEFT)?;
+            let y = *stats.at_2d::<i32>(i, imgproc::CC_STAT_TOP)?;
+            let w = *stats.at_2d::<i32>(i, imgproc::CC_STAT_WIDTH)?;
+            let h = *stats.at_2d::<i32>(i, imgproc::CC_STAT_HEIGHT)?;
+            let area = *stats.at_2d::<i32>(i, imgproc::CC_STAT_AREA)?;
+            if area < 12 || w < 2 || h < 2 {
+                continue;
+            }
+            comps.push(Rect::new(x, y, w, h));
+        }
+        if comps.is_empty() {
+            return Ok(None);
+        }
+
+        // 主行 = 最高组件所在行:风速显示就一行,高件(数字/箭头)留下,
+        // 偏离中线的别行杂点剔除。
+        let hmax = comps.iter().map(|r| r.height).max().unwrap() as f64;
+        let mut tall: Vec<Rect> = comps
+            .iter()
+            .cloned()
+            .filter(|r| r.height as f64 >= hmax * 0.5)
+            .collect();
+        if tall.is_empty() {
+            return Ok(None);
+        }
+        let mut cys: Vec<f64> = tall
+            .iter()
+            .map(|r| r.y as f64 + r.height as f64 / 2.0)
+            .collect();
+        cys.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let med_cy = cys[cys.len() / 2];
+        tall.retain(|r| {
+            ((r.y as f64 + r.height as f64 / 2.0) - med_cy).abs() <= hmax * 0.4
+        });
+        if tall.is_empty() {
+            return Ok(None);
+        }
+        tall.sort_by_key(|r| r.x);
+        let band_top = tall.iter().map(|r| r.y).min().unwrap();
+        let band_bot = tall.iter().map(|r| r.y + r.height).max().unwrap();
+        let band_h = (band_bot - band_top) as f64;
+
+        // 高件逐个过数字模板:认出来是数字,认不出来是箭头/杂件。
+        let mut pieces: Vec<(Rect, Option<u8>)> = Vec::new();
+        for r in &tall {
+            let sub = core::Mat::roi(&gray, *r)?.try_clone()?;
+            let t40 = self.to_template_40(&sub)?;
+            let (adj, raw) = self.score_digits(&t40)?;
+            let (bi, ba, sa) = Self::pick_best(&adj);
+            let ok = raw[bi] >= SIM_MIN && (ba - sa) >= SIM_MARGIN;
+            pieces.push((*r, if ok { Some(bi as u8) } else { None }));
+        }
+
+        // 数字串 = 连续数字段(间隔 <= band_h),取最长的一段。
+        let mut best_run: Vec<(Rect, u8)> = Vec::new();
+        let mut cur: Vec<(Rect, u8)> = Vec::new();
+        let mut last_x_end: Option<i32> = None;
+        for (r, d) in &pieces {
+            match d {
+                Some(dv) => {
+                    let contiguous = last_x_end
+                        .map(|e| r.x - e <= band_h as i32)
+                        .unwrap_or(true);
+                    if !contiguous {
+                        if cur.len() > best_run.len() {
+                            best_run = std::mem::take(&mut cur);
+                        } else {
+                            cur.clear();
+                        }
+                    }
+                    cur.push((*r, *dv));
+                    last_x_end = Some(r.x + r.width);
+                }
+                None => {}
+            }
+        }
+        if cur.len() > best_run.len() {
+            best_run = cur;
+        }
+        if best_run.is_empty() {
+            return Ok(None);
+        }
+        let run_l = best_run.first().unwrap().0.x;
+        let run_r = best_run.last().unwrap().0.x + best_run.last().unwrap().0.width;
+
+        // 小数点:矮件(h <= band_h*0.45)、底对齐数字行底、落在数字串内部。
+        let mut dot_x: Option<i32> = None;
+        for r in &comps {
+            let rh = r.height as f64;
+            if rh <= band_h * 0.45
+                && (r.width as f64) <= rh * 1.5
+                && (band_bot - (r.y + r.height)).abs() as f64 <= band_h * 0.45
+                && r.x > run_l
+                && r.x + r.width < run_r
+            {
+                dot_x = Some(r.x + r.width / 2);
+            }
+        }
+
+        // 拼值:小数点左侧数字为整数位,右侧为小数位。
+        let mut int_part = 0i64;
+        let mut frac_part = 0i64;
+        let mut frac_len = 0i32;
+        for (r, d) in &best_run {
+            let cx = r.x + r.width / 2;
+            if let Some(dx) = dot_x {
+                if cx > dx {
+                    frac_part = frac_part * 10 + *d as i64;
+                    frac_len += 1;
+                    continue;
+                }
+            }
+            int_part = int_part * 10 + *d as i64;
+        }
+        let mut mag = int_part as f64 + frac_part as f64 / 10f64.powi(frac_len);
+        if dot_x.is_none() && best_run.len() >= 2 && mag >= 30.0 {
+            // 点没识别到时的兜底:"58"多半是 5.8。
+            mag /= 10.0;
+        }
+        if !(0.0..=30.0).contains(&mag) {
+            return Ok(None);
+        }
+
+        // 方向:数字串左右相邻的非数字件 = 箭头,看尖端朝哪边;
+        // 数字串左边的扁平短横 = 负号(风速直接带符号的情况)。
+        let mut sign = 1.0f64;
+        let mut arrow_dir: Option<f64> = None;
+        for (r, d) in &pieces {
+            if d.is_some() {
+                continue;
+            }
+            let gap = if r.x + r.width <= run_l {
+                run_l - (r.x + r.width)
+            } else if r.x >= run_r {
+                r.x - run_r
+            } else {
+                continue;
+            };
+            if gap > band_h as i32 * 2 {
+                continue;
+            }
+            // 扁平短横 -> 负号
+            if (r.height as f64) <= band_h * 0.4
+                && (r.width as f64) >= r.height as f64 * 1.3
+                && r.x + r.width <= run_l
+            {
+                sign = -1.0;
+                continue;
+            }
+            let d = self.arrow_tip_dir(&mask, r)?;
+            if d != 0.0 && arrow_dir.is_none() {
+                arrow_dir = Some(d);
+            }
+        }
+        let signed = match arrow_dir {
+            Some(d) => d * mag,
+            None => sign * mag,
+        };
+        Ok(Some(signed))
+    }
+
+    /// 箭头方向判断:尖的一端墨水少(顶点/箭头尖),平的一端墨水多。
+    /// 对 '<' '>' 尖括号和 '←' '→' 实心箭头都成立——两种字形的尖端
+    /// 都是从单点向里张开的。返回 -1 朝左 / +1 朝右 / 0 认不出。
+    fn arrow_tip_dir(&self, mask: &core::Mat, r: &Rect) -> opencv::Result<f64> {
+        let sub = core::Mat::roi(mask, *r)?;
+        let col_ext = |x: i32| -> opencv::Result<i32> {
+            let mut top = -1;
+            let mut bot = -1;
+            for y in 0..sub.rows() {
+                if *sub.at_2d::<u8>(y, x)? > 0 {
+                    if top < 0 {
+                        top = y;
+                    }
+                    bot = y;
+                }
+            }
+            Ok(if top < 0 { -1 } else { bot - top + 1 })
+        };
+        let w = sub.cols();
+        let h = sub.rows();
+        // 端点 extent:第一个有墨的列;参照 extent:20% 宽度处的列
+        let probe = |from_left: bool| -> opencv::Result<Option<(i32, i32)>> {
+            let xs: Vec<i32> = if from_left {
+                (0..w).collect()
+            } else {
+                (0..w).rev().collect()
+            };
+            let mut first: Option<i32> = None;
+            let mut first_i = 0usize;
+            for (i, &x) in xs.iter().enumerate() {
+                let e = col_ext(x)?;
+                if e >= 0 {
+                    if first.is_none() {
+                        first = Some(e);
+                        first_i = i;
+                    }
+                    if i >= first_i + ((w as f64 * 0.2).max(1.0)) as usize {
+                        return Ok(Some((first.unwrap(), e)));
+                    }
+                }
+            }
+            Ok(None)
+        };
+        let tip_at = |p: Option<(i32, i32)>| -> bool {
+            match p {
+                Some((e0, e1)) => e0 >= 1 && e0 <= (e1 as f64 * 0.5).max(2.0) as i32,
+                None => false,
+            }
+        };
+        let l_tip = tip_at(probe(true)?);
+        let r_tip = tip_at(probe(false)?);
+        // 细长件(h << w)两端都可能"尖",用它相对行高的占比再过滤
+        if l_tip == r_tip {
+            return Ok(0.0);
+        }
+        if (w as f64) < (h as f64) * 0.4 {
+            return Ok(0.0); // 太窄,可能是残笔
+        }
+        Ok(if l_tip { -1.0 } else { 1.0 })
     }
 
     /// 把 ROI 夹到画面范围内，防止分辨率异常时 Mat::roi 直接 panic。
