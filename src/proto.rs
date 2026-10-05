@@ -200,6 +200,14 @@ pub struct PlayerInit {
     pub angle_hint: u64,
 }
 
+/// Client BattleCommandAction::init uses signed 32-bit XORs before display.
+pub fn decode_wind10(raw: i64, round: u64, speed: u64, order: &[u64]) -> i32 {
+    order.iter().fold(
+        raw as i32 ^ round as i32 ^ speed as i32,
+        |wind, &id| wind ^ id as i32,
+    )
+}
+
 #[derive(Clone, Debug)]
 pub enum GameEvent {
     /// Battle init: players + map world size.
@@ -208,13 +216,15 @@ pub enum GameEvent {
         map_h: u64,
         players: Vec<PlayerInit>,
     },
-    /// Turn boundary carrying the type-8 field-4 raw wind/seed value
-    /// (decode not yet confirmed).
+    /// Turn boundary: f1=round, f2=repeated order, f3=speed, f4=raw seed.
+    /// `wind10` is the signed world wind in tenths decoded by
+    /// [`decode_wind10`]; None when any required field is missing.
     WindSeed {
         round: u64,
         order: Vec<u64>,
-        scale: u64,
+        speed: u64,
         seed: i64,
+        wind10: Option<i32>,
     },
     /// Per-player attribute block inside a type-9 update.
     PlayerUpdate {
@@ -285,14 +295,25 @@ pub fn decode_envelope(env: &Envelope) -> Vec<GameEvent> {
                         });
                     }
                 }
-                // Turn start: {1: round, 2: repeated order, 3: scale, 4: seed}
+                // Turn start: {1: round, 2: repeated order, 3: speed, 4: seed}
                 8 => {
                     if let Some(w) = fields.subs(8).into_iter().next() {
+                        let round = w.varint(1);
+                        let speed = w.varint(3);
+                        let seed = w.varint(4).map(|raw| raw as i32 as i64);
+                        let order = w.varints(2);
+                        let wind10 = match (round, speed, seed, order.is_empty()) {
+                            (Some(round), Some(speed), Some(seed), false) => {
+                                Some(decode_wind10(seed, round, speed, &order))
+                            }
+                            _ => None,
+                        };
                         out.push(GameEvent::WindSeed {
-                            round: w.varint(1).unwrap_or(0),
-                            order: w.varints(2),
-                            scale: w.varint(3).unwrap_or(0),
-                            seed: w.varint(4).unwrap_or(0) as i64,
+                            round: round.unwrap_or(0),
+                            order,
+                            speed: speed.unwrap_or(0),
+                            seed: seed.unwrap_or(0),
+                            wind10,
                         });
                     }
                 }
@@ -429,6 +450,227 @@ mod tests {
                 assert_eq!(*path, vec![(444, 865), (752, 414)]);
             }
             other => panic!("expected Flight, got {other:?}"),
+        }
+    }
+
+    // ---- wind decode regression (frozen wind_decode_validation.json) ----
+
+    /// (round, speed, raw, order, expected wind10) — frozen offline records.
+    const FROZEN: &[(u64, u64, i64, &[u64], i32)] = &[
+        (1, 100, -447, &[74108, 73884, 0], -60),
+        (1, 100, 447, &[73884, 0, 74108], 58),
+        (2, 100, 469, &[73884, 74108, 0], 83),
+        (2, 100, 449, &[74108, 0, 73884], 71),
+        (3, 100, 486, &[73884, 74108, 0], 97),
+        (3, 100, 484, &[74108, 0, 73884], 99),
+        (4, 100, 465, &[73884, 74108, 0], 81),
+        (4, 100, -434, &[74108, 0, 73884], -50),
+        (5, 100, -470, &[73884, 74108, 0], -85),
+        (5, 100, 467, &[74108, 0, 73884], 82),
+        (1, 100, -130217, &[56817, 74108, 0], -65),
+        (1, 100, 130226, &[74108, 0, 56817], 90),
+        (2, 100, 130260, &[74108, 56817, 0], 63),
+        (1, 100, 125170, &[65432, 48235, 26895, 13375, 55164, 74108, 0], 84),
+        (1, 100, 125160, &[48235, 26895, 13375, 55164, 74108, 0, 65432], 78),
+        (1, 100, -125160, &[26895, 13375, 55164, 74108, 0, 48235, 65432], -66),
+        (1, 100, 87282, &[13375, 55164, 74108, 0, 65432, 26895], 63),
+        (1, 100, 109417, &[55164, 74108, 0, 26895, 13375], 60),
+        (1, 100, -109338, &[74108, 0, 55164, 26895, 13375], -77),
+        (2, 100, 109332, &[55164, 26895, 13375, 74108, 0], 66),
+        (2, 100, -109319, &[26895, 13375, 74108, 0, 55164], -81),
+        (2, 100, -109419, &[13375, 74108, 0, 55164, 26895], -61),
+        (2, 100, 109338, &[74108, 0, 55164, 26895, 13375], 76),
+        (3, 100, 109412, &[55164, 26895, 13375, 74108, 0], 51),
+        (3, 100, 109409, &[26895, 13375, 74108, 0, 55164], 54),
+        (3, 100, 35454, &[13375, 0, 55164, 26895], 85),
+        (1, 100, 8690, &[65717, 74108, 0], 94),
+        (1, 100, 8674, &[74108, 0, 65717], 78),
+        (2, 100, 8605, &[74108, 65717, 0], 50),
+        (2, 100, 8699, &[65717, 0, 74108], 84),
+        (3, 100, 8688, &[74108, 65717, 0], 94),
+        (3, 100, -8602, &[65717, 0, 74108], -56),
+    ];
+
+    #[test]
+    fn decode_wind10_matches_frozen_records() {
+        for &(round, speed, raw, order, expected) in FROZEN {
+            assert_eq!(
+                decode_wind10(raw, round, speed, order),
+                expected,
+                "round={round} speed={speed} raw={raw} order={order:?}"
+            );
+        }
+    }
+
+    fn push_varint(out: &mut Vec<u8>, mut v: u64) {
+        loop {
+            let b = (v & 0x7f) as u8;
+            v >>= 7;
+            if v == 0 {
+                out.push(b);
+                return;
+            }
+            out.push(b | 0x80);
+        }
+    }
+
+    fn push_tag(out: &mut Vec<u8>, no: u64, wire: u64) {
+        push_varint(out, (no << 3) | wire);
+    }
+
+    /// Build a BattleNotify type-8 envelope; `packed` switches the order list
+    /// between length-delimited packed and repeated-varint encodings.
+    /// raw is encoded as a varint of its sign-extended u64 (proto int32/64).
+    fn wind_seed_env(
+        round: Option<u64>,
+        order: &[u64],
+        speed: Option<u64>,
+        raw: Option<i64>,
+        packed: bool,
+    ) -> Envelope {
+        let mut w = Vec::new();
+        if let Some(r) = round {
+            push_tag(&mut w, 1, 0);
+            push_varint(&mut w, r);
+        }
+        if packed {
+            let mut p = Vec::new();
+            for &o in order {
+                push_varint(&mut p, o);
+            }
+            push_tag(&mut w, 2, 2);
+            push_varint(&mut w, p.len() as u64);
+            w.extend(p);
+        } else {
+            for &o in order {
+                push_tag(&mut w, 2, 0);
+                push_varint(&mut w, o);
+            }
+        }
+        if let Some(s) = speed {
+            push_tag(&mut w, 3, 0);
+            push_varint(&mut w, s);
+        }
+        if let Some(r) = raw {
+            push_tag(&mut w, 4, 0);
+            push_varint(&mut w, r as u64);
+        }
+        let mut body = Vec::new();
+        push_tag(&mut body, 1, 0);
+        push_varint(&mut body, 7); // seq
+        push_tag(&mut body, 2, 0);
+        push_varint(&mut body, 8); // ntype
+        push_tag(&mut body, 8, 2);
+        push_varint(&mut body, w.len() as u64);
+        body.extend(w);
+        Envelope {
+            name: "BattleNotify".to_string(),
+            body,
+        }
+    }
+
+    fn decode_wind(env: &Envelope) -> (u64, Vec<u64>, u64, i64, Option<i32>) {
+        let events = decode_envelope(env);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            GameEvent::WindSeed {
+                round,
+                order,
+                speed,
+                seed,
+                wind10,
+            } => (*round, order.clone(), *speed, *seed, *wind10),
+            other => panic!("expected WindSeed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wind_seed_decodes_positive_wind() {
+        let env = wind_seed_env(Some(2), &[74108, 0, 73884], Some(100), Some(449), false);
+        let (round, order, speed, seed, wind10) = decode_wind(&env);
+        assert_eq!(round, 2);
+        assert_eq!(order, vec![74108, 0, 73884]);
+        assert_eq!(speed, 100);
+        assert_eq!(seed, 449);
+        assert_eq!(wind10, Some(71));
+    }
+
+    #[test]
+    fn wind_seed_decodes_negative_raw_sign_extended() {
+        // -447 on the wire is the 10-byte sign-extended varint of u64.
+        let env = wind_seed_env(Some(1), &[74108, 73884, 0], Some(100), Some(-447), false);
+        let (_, _, _, seed, wind10) = decode_wind(&env);
+        assert_eq!(seed, -447);
+        assert_eq!(wind10, Some(-60));
+    }
+
+    #[test]
+    fn wind_seed_packed_order_matches_unpacked() {
+        let a = wind_seed_env(Some(1), &[56817, 74108, 0], Some(100), Some(-130217), true);
+        let b = wind_seed_env(Some(1), &[56817, 74108, 0], Some(100), Some(-130217), false);
+        assert_eq!(decode_wind(&a), decode_wind(&b));
+        assert_eq!(decode_wind(&a).4, Some(-65));
+    }
+
+    #[test]
+    fn wind_seed_order_reorder_is_invariant() {
+        let a = wind_seed_env(Some(2), &[74108, 0, 73884], Some(100), Some(449), false);
+        let b = wind_seed_env(Some(2), &[73884, 0, 74108], Some(100), Some(449), false);
+        assert_eq!(decode_wind(&a).4, Some(71));
+        assert_eq!(decode_wind(&b).4, Some(71));
+    }
+
+    #[test]
+    fn wind_seed_six_player_order() {
+        let env = wind_seed_env(
+            Some(1),
+            &[65432, 48235, 26895, 13375, 55164, 74108, 0],
+            Some(100),
+            Some(125170),
+            false,
+        );
+        assert_eq!(decode_wind(&env).4, Some(84));
+        let env = wind_seed_env(
+            Some(1),
+            &[26895, 13375, 55164, 74108, 0, 48235, 65432],
+            Some(100),
+            Some(-125160),
+            false,
+        );
+        assert_eq!(decode_wind(&env).4, Some(-66));
+    }
+
+    #[test]
+    fn wind_seed_raw_zero_is_valid_complete_action() {
+        // raw=0 is a real field value, not "missing": order [1] decodes 10.0.
+        let env = wind_seed_env(Some(1), &[1], Some(100), Some(0), false);
+        let (_, _, _, seed, wind10) = decode_wind(&env);
+        assert_eq!(seed, 0);
+        assert_eq!(wind10, Some(100));
+    }
+
+    #[test]
+    fn wind_seed_true_zero_wind() {
+        let env = wind_seed_env(Some(1), &[74108, 73884, 0], Some(100), Some(389), false);
+        assert_eq!(decode_wind(&env).4, Some(0));
+    }
+
+    #[test]
+    fn wind_seed_decodes_above_old_25_5_limit() {
+        let env = wind_seed_env(Some(1), &[74108, 73884, 0], Some(100), Some(169), false);
+        assert_eq!(decode_wind(&env).4, Some(300));
+    }
+
+    #[test]
+    fn wind_seed_missing_fields_decode_none() {
+        // Each incomplete action still emits WindSeed but never guesses wind.
+        for env in [
+            wind_seed_env(None, &[74108, 73884, 0], Some(100), Some(389), false),
+            wind_seed_env(Some(1), &[74108, 73884, 0], None, Some(389), false),
+            wind_seed_env(Some(1), &[74108, 73884, 0], Some(100), None, false),
+            wind_seed_env(Some(1), &[], Some(100), Some(389), false),
+        ] {
+            assert_eq!(decode_wind(&env).4, None);
         }
     }
 }

@@ -1,39 +1,42 @@
 # TNT 弹道 HUD
 
-Rust+OpenCV 弹弹堂辅助 HUD。`./start-hud.sh` 一键:推 .so→重启游戏→起隧道→HUD。
+Rust+OpenCV 弹弹堂辅助 HUD。`./start-hud.sh` 一键启动隧道与 HUD。
+不要自动停止正在运行的游戏;重启必须由用户明确授权。
 网络层: 43.248.190.45:8888 WebSocket 二进制帧 = zlib(Protobuf)。解析在 `src/proto.rs`+`src/net.rs`(Tracker/隧道记录格式见注释)。
 
 ## 验证
 
 ```bash
-cargo test --lib                    # 14 项
+cargo test --lib
 cargo build --bin live_gui --bin net_live --bin dump_wind_fields
 ```
 
-## 风速解码(已确认结构,2025-10)
+## 风速解码(客户端运行时代码已恢复,2026-10)
 
-BattleNotify type-8 inner f4 = 带符号 i64。**符号=风向**(已验证)。
-大小解码模型(3局独立验证,C为局内常数):
+BattleNotify type-8 的 Action: f1=round, f2=repeated order, f3=speed,
+f4=raw wind。客户端 BattleCommandAction::init 使用有符号 32 位 XOR:
 
 ```
-wind10 = (abs(raw) & 0xff) ^ C_battle ^ round
-C_battle = 每局恒定的XOR密钥: 15xxx局=0x02, 146xx=0x1B, 154xx=0x1D, 128xxx≈0x19x
+wind10 = i32(raw) ^ i32(round) ^ i32(speed) ^ XOR(每个 i32(order))
+世界风速 = wind10 / 10.0
 ```
 
-验证结果: 154xx局10连回合中6组逐位精确、4组差±0.2-0.4(疑ASR听错小数尾数)。
-C来源仍未知(消息字段推不出)→**运行时用一次用户报风自举**:
-live_gui 在每次语音/手动确认时解 `C=(|raw|&0xff)^w10^round`,之后每回合
-自动填风速(我方回合才覆盖 st.wind,符号=箭头×方位×F翻转,标 [N])。
-用户重报即更新C → 自纠错。环境变量无需开启,默认启用。
+不先取 abs(raw),不截低8位,不只用 order[0]。完整列表随玩家退出而变化,
+因此旧的 C_battle 并非通用局内常数;负风的旧模型也可能产生 0.2 等偏差。
+这些偏差不能一律归咎于语音识别。
 
-已排除: %1024/10、线性同余、位移/乘法/灰码、round^2。
-注意: 8位模型上限25.5;若实测出现>25.5的大风需扩到10bit再验证
-(128xxx局的40.2/43.8疑为ASR幻听未确认)。
+已有32条历史 Action 的计算已冻结在
+`/Users/wx/Downloads/tnt-apk-analysis/wind_decode_validation.json`。
+其中3局各有1条手动报告可独立比较大小,7.1/9.0/7.8均完全匹配。
+SETTLED/applied 行不是独立真值。完整实时屏幕对照仍待正常游戏验证。
+HUD 使用解出的世界风向结合目标方位/F翻转转换为顺逆风。
+语音/手动输入保留为覆盖,不再用于推测局密钥。
 
 ## 配对采样(自动)
 
 `live_gui` 运行中: 每条 SEED 写 `wind_pairs.csv`(applied列=自动预测值);
 语音/回车确认风速自动记 VOICE/MANUAL 行。正常玩即可攒数据。
+`analyze_wind.py` 是旧模型研究工具,其推测的密钥不能覆盖客户端算法。
 
 ```bash
 python3 analyze_wind.py            # 配对 raw↔wind, 列出每回合 key

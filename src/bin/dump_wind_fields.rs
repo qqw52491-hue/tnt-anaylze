@@ -3,7 +3,9 @@ use std::io::Read;
 use flate2::read::ZlibDecoder;
 use tnt_comput::net::tunnel;
 use tnt_comput::net::{Tracker, TunnelEvent};
-use tnt_comput::proto::{parse_envelope, parse_fields, Field, FieldSlice, Wire};
+use tnt_comput::proto::{
+    decode_envelope, parse_envelope, parse_fields, Field, FieldSlice, GameEvent, Wire,
+};
 
 fn hex_prefix(bytes: &[u8], limit: usize) -> String {
     bytes
@@ -95,6 +97,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 hex_prefix(&env.body, 256)
             );
             print_fields(&fields, 0);
+            // 客户端公式解出的世界风(复用 decode_envelope 的字段完整性门槛)
+            for gev in decode_envelope(&env) {
+                if let GameEvent::WindSeed {
+                    wind10: Some(w), ..
+                } = gev
+                {
+                    println!("decoded wind10={w} world_wind={:.1}", w as f64 / 10.0);
+                }
+            }
         }
     }
 

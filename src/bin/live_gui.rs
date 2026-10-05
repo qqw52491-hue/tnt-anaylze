@@ -24,18 +24,11 @@ struct NetHud {
     round: u64,
     /// 本回合出手者(order[0])
     active: Option<u64>,
-    /// 回合风原始字段(解码尚未确认,仅诊断)
+    /// 回合风原始字段 f4(客户端 XOR 输入,仅诊断)
     wind_seed: i64,
-    /// 局内风密钥候选(每次报风反解一个)。生效值=众数,防个别抖动回合污染;
-    /// wind10 = (|raw|&0xff) ^ C ^ round
-    wind_key_votes: Vec<i64>,
-    /// 持久化的 基数→密钥 映射(raw>>8 → C);同房连打基数不变密钥也不变
-    key_by_base: HashMap<i64, i64>,
-    /// 最近一次确认过的密钥(跨进程重启的兜底先验)
-    last_key: Option<i64>,
     /// 每个 WindSeed 自增,渲染线程据此判定"新回合"并应用自动风
     turn_seq: u64,
-    /// 本回合解码出的风速大小(×10,无符号);None=密钥未知
+    /// 本回合客户端公式解出的世界风速(×10,带符号);None=Action 缺字段
     auto_wind10: Option<i32>,
     /// 最近一发实际炮弹: (射手id, 角度)
     last_fire: Option<(u64, Option<f64>)>,
@@ -94,69 +87,11 @@ fn log_wind_pair(
 }
 
 /// 相对风向提示: +1=顺风(箭头与投掷方向一致) -1=逆风。
-/// raw 符号=世界风向(已验证);投掷方向=敌人相对我方 x 方位。
-/// 信息不足(无种子/无坐标/站位重合)时返回 None。
-/// 一次报风/纠错 = 一票 + 更新持久化映射并存盘
-fn push_wind_vote(st: &mut NetHud, c: i64) {
-    st.wind_key_votes.push(c);
-    let base = st.wind_seed.abs() >> 8;
-    if base > 0 {
-        st.key_by_base.insert(base, c);
-    }
-    st.last_key = Some(c);
-    save_wind_keys(st);
-}
-
-fn save_wind_keys(st: &NetHud) {
-    let mut s = String::new();
-    if let Some(l) = st.last_key {
-        s.push_str(&format!("last {l}\n"));
-    }
-    for (b, c) in &st.key_by_base {
-        s.push_str(&format!("base {b} {c}\n"));
-    }
-    let _ = std::fs::write("wind_key.txt", s);
-}
-
-/// 启动时载入上次会话确认的密钥 → 重启后第一回合即可预测
-fn load_wind_keys(st: &mut NetHud) {
-    if let Ok(txt) = std::fs::read_to_string("wind_key.txt") {
-        for line in txt.lines() {
-            let p: Vec<&str> = line.split_whitespace().collect();
-            match p.as_slice() {
-                ["last", v] => {
-                    // 只作兜底猜测,不占票:避免上局旧密钥压制本局真实密钥
-                    st.last_key = v.parse().ok();
-                }
-                ["base", b, c] => {
-                    if let (Ok(b), Ok(c)) = (b.parse::<i64>(), c.parse::<i64>()) {
-                        st.key_by_base.insert(b, c);
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-}
-
-/// 密钥众数(平票取最新):单次抖动/误报不污染已确认的密钥,连续重报可翻票
-fn voted_key(votes: &[i64]) -> Option<i64> {
-    let mut best: Option<(i64, usize, usize)> = None; // (key, count, last_idx)
-    for (i, &v) in votes.iter().enumerate() {
-        let n = votes.iter().filter(|&&x| x == v).count();
-        let better = match best {
-            None => true,
-            Some((_, bn, bi)) => n > bn || (n == bn && i > bi),
-        };
-        if better {
-            best = Some((v, n, i));
-        }
-    }
-    best.map(|(v, _, _)| v)
-}
-
+/// 箭头取客户端解出的世界风符号;投掷方向=敌人相对我方 x 方位。
+/// 信息不足(无解码风/零风/无坐标/站位重合)时返回 None。
 fn wind_dir_hint(net: &NetHud) -> Option<i32> {
-    if net.wind_seed == 0 {
+    let arrow = net.auto_wind10?.signum();
+    if arrow == 0 {
         return None;
     }
     let my = net.my_id?;
@@ -174,8 +109,15 @@ fn wind_dir_hint(net: &NetHud) -> Option<i32> {
     if aim == 0 {
         return None;
     }
-    let arrow = net.wind_seed.signum() as i32;
     Some(arrow * aim)
+}
+
+/// 我方新回合自动风的呈现值: |world10|/10 × (hint×F翻转),
+/// 方位缺失时退回世界风符号。与渲染循环内联表达式保持一致。
+fn auto_wind_present(world10: i32, hint: Option<i32>, flip: bool) -> f64 {
+    let flip_n = if flip { -1 } else { 1 };
+    let dir = hint.map(|h| h * flip_n).unwrap_or(world10.signum());
+    (world10 as i64).abs() as f64 / 10.0 * dir as f64
 }
 
 /// 输入按"风速大小"解释,符号=顺/逆风自动附加(hint 缺失时原样返回)。
@@ -211,9 +153,6 @@ fn apply_net_event(st: &mut NetHud, ev: &GameEvent, my_name: &str) {
             st.round = 0;
             st.active = None;
             st.wind_seed = 0;
-            // 新局清空会话票;先验预测由 key_by_base/last_key 兜底,不占票——
-            // 同房连打基数不变→命中历史映射自动预测;基数变了→用户报一次即确立
-            st.wind_key_votes.clear();
             st.auto_wind10 = None;
             st.last_fire = None;
             st.last_fire_req = None;
@@ -232,25 +171,25 @@ fn apply_net_event(st: &mut NetHud, ev: &GameEvent, my_name: &str) {
         GameEvent::WindSeed {
             round,
             order,
+            speed,
             seed,
-            ..
+            wind10,
         } => {
             st.round = *round;
             st.wind_seed = *seed;
-            st.active = order.first().copied();
+            // 客户端同款活动 uid = abs(i32(order[0]));order 全量仍由 XOR 使用
+            st.active = order
+                .first()
+                .map(|&id| (id as i32 as i64).unsigned_abs())
+                .filter(|&id| id != 0);
             st.turn_seq += 1;
-            // 密钥来源: 本会话投票众数 → 同基数历史映射(持久化)。
-            // 跨局旧密钥不兜底——不同房间C不同,乱猜只会填垃圾值。
-            let base = (*seed).abs() >> 8;
-            let c = voted_key(&st.wind_key_votes)
-                .or_else(|| st.key_by_base.get(&base).copied());
-            // 未确认时(本会话无票)过滤离谱值(>15风),等用户报一次校准
-            st.auto_wind10 = c
-                .map(|c| (((*seed).abs() & 0xff) as i64 ^ c ^ (*round as i64)) as i32)
-                .filter(|&m| !st.wind_key_votes.is_empty() || m <= 150);
+            // 客户端 BattleCommandAction::init 已在 proto 层解码;缺字段=None
+            st.auto_wind10 = *wind10;
             println!(
-                "📡 NET WIND raw={seed} active={:?} auto={:?}",
-                st.active, st.auto_wind10
+                "📡 NET WIND raw={seed} speed={speed} order={order:?} active={:?} wind10={:?} world={:?}",
+                st.active,
+                wind10,
+                wind10.map(|w| w as f64 / 10.0)
             );
             log_wind_pair(
                 "SEED",
@@ -700,7 +639,6 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
     // ===== 网络实况隧道:libtntsniff.so → adb reverse → 127.0.0.1:19001 =====
     // 尽早绑定:用户还在框选时隧道就能连进来,开局 INIT 不容易错过。
     let net_state: Arc<Mutex<NetHud>> = Arc::new(Mutex::new(NetHud::default()));
-    load_wind_keys(&mut net_state.lock().unwrap());
     {
         let ns = net_state.clone();
         thread::spawn(move || {
@@ -1672,13 +1610,7 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
                     match parsed {
                         Some(w) => {
                             let flip_ui = app_state.lock().unwrap().wind_flip;
-                            let mut net = net_state.lock().unwrap();
-                            // 报一次风=反解局密钥候选 C;众数生效,之后所有回合自动解码
-                            if net.wind_seed != 0 {
-                                let w10 = (w.abs() * 10.0).round() as i64;
-                                let c = (net.wind_seed.abs() & 0xff) ^ w10 ^ net.round as i64;
-                                push_wind_vote(&mut net, c);
-                            }
+                            let net = net_state.lock().unwrap();
                             let applied = if auto_wind_sign {
                                 apply_auto_wind_sign(&net, w, flip_ui)
                             } else {
@@ -1831,14 +1763,14 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
             // ===== 网络实况:世界坐标 → 小地图 canvas 点 =====
             let net = net_state.lock().unwrap().clone();
 
-            // 局密钥已知 → 我方新回合自动解码风速写进 st.wind(符号=箭头×方位×F翻转)
+            // 客户端解出的世界风 → 我方新回合自动写进 st.wind(符号=箭头×方位×F翻转)
             if net.turn_seq != last_wind_turn {
                 last_wind_turn = net.turn_seq;
                 // 通知 OCR 线程:新回合清票,快速锁定新角度
                 angle_reset_gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                // 结算上一个我方回合:st.wind=用户最终认定值(没改=预测正确,改了=修正)
-                // → 每个我方回合都有标注数据,纠错样本额外给密钥投票
-                if let Some((pb, pr, praw, pw)) = prev_my_turn.take() {
+                // 结算上一个我方回合(纯诊断):st.wind=用户最终认定值
+                // (没改≠用户确认,改了只是修正记录)
+                if let Some((pb, pr, praw, _pw)) = prev_my_turn.take() {
                     let settled = app_state.lock().unwrap().wind;
                     log_wind_pair(
                         "SETTLED",
@@ -1849,24 +1781,16 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
                         Some(settled),
                         Some(settled),
                     );
-                    if (settled - pw).abs() > 0.01
-                        && settled.abs() > 0.05
-                        && pb == net.battle_id
-                    {
-                        let w10 = (settled.abs() * 10.0).round() as i64;
-                        let c = (praw.abs() & 0xff) ^ w10 ^ pr as i64;
-                        push_wind_vote(&mut net_state.lock().unwrap(), c);
-                    }
                 }
                 if net.active.is_some() && net.active == net.my_id {
                     let mut stg = app_state.lock().unwrap();
-                    if let Some(mag10) = net.auto_wind10 {
-                        let flip_n = if stg.wind_flip { -1 } else { 1 };
-                        let dir = wind_dir_hint(&net)
-                            .map(|h| h * flip_n)
-                            .unwrap_or(net.wind_seed.signum() as i32);
-                        stg.wind = mag10 as f64 / 10.0 * dir as f64;
+                    if let Some(world10) = net.auto_wind10 {
+                        stg.wind =
+                            auto_wind_present(world10, wind_dir_hint(&net), stg.wind_flip);
                         stg.wind_net = true;
+                    } else {
+                        // 本回合 Action 缺字段:保留手动风,但不再标网络真值
+                        stg.wind_net = false;
                     }
                     prev_my_turn =
                         Some((net.battle_id, net.round, net.wind_seed, stg.wind));
@@ -2637,13 +2561,11 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
                     Some(_) => "敌方回合",
                     None => "",
                 };
-                // raw 符号=风向已验证(6/6):正→向右吹,负→向左;大小仍未解码
-                let wind_dir = if net.wind_seed > 0 {
-                    "→"
-                } else if net.wind_seed < 0 {
-                    "←"
-                } else {
-                    "-"
+                // 客户端已解出带符号世界风:正→向右吹,负→向左
+                let wind_dir = match net.auto_wind10.map(|w| w.signum()) {
+                    Some(s) if s > 0 => "→",
+                    Some(s) if s < 0 => "←",
+                    _ => "-",
                 };
                 let flip_n = if st.wind_flip { -1 } else { 1 };
                 let rel = match wind_dir_hint(&net).map(|h| h * flip_n) {
@@ -2653,7 +2575,7 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
                 };
                 let auto_s = net
                     .auto_wind10
-                    .map(|m| format!(" 风~{:.1}", m as f64 / 10.0))
+                    .map(|m| format!(" 风{:.1}", (m as i64).abs() as f64 / 10.0))
                     .unwrap_or_default();
                 let mut info = format!(
                     "{link} 回合{} {turn_s} 风向{wind_dir}{rel}{auto_s} raw:{} lag:{}ms",
@@ -2703,12 +2625,7 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
             if !wind_input_buf.is_empty() {
                 if let Ok(w) = wind_input_buf.parse::<f64>() {
                     let flip_ui = app_state.lock().unwrap().wind_flip;
-                    let mut net = net_state.lock().unwrap();
-                    if net.wind_seed != 0 {
-                        let w10 = (w.abs() * 10.0).round() as i64;
-                        let c = (net.wind_seed.abs() & 0xff) ^ w10 ^ net.round as i64;
-                        push_wind_vote(&mut net, c);
-                    }
+                    let net = net_state.lock().unwrap();
                     let applied = if auto_wind_sign {
                         apply_auto_wind_sign(&net, w, flip_ui)
                     } else {
@@ -2958,5 +2875,119 @@ mod tests {
     #[test]
     fn plain_click_still_works_without_network_battle() {
         assert!(allow_plain_manual_mark(false));
+    }
+
+    fn wind_seed_ev(seed: i64, wind10: Option<i32>) -> GameEvent {
+        GameEvent::WindSeed {
+            round: 2,
+            order: vec![74108, 0, 73884],
+            speed: 100,
+            seed,
+            wind10,
+        }
+    }
+
+    #[test]
+    fn init_clears_auto_wind() {
+        let mut st = NetHud {
+            wind_seed: 449,
+            auto_wind10: Some(71),
+            ..Default::default()
+        };
+        apply_net_event(
+            &mut st,
+            &GameEvent::Init {
+                map_w: 2000,
+                map_h: 1000,
+                players: vec![],
+            },
+            "1111rust",
+        );
+        assert_eq!(st.auto_wind10, None);
+        assert_eq!(st.wind_seed, 0);
+    }
+
+    #[test]
+    fn first_wind_seed_decodes_without_calibration() {
+        let mut st = NetHud::default();
+        apply_net_event(&mut st, &wind_seed_ev(449, Some(71)), "1111rust");
+        assert_eq!(st.auto_wind10, Some(71));
+        assert_eq!(st.active, Some(74108));
+        assert_eq!(st.wind_seed, 449);
+        assert_eq!(st.turn_seq, 1);
+    }
+
+    #[test]
+    fn wind_dir_hint_uses_decoded_sign() {
+        let mut st = NetHud {
+            my_id: Some(1),
+            wind_seed: -447,
+            auto_wind10: Some(-60),
+            ..Default::default()
+        };
+        st.pos.insert(1, (100, 100));
+        // 世界风向左,敌人在右 → 逆风
+        st.pos.insert(2, (500, 100));
+        assert_eq!(wind_dir_hint(&st), Some(-1));
+        // 敌人在左 → 顺风
+        st.pos.insert(2, (50, 100));
+        assert_eq!(wind_dir_hint(&st), Some(1));
+    }
+
+    #[test]
+    fn wind_dir_hint_none_for_zero_or_missing_wind() {
+        let mut st = NetHud {
+            my_id: Some(1),
+            auto_wind10: Some(0),
+            ..Default::default()
+        };
+        st.pos.insert(1, (100, 100));
+        st.pos.insert(2, (500, 100));
+        assert_eq!(wind_dir_hint(&st), None);
+        st.auto_wind10 = None;
+        assert_eq!(wind_dir_hint(&st), None);
+    }
+
+    #[test]
+    fn wind_dir_hint_works_when_raw_is_zero() {
+        // raw=0 的完整 Action 也能解出真风(如 10.0),方向提示照常工作
+        let mut st = NetHud {
+            my_id: Some(1),
+            wind_seed: 0,
+            auto_wind10: Some(100),
+            ..Default::default()
+        };
+        st.pos.insert(1, (100, 100));
+        st.pos.insert(2, (500, 100));
+        assert_eq!(wind_dir_hint(&st), Some(1));
+    }
+
+    #[test]
+    fn auto_wind_presentation_matches_client_formula() {
+        // |world10|/10 × (hint×F翻转);hint 缺失退回世界风符号
+        assert_eq!(auto_wind_present(71, Some(1), false), 7.1);
+        assert_eq!(auto_wind_present(71, Some(-1), false), -7.1);
+        assert_eq!(auto_wind_present(-60, Some(1), false), 6.0);
+        assert_eq!(auto_wind_present(-60, None, false), -6.0);
+        assert_eq!(auto_wind_present(71, Some(1), true), -7.1);
+        assert_eq!(auto_wind_present(0, None, false), 0.0);
+    }
+
+    #[test]
+    fn manual_override_sign_still_applies() {
+        let mut st = NetHud {
+            my_id: Some(1),
+            auto_wind10: Some(-60),
+            ..Default::default()
+        };
+        st.pos.insert(1, (100, 100));
+        st.pos.insert(2, (500, 100));
+        // 逆风 → 手动输入的大小被附负号
+        assert_eq!(apply_auto_wind_sign(&st, 5.0, false), -5.0);
+        // F 翻转 → 顺风
+        assert_eq!(apply_auto_wind_sign(&st, 5.0, true), 5.0);
+        // 无 hint → 原样返回
+        let bare = NetHud::default();
+        assert_eq!(apply_auto_wind_sign(&bare, 5.0, false), 5.0);
     }
 }

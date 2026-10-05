@@ -34,9 +34,14 @@ fn fmt_event(prefix: &str, ev: &GameEvent) -> String {
         GameEvent::WindSeed {
             round,
             order,
-            scale,
+            speed,
             seed,
-        } => format!("{prefix} WIND round={round} order={order:?} scale={scale} seed={seed}"),
+            wind10,
+        } => format!(
+            "{prefix} WIND round={round} order={order:?} speed={speed} seed={seed} wind10={:?} world={:?}",
+            wind10,
+            wind10.map(|w| w as f64 / 10.0)
+        ),
         GameEvent::PlayerUpdate {
             id,
             pos,

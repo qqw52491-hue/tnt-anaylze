@@ -1,8 +1,21 @@
 #!/bin/bash
 # TNT HUD 一键启动:wrap 注入检查 + adb 隧道 + HUD
-# 用法:  ./start-hud.sh
+# 用法:  ./start-hud.sh [--restart]
+#   --restart  游戏在跑但需要重载(.so 更新/未注入)时,明确授权 force-stop+重启;
+#              默认绝不停止正在运行的游戏,只打印延迟重载说明并非零退出
 # 自检模式(不拉起 HUD):  TNT_NO_LAUNCH=1 ./start-hud.sh
 set -u
+
+RESTART=0
+for arg in "$@"; do
+    case "$arg" in
+        --restart) RESTART=1 ;;
+        *)
+            echo "用法: $0 [--restart]" >&2
+            exit 2
+            ;;
+    esac
+done
 
 ADB=/Applications/BlueStacks.app/Contents/MacOS/hd-adb
 DEV=127.0.0.1:5555
@@ -84,22 +97,8 @@ game_pid() { "$ADB" -s "$DEV" shell "pidof $PKG" 2>/dev/null | tr -d '\r' | awk 
 # rand=1 + fmt=1 + memscan=7 才表示进程里跑的是当前 Qt hook 观察版;旧标记视为旧版,要重启吃新 .so
 so_loaded() { "$ADB" -s "$DEV" shell "logcat -d -s TntSniff" 2>/dev/null | grep -q "loaded pid=$1 rand=1 fmt=1 memscan=7"; }
 
-PID=$(game_pid)
-if [ -n "$PID" ] && [ "$SO_UPDATED" = "1" ]; then
-    info ".so 已更新,需重启游戏进程加载新版(内容不丢,会回大厅)..."
-    "$ADB" -s "$DEV" shell "am force-stop $PKG; sleep 1; monkey -p $PKG -c android.intent.category.LAUNCHER 1" >/dev/null 2>&1
-    sleep 7
-    PID=$(game_pid)
-    if [ -n "$PID" ] && so_loaded "$PID"; then
-        ok "游戏已重启 pid=$PID,新版 .so 注入成功"
-    else
-        bad ".so 仍未加载 — 手工看: $ADB -s $DEV shell 'logcat -d -s TntSniff'"
-        exit 1
-    fi
-elif [ -n "$PID" ] && so_loaded "$PID"; then
-    ok "游戏运行中 pid=$PID,libtntsniff 已注入"
-elif [ -n "$PID" ]; then
-    info "游戏在跑(pid=$PID)但 .so 未注入 — 重启游戏进程(内容不丢,会回大厅)..."
+# 明确授权(--restart)才允许的重启路径:force-stop + monkey 拉起并验证注入
+restart_game() {
     "$ADB" -s "$DEV" shell "am force-stop $PKG; sleep 1; monkey -p $PKG -c android.intent.category.LAUNCHER 1" >/dev/null 2>&1
     sleep 7
     PID=$(game_pid)
@@ -108,6 +107,33 @@ elif [ -n "$PID" ]; then
     else
         bad ".so 仍未加载 — 手工看: $ADB -s $DEV shell 'logcat -d -s TntSniff'"
         exit 1
+    fi
+}
+
+# 默认路径:绝不碰正在运行的游戏,打印延迟重载说明后非零退出
+defer_reload() {
+    bad "游戏运行中 pid=$1 但需要重载($2),默认不停止正在运行的游戏"
+    echo "   → 请在游戏里手动退出到桌面后重跑本脚本,或明确授权:"
+    echo "      ./start-hud.sh --restart   # 会中断当前对局，可能影响积分；确认安全后才使用"
+    exit 1
+}
+
+PID=$(game_pid)
+if [ -n "$PID" ] && [ "$SO_UPDATED" = "1" ]; then
+    if [ "$RESTART" = "1" ]; then
+        info ".so 已更新，按明确授权重启游戏加载新版；会中断当前对局..."
+        restart_game
+    else
+        defer_reload "$PID" "新版 libtntsniff.so 待加载"
+    fi
+elif [ -n "$PID" ] && so_loaded "$PID"; then
+    ok "游戏运行中 pid=$PID,libtntsniff 已注入"
+elif [ -n "$PID" ]; then
+    if [ "$RESTART" = "1" ]; then
+        info "游戏在跑(pid=$PID)但 .so 未注入 — 按明确授权重启，会中断当前对局..."
+        restart_game
+    else
+        defer_reload "$PID" "libtntsniff.so 未注入"
     fi
 else
     info "游戏未运行,正在启动..."
@@ -158,5 +184,15 @@ echo "   文本日志: /tmp/tnt-hud-live.log"
 echo "   原始网络记录: /tmp/tnt-tunnel-records.bin"
 echo "=========================================="
 [ "${TNT_NO_LAUNCH:-0}" = "1" ] && { ok "自检完成(未启动 HUD)"; exit 0; }
-rm -f /tmp/tnt-hud-live.log /tmp/tnt-tunnel-records.bin
+# 新录制前归档上一次的日志/记录(时间戳+PID 后缀),不删除任何历史数据
+ARCHIVE_SUFFIX="$(date +%Y%m%d-%H%M%S).$$"
+for f in /tmp/tnt-hud-live.log /tmp/tnt-tunnel-records.bin; do
+    if [ -f "$f" ]; then
+        if ! mv "$f" "$f.$ARCHIVE_SUFFIX"; then
+            bad "无法归档 ${f}，已停止启动以保护旧记录"
+            exit 1
+        fi
+        info "已归档 $f → $f.$ARCHIVE_SUFFIX"
+    fi
+done
 cd "$DIR" && ./target/debug/live_gui 2>&1 | tee /tmp/tnt-hud-live.log
