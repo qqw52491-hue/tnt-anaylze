@@ -45,6 +45,8 @@ struct NetHud {
     pending_firereq: bool,
     /// 确定不是我们的 uid(对方开炮时记录,用于中途加入时反推 my_id)
     not_mine: std::collections::HashSet<u64>,
+    /// 多敌模式:用户在小地图上点选的目标 uid;None=自动取第一个
+    target_id: Option<u64>,
     /// 当前活着的隧道连接数(0=隧道断开)
     conns: i32,
     /// 最近一条记录的游戏端→本地投递延迟(排队导致的滞后)
@@ -160,10 +162,14 @@ fn wind_dir_hint(net: &NetHud) -> Option<i32> {
     let my = net.my_id?;
     let (mx, _) = *net.pos.get(&my)?;
     let (ex, _) = net
-        .pos
-        .iter()
-        .find(|(id, _)| **id != my && !net.not_mine.contains(*id))?
-        .1;
+        .target_id
+        .and_then(|t| net.pos.get(&t))
+        .or_else(|| {
+            net.pos
+                .iter()
+                .find(|(id, _)| **id != my && !net.not_mine.contains(*id))
+                .map(|(_, p)| p)
+        })?;
     let aim = (ex - mx).signum() as i32;
     if aim == 0 {
         return None;
@@ -213,6 +219,7 @@ fn apply_net_event(st: &mut NetHud, ev: &GameEvent, my_name: &str) {
             st.last_fire_req = None;
             st.pending_firereq = false;
             st.not_mine.clear();
+            st.target_id = None;
             st.my_id = None;
             for p in players {
                 st.pos.insert(p.id, (p.x, p.y));
@@ -888,6 +895,8 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
     let btn_draw_ruler = core::Rect::new(map_w_display + 20, 130, 230, 35);
 
     let btn_exit = core::Rect::new(map_w_display + 150, 5, 100, 30);
+    // 多人局目标轮换:点击在敌人列表里循环选中(等效于右键点标记)
+    let btn_target = core::Rect::new(map_w_display + 260, 5, 110, 30);
 
     let btn_clear = core::Rect::new(map_w_display + 20, 210, 230, 25);
 
@@ -927,7 +936,7 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
     // 全部按钮矩形:用于"按下和松开都在同一按钮内才生效"的防误触判定
     let all_btns = vec![
         btn_p1, btn_e1, btn_mode_switch, btn_lock_ruler, btn_draw_ruler,
-        btn_exit, btn_clear, btn_a20, btn_a30, btn_a45, btn_a50, btn_a60, btn_a65, btn_a70,
+        btn_exit, btn_target, btn_clear, btn_a20, btn_a30, btn_a45, btn_a50, btn_a60, btn_a65, btn_a70,
         btn_a75, btn_ang_m5, btn_ang_minus, btn_ang_plus, btn_ang_p5, btn_auto_angle,
         btn_wind_m1, btn_wind_m01, btn_wind_p01, btn_wind_p1,
         btn_u12, btn_u16, btn_u18, btn_u20, btn_u22,
@@ -994,13 +1003,49 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
                     }
                 }
             } else if event == highgui::EVENT_RBUTTONDOWN {
-                // 右键直接标敌方;标尺框定过程中忽略右键,免打扰两次左键标定
+                // 右键:网络局随时点敌人标记选目标;空地落点当手动敌方标记
+                // (无网时随便标,有网时须先按"敌方"进 E1 模式才允许手动点)
+                // 标尺框定过程中忽略右键,免打扰两次左键标定
                 if on_map
                     && !matches!(st.edit_mode, EditMode::DrawRuler1 | EditMode::DrawRuler2)
-                    && (!net_active || st.edit_mode == EditMode::E1)
                 {
-                    st.manual_e1 = Some(core::Point::new(x, y));
-                    st.edit_mode = EditMode::None;
+                    // 多人局:点在敌人标记附近 → 选中该玩家为目标(用网络精确坐标);
+                    // 点在空地 → 照旧当手动敌方点
+                    let mut picked = false;
+                    if net_active {
+                        if let Ok(mut n) = net_state_cb.lock() {
+                            if n.map_w > 0 && n.map_h > 0 {
+                                let mw = (st.src_w as f64 * st.disp_scale) as f64;
+                                let mh = (st.src_h as f64 * st.disp_scale) as f64;
+                                let mut best: Option<(u64, f64)> = None;
+                                for (k, &(wx, wy)) in n.pos.iter() {
+                                    if Some(*k) == n.my_id {
+                                        continue;
+                                    }
+                                    let sx = wx as f64 * mw / n.map_w as f64;
+                                    let sy = wy as f64 * mh / n.map_h as f64;
+                                    let d = ((sx - x as f64).powi(2)
+                                        + (sy - y as f64).powi(2))
+                                    .sqrt();
+                                    if d < 30.0 && best.map_or(true, |(_, bd)| d < bd) {
+                                        best = Some((*k, d));
+                                    }
+                                }
+                                if let Some((uid, _)) = best {
+                                    n.target_id = Some(uid);
+                                    st.manual_e1 = None;
+                                    picked = true;
+                                }
+                            }
+                        }
+                    }
+                    if !picked && (!net_active || st.edit_mode == EditMode::E1) {
+                        st.manual_e1 = Some(core::Point::new(x, y));
+                        st.edit_mode = EditMode::None;
+                    }
+                    if picked {
+                        st.edit_mode = EditMode::None;
+                    }
                 }
             } else if event == highgui::EVENT_LBUTTONUP {
                 // 按钮生效:按下和松开都在同一个按钮内,才算真点
@@ -1021,6 +1066,27 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
                             } else {
                                 EditMode::E1
                             };
+                        } else if is_inside(x, y, btn_target) {
+                            // 目标轮换:按 id 排序稳定循环,当前目标的下一个成为新目标
+                            if let Ok(mut n) = net_state_cb.lock() {
+                                let mut ids: Vec<u64> = n
+                                    .pos
+                                    .keys()
+                                    .copied()
+                                    .filter(|k| Some(*k) != n.my_id)
+                                    .collect();
+                                ids.sort_unstable();
+                                if !ids.is_empty() {
+                                    n.target_id = match n.target_id {
+                                        Some(t) => {
+                                            let i = ids.iter().position(|&k| k == t);
+                                            Some(ids[(i.map_or(0, |i| i + 1)) % ids.len()])
+                                        }
+                                        None => Some(ids[0]),
+                                    };
+                                    st.manual_e1 = None;
+                                }
+                            }
                         } else if is_inside(x, y, btn_lock_ruler) {
                             if st.locked_px_per_unit.is_some() {
                                 st.locked_px_per_unit = None;
@@ -1831,7 +1897,8 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
 
             let net_p1;
             let net_e1;
-            let mut net_others: Vec<core::Point> = Vec::new();
+            // 所有非我玩家: (uid, 显示坐标) —— 多人局全部画出来供点选
+            let mut net_all: Vec<(u64, core::Point)> = Vec::new();
             if net.map_w > 0 && net.map_h > 0 {
                 let to_map = |x: i64, y: i64| core::Point::new(
                     (x as f64 * map_w_display as f64 / net.map_w as f64).round() as i32,
@@ -1841,19 +1908,23 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
                     .my_id
                     .and_then(|id| net.pos.get(&id))
                     .map(|&(x, y)| to_map(x, y));
-                // 身份未定时:把全部已知玩家都画出来(中途加入对局没收到 INIT)
-                if net.my_id.is_none() {
-                    net_others = net
-                        .pos
-                        .values()
-                        .map(|&(x, y)| to_map(x, y))
-                        .collect();
-                }
-                net_e1 = net
+                net_all = net
                     .pos
                     .iter()
-                    .find(|(k, _)| Some(**k) != net.my_id)
-                    .map(|(_, &(x, y))| to_map(x, y));
+                    .filter(|(k, _)| Some(**k) != net.my_id)
+                    .map(|(k, &(x, y))| (*k, to_map(x, y)))
+                    .collect();
+                // 目标:点选的优先,否则第一个非我玩家
+                net_e1 = net
+                    .target_id
+                    .and_then(|t| net.pos.get(&t))
+                    .or_else(|| {
+                        net.pos
+                            .iter()
+                            .find(|(k, _)| Some(**k) != net.my_id)
+                            .map(|(_, p)| p)
+                    })
+                    .map(|&(x, y)| to_map(x, y));
             } else {
                 net_p1 = None;
                 net_e1 = None;
@@ -1876,12 +1947,37 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
             if let Some(p) = net_p1 {
                 draw_ring(&mut canvas, p, false);
             }
-            if let Some(p) = net_e1 {
-                draw_ring(&mut canvas, p, true);
-            }
-            // 身份未定:所有已知玩家都画灰环
-            for p in net_others {
-                let _ = imgproc::circle(&mut canvas, p, 9, core::Scalar::new(160.0, 160.0, 160.0, 0.0), 2, imgproc::LINE_AA, 0);
+            // 所有非我玩家都画出来:选中的目标亮品红+名字,其余暗色(右键点选切换目标)
+            let sel_uid = net.target_id.or_else(|| {
+                net.pos
+                    .iter()
+                    .find(|(k, _)| Some(**k) != net.my_id)
+                    .map(|(k, _)| *k)
+            });
+            for (uid, p) in &net_all {
+                let is_sel = sel_uid == Some(*uid);
+                let color = if is_sel {
+                    core::Scalar::new(255.0, 0.0, 255.0, 0.0)
+                } else {
+                    core::Scalar::new(140.0, 80.0, 140.0, 0.0)
+                };
+                let thick = if is_sel { 2 } else { 1 };
+                let _ = imgproc::circle(&mut canvas, *p, 9, color, thick, imgproc::LINE_AA, 0);
+                let _ = imgproc::circle(&mut canvas, *p, 2, color, -1, imgproc::LINE_AA, 0);
+                if let Some(nm) = net.names.get(uid) {
+                    let short: String = nm.chars().take(5).collect();
+                    let _ = imgproc::put_text(
+                        &mut canvas,
+                        &short,
+                        core::Point::new(p.x - 12, p.y - 13),
+                        imgproc::FONT_HERSHEY_SIMPLEX,
+                        0.35,
+                        color,
+                        1,
+                        imgproc::LINE_AA,
+                        false,
+                    );
+                }
             }
 
             let draw_pt =
@@ -1923,8 +2019,16 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
                 draw_pt(&mut canvas, p, label, false, st.manual_p1.is_some());
             }
             if let Some(e) = e1 {
-                let label = if st.manual_e1.is_some() { "敌方 [手动]" } else { "敌方 (Enemy)" };
-                draw_pt(&mut canvas, e, label, true, st.manual_e1.is_some());
+                let label = if st.manual_e1.is_some() {
+                    "敌方 [手动]".to_string()
+                } else {
+                    let nm = sel_uid
+                        .and_then(|u| net.names.get(&u))
+                        .map(|s| s.as_str())
+                        .unwrap_or("Enemy");
+                    format!("敌方 ({})", nm)
+                };
+                draw_pt(&mut canvas, e, &label, true, st.manual_e1.is_some());
             }
 
             let mut y_offset = 480;
@@ -2439,6 +2543,57 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
             imgproc::LINE_AA,
             false,
         )?;
+
+        // 目标轮换钮:标签直接显示当前目标名(网络局才可用)
+        {
+            let net = net_state.lock().unwrap().clone();
+            let sel_uid = net.target_id.or_else(|| {
+                net.pos
+                    .iter()
+                    .find(|(k, _)| Some(**k) != net.my_id)
+                    .map(|(k, _)| *k)
+            });
+            let tgt_label = sel_uid
+                .and_then(|u| net.names.get(&u))
+                .map(|n| {
+                    let s: String = n.chars().take(4).collect();
+                    format!("▶{}", s)
+                })
+                .unwrap_or_else(|| "▶--".to_string());
+            // 醒目:敌人标记同色的品红底 + 亮字,一眼锁定当前目标
+            let has_tgt = sel_uid.is_some();
+            imgproc::rectangle(
+                &mut canvas,
+                btn_target,
+                if has_tgt {
+                    core::Scalar::new(220.0, 0.0, 220.0, 0.0)
+                } else {
+                    core::Scalar::new(80.0, 80.0, 80.0, 0.0)
+                },
+                -1,
+                imgproc::LINE_8,
+                0,
+            )?;
+            imgproc::rectangle(
+                &mut canvas,
+                btn_target,
+                core::Scalar::new(255.0, 180.0, 255.0, 0.0),
+                2,
+                imgproc::LINE_8,
+                0,
+            )?;
+            imgproc::put_text(
+                &mut canvas,
+                &tgt_label,
+                core::Point::new(btn_target.x + 8, btn_target.y + 21),
+                imgproc::FONT_HERSHEY_SIMPLEX,
+                0.55,
+                core::Scalar::new(255.0, 255.0, 255.0, 0.0),
+                2,
+                imgproc::LINE_AA,
+                false,
+            )?;
+        }
 
         let t_ui = t2.elapsed().as_millis();
         let bg_cap_ms = *cap_time_ms.lock().unwrap();
