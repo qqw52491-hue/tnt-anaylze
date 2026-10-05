@@ -100,10 +100,16 @@ fn wind_dir_hint(net: &NetHud) -> Option<i32> {
         .target_id
         .and_then(|t| net.pos.get(&t))
         .or_else(|| {
-            net.pos
-                .iter()
-                .find(|(id, _)| **id != my && !net.not_mine.contains(*id))
-                .map(|(_, p)| p)
+            // 未选目标:取 id 最小的敌人,与"目标"按钮轮换第一个一致
+            // (HashMap 遍历顺序不定,必须显式排序)
+            let mut ids: Vec<u64> = net
+                .pos
+                .keys()
+                .copied()
+                .filter(|id| *id != my && !net.not_mine.contains(id))
+                .collect();
+            ids.sort_unstable();
+            ids.first().and_then(|id| net.pos.get(id))
         })?;
     let aim = (ex - mx).signum() as i32;
     if aim == 0 {
@@ -1086,12 +1092,16 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
                             st.auto_angle = true;
                         } else if is_inside(x, y, btn_wind_m1) {
                             st.wind -= 1.0;
+                            st.wind_net = false;
                         } else if is_inside(x, y, btn_wind_m01) {
                             st.wind -= 0.1;
+                            st.wind_net = false;
                         } else if is_inside(x, y, btn_wind_p01) {
                             st.wind += 0.1;
+                            st.wind_net = false;
                         } else if is_inside(x, y, btn_wind_p1) {
                             st.wind += 1.0;
+                            st.wind_net = false;
                         } else if is_inside(x, y, btn_u12)
                             || is_inside(x, y, btn_u16)
                             || is_inside(x, y, btn_u18)
@@ -1301,6 +1311,8 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
         .unwrap_or(80.0);
     let mut last_battle_id: u64 = 0;
     let mut last_wind_turn: u64 = 0;
+    /// 上次自动写风时用的 (方位hint, F翻转);回合内换目标/按F/站位变化都会改它
+    let mut last_wind_key: Option<(Option<i32>, bool)> = None;
     /// 上一个我方回合(局,回合,raw,回合开始时的风值),翻篇时结算进配对日志
     let mut prev_my_turn: Option<(u64, u64, i64, f64)> = None;
 
@@ -1788,12 +1800,28 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
                         stg.wind =
                             auto_wind_present(world10, wind_dir_hint(&net), stg.wind_flip);
                         stg.wind_net = true;
+                        last_wind_key = Some((wind_dir_hint(&net), stg.wind_flip));
                     } else {
                         // 本回合 Action 缺字段:保留手动风,但不再标网络真值
                         stg.wind_net = false;
                     }
                     prev_my_turn =
                         Some((net.battle_id, net.round, net.wind_seed, stg.wind));
+                }
+            }
+
+            // 回合内换目标/按F翻转/敌人移动导致顺逆符号变化 → 重算网络风;
+            // 手动输入/语音/±按钮改过的风(wind_net=false)不覆盖
+            if net.active.is_some() && net.active == net.my_id {
+                let mut stg = app_state.lock().unwrap();
+                let key = (wind_dir_hint(&net), stg.wind_flip);
+                if last_wind_key != Some(key) {
+                    last_wind_key = Some(key);
+                    if stg.wind_net {
+                        if let Some(w10) = net.auto_wind10 {
+                            stg.wind = auto_wind_present(w10, key.0, stg.wind_flip);
+                        }
+                    }
                 }
             }
 
@@ -2959,6 +2987,24 @@ mod tests {
         };
         st.pos.insert(1, (100, 100));
         st.pos.insert(2, (500, 100));
+        assert_eq!(wind_dir_hint(&st), Some(1));
+    }
+
+    #[test]
+    fn wind_dir_hint_fallback_is_deterministic() {
+        // 多人局未选目标:默认敌人 = id 最小者,与"目标"按钮轮换首个一致;
+        // 若靠 HashMap 遍历顺序,每次插入顺序不同结果会飘
+        let mut st = NetHud {
+            my_id: Some(1),
+            auto_wind10: Some(50), // 世界风向右
+            ..Default::default()
+        };
+        st.pos.insert(1, (100, 100));
+        st.pos.insert(9, (500, 100));
+        st.pos.insert(3, (50, 100)); // id 最小,在我方左侧
+        assert_eq!(wind_dir_hint(&st), Some(-1)); // 向右风打左侧 = 逆
+        // 显式目标优先于默认
+        st.target_id = Some(9);
         assert_eq!(wind_dir_hint(&st), Some(1));
     }
 
