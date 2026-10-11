@@ -51,3 +51,22 @@ python3 analyze_wind.py            # 配对 raw↔wind, 列出每回合 key
 ## 语音
 
 `TNT_VOICE_TURBO=1 ./start-hud.sh` 常驻模型 ~1.3s;默认档 SenseVoice+Whisper 双保险。
+
+## 弹道研究录制（原始数据，不自动拟合）
+
+新版 HUD 在项目 `recordings/<unix-ms>-<pid>-<index>/` 自动保存：
+- `raw.bin`：原隧道格式全部记录，含游戏端时间、进程和连接信息，可离线重放。
+- `events.jsonl`：实际 FireReq、Fire 通知、风和玩家位置事件；保留完整力度精度、方向、连接、事件序号和原始记录偏移。
+- `manifest.json`：格式版本和限制。
+
+`TNT_RECORD_DIR` 可改录制根目录；`TNT_TRACE_PATH` 可指定原始文件，但已存在时拒绝覆盖并提示录制失败。
+数据可能含游戏账号、聊天等隐私信息，目录已加入 gitignore，不要上传公开仓库。
+请求和通知不自动配对；Fire 坐标含义、缺省字段、炮弹路径和落点未核实，`fit_ready=false`。
+`player_transport` 是玩家飞行路径，不是炮弹轨迹；HUD 上下文是缓存快照，不是独立真值。
+录制功能本身不修改物理模型或主动启动/重启游戏。文件实时写入，但不是逐条 fsync 的断电保护。当前默认物理模型见下节。
+
+## 弹道模型更新
+
+默认采用 recorded-frozen-v1；旧版完整保留在 src/physics/legacy.rs。
+TNT_PHYSICS=legacy 可回退。说明见 PHYSICS_MODELS.md。
+新 manifest 记录模型名；运行中的旧 HUD 不热更新，不自动重启游戏。

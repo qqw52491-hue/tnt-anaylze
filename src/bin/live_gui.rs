@@ -1,6 +1,6 @@
 use opencv::{core, highgui, imgcodecs, imgproc, prelude::*};
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read};
 use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
 use std::sync::{mpsc, Arc, Mutex};
@@ -639,6 +639,7 @@ fn capture_rect_to_file(geo: (i32, i32, i32, i32), path: &str) {
 }
 
 fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
+    eprintln!("[PHYSICS] model={} world_units_per_hud_unit={}", model_name(), world_units_per_hud_unit());
     #[cfg(target_os = "macos")]
     println!("=== 🍎 Mac OS 环境检测成功，已自动切换原生 screencapture 截图引擎 ===");
 
@@ -658,19 +659,23 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
                 println!("⚠️ NET: 端口 {port} 被占用(可能在跑 net_live),网络定位不可用");
                 return;
             };
-            let trace_path = std::env::var("TNT_TRACE_PATH")
-                .unwrap_or_else(|_| "/tmp/tnt-tunnel-records.bin".to_string());
-            let trace = std::fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(&trace_path)
-                .ok()
-                .map(|f| Arc::new(Mutex::new(f)));
+            let recording_root = std::env::var_os("TNT_RECORD_DIR")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("recordings"));
+            let raw_override = std::env::var_os("TNT_TRACE_PATH").map(std::path::PathBuf::from);
+            let trace = match tnt_comput::capture::Capture::open(&recording_root, raw_override.as_deref()) {
+                Ok(capture) => {
+                    println!("📡 NET: 本次数据目录 {}", capture.dir.display());
+                    Some(Arc::new(Mutex::new(capture)))
+                }
+                Err(e) => { eprintln!("⚠️ 无法开启数据录制（不会覆盖旧文件）: {e}"); None }
+            };
+            let mut connection_seq = 0u64;
             println!("📡 NET: 监听 127.0.0.1:{port} — adb reverse tcp:{port} tcp:{port}");
-            println!("📡 NET: 原始记录保存到 {trace_path}");
             for conn in listener.incoming() {
                 let Ok(mut s) = conn else { continue };
+                connection_seq += 1;
+                let connection_id = connection_seq;
                 let ns = ns.clone();
                 let my_name = my_name.clone();
                 let trace = trace.clone();
@@ -690,17 +695,9 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
                             Ok(n) => n,
                         };
                         for rec in parser.feed(&buf[..n]) {
-                            if let Some(trace) = &trace {
-                                if let Ok(mut f) = trace.lock() {
-                                    let len = rec.payload.len() as u32;
-                                    let _ = f.write_all(&[rec.kind]);
-                                    let _ = f.write_all(&rec.pid.to_le_bytes());
-                                    let _ = f.write_all(&rec.fd.to_le_bytes());
-                                    let _ = f.write_all(&rec.ms.to_le_bytes());
-                                    let _ = f.write_all(&len.to_le_bytes());
-                                    let _ = f.write_all(&rec.payload);
-                                }
-                            }
+                            let raw_offset = trace.as_ref().and_then(|trace| {
+                                trace.lock().ok().and_then(|mut capture| capture.record(&rec))
+                            });
                             n_rec += 1;
                             let lag = match t0 {
                                 None => {
@@ -714,7 +711,7 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
                             st.last_lag_ms = lag;
                             let mut ev_names: Vec<String> = Vec::new();
                             for ev in tracker.on_record(&rec) {
-                                if let TunnelEvent::Msg { msg, .. } = ev {
+                                if let TunnelEvent::Msg { msg, c2s, .. } = ev {
                                     for gev in decode_ws_message(&msg) {
                                         let name = match &gev {
                                             GameEvent::Init { .. } => "INIT",
@@ -729,6 +726,16 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
                                         };
                                         ev_names.push(name.to_string());
                                         apply_net_event(&mut st, &gev, &my_name);
+                                        if let Some(trace) = &trace {
+                                            if let Ok(mut capture) = trace.lock() {
+                                                let ctx = tnt_comput::capture::Context {
+                                                    battle: st.battle_id, round: st.round,
+                                                    turn: st.turn_seq, wind10: st.auto_wind10,
+                                                    my_id: st.my_id,
+                                                };
+                                                capture.event(connection_id, &rec, raw_offset, c2s, &gev, &ctx);
+                                            }
+                                        }
                                     }
                                 }
                             }

@@ -181,7 +181,7 @@ echo "   ③ 框选左下角圆盘角度数字"
 echo " 窗口弹出后进一局战斗即可。别关 HUD 窗口!"
 echo "   本终端会持续打 📡 NET 日志和 lag 延迟值"
 echo "   文本日志: /tmp/tnt-hud-live.log"
-echo "   原始网络记录: /tmp/tnt-tunnel-records.bin"
+echo "   数据录制: ${TNT_RECORD_DIR:-$DIR/recordings}/（每次独立目录，见 NET 输出）"
 echo "=========================================="
 [ "${TNT_NO_LAUNCH:-0}" = "1" ] && { ok "自检完成(未启动 HUD)"; exit 0; }
 # 新录制前归档上一次的日志/记录(时间戳+PID 后缀),不删除任何历史数据

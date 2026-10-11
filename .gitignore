@@ -20,3 +20,6 @@ mac_stt
 stt_rec
 wind_key.txt
 wind_pairs.csv
+
+# Private raw network captures and research events
+/recordings/
