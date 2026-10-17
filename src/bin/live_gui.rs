@@ -46,6 +46,171 @@ struct NetHud {
     last_lag_ms: i64,
 }
 
+/// 只读 Android 进程中 BattleRole 的逻辑坐标，仅作为网络坐标的短期覆盖层。
+/// 不写入 NetHud，避免污染历史抓包记录及原有网络定位状态。
+#[derive(Clone)]
+struct LiveXY {
+    updated: std::time::Instant,
+    pos: HashMap<u64, (i64, i64)>,
+}
+
+/// 默认启用本地人物图形坐标；用户可以通过 TNT_LIVE_XY=0 关闭。
+/// 大小写不敏感，兼容常见环境变量表示；未设置时也启用。
+fn live_xy_enabled_from_env(value: Option<&str>) -> bool {
+    !value.is_some_and(|v| {
+        ["0", "false", "off", "no"]
+            .iter()
+            .any(|disabled| v.trim().eq_ignore_ascii_case(disabled))
+    })
+}
+
+/// 独立只读 Python 探针的严格行协议；None 表示非协议行，Some(None) 表示清空。
+fn parse_live_xy_line(line: &str) -> Option<Option<HashMap<u64, (i64, i64)>>> {
+    if line.trim() == "TNTXY-" {
+        return Some(None);
+    }
+    let mut it = line.split_whitespace();
+    if it.next()? != "TNTXY" {
+        return None;
+    }
+    let pid = it.next()?.parse::<u32>().ok()?;
+    if pid == 0 {
+        return None;
+    }
+    let count = it.next()?.parse::<usize>().ok()?;
+    if count == 0 || count > 128 {
+        return None;
+    }
+    let mut pos = HashMap::new();
+    for _ in 0..count {
+        let mut parts = it.next()?.split(':');
+        let id = parts.next()?.parse::<u64>().ok()?;
+        let x = parts.next()?.parse::<i64>().ok()?;
+        let y = parts.next()?.parse::<i64>().ok()?;
+        if parts.next().is_some() || id == 0 || !(-100000..=100000).contains(&x)
+            || !(-100000..=100000).contains(&y)
+            || pos.insert(id, (x, y)).is_some()
+        {
+            return None;
+        }
+    }
+    if it.next().is_some() {
+        return None;
+    }
+    Some(Some(pos))
+}
+
+/// 只覆盖【我方】在 Qt 图形对象上的当前坐标。
+/// 敌方由原有网络事件驱动，保持不变；不创建未知 ID。
+fn overlay_live_xy(net: &mut NetHud, live: Option<&LiveXY>) -> usize {
+    if net.conns <= 0 || net.map_w <= 0 || net.map_h <= 0 {
+        return 0;
+    }
+    let (Some(live), Some(my_id)) = (live, net.my_id) else {
+        return 0;
+    };
+    if live.updated.elapsed() > std::time::Duration::from_secs(3) {
+        return 0;
+    }
+    if let (Some(&xy), Some(original)) = (live.pos.get(&my_id), net.pos.get_mut(&my_id)) {
+        *original = xy;
+        1
+    } else {
+        0
+    }
+}
+
+/// Optional, short-lived candidate read from the local game's own aiming control.
+/// The probe's Qt scene-transform cache may lag the actual game; this experimental
+/// source is opt-in only and must never override an explicit manual angle.
+#[derive(Clone)]
+struct LiveAngle {
+    updated: std::time::Instant,
+    uid: u64,
+    fire_angle: u16,
+}
+
+/// Strict, bounded one-line protocol from stream_live_angle_readonly.py.
+/// The reconstructed fireAngle formula is checked again before accepting data.
+fn parse_live_angle_line(line: &str) -> Option<Option<LiveAngle>> {
+    if line.trim() == "TNTANGLE-" {
+        return Some(None);
+    }
+    let mut parts = line.split_whitespace();
+    if parts.next()? != "TNTANGLE" {
+        return None;
+    }
+    let pid = parts.next()?.parse::<u32>().ok()?;
+    let uid = parts.next()?.parse::<u64>().ok()?;
+    let fire = parts.next()?.parse::<u16>().ok()?;
+    let control = parts.next()?.parse::<i32>().ok()?;
+    let rotation = parts.next()?.parse::<f64>().ok()?;
+    let flipped = match parts.next()? {
+        "0" => false,
+        "1" => true,
+        _ => return None,
+    };
+    if parts.next().is_some()
+        || pid == 0
+        || uid == 0
+        || fire > 180
+        || !(0..=180).contains(&control)
+        || !rotation.is_finite()
+        || rotation.abs() > 360.0
+    {
+        return None;
+    }
+    let expected = if flipped {
+        (180.0 - rotation - control as f64).trunc() as i32
+    } else {
+        (control as f64 - rotation).trunc() as i32
+    };
+    if expected != i32::from(fire) {
+        return None;
+    }
+    Some(Some(LiveAngle {
+        updated: std::time::Instant::now(),
+        uid,
+        fire_angle: fire,
+    }))
+}
+
+/// The Python probe verifies a *BattleSpritePlayerSelf* vtable plus its
+/// linked role UID and current battle panel before emitting a TNTANGLE row.
+/// The network tunnel is a separate optional source: its absence is NOT an
+/// identity mismatch. Reject only when a known network identity contradicts
+/// the verified local self identity, or when the sample has expired.
+/// FireReq 110 degrees folds to the HUD's 70-degree elevation.
+fn live_angle_for_hud(sample: Option<&LiveAngle>, my_id: Option<u64>) -> Option<f64> {
+    let sample = sample?;
+    if my_id.is_some_and(|network_uid| network_uid != sample.uid)
+        || sample.updated.elapsed() > std::time::Duration::from_secs(2)
+    {
+        return None;
+    }
+    let folded = sample.fire_angle.min(180 - sample.fire_angle);
+    Some(f64::from(folded))
+}
+
+/// Local angle is the preferred source by default. Explicit environment opt-out
+/// keeps the old OCR-only path without spawning the memory reader.
+fn live_angle_enabled_from_env(value: Option<&str>) -> bool {
+    match value.map(str::trim) {
+        Some(s) if ["0", "false", "off", "no"].iter()
+            .any(|off| s.eq_ignore_ascii_case(off)) => false,
+        _ => true,
+    }
+}
+
+fn selected_memory_angle(enabled: bool, prefer_memory: bool,
+                         sample: Option<&LiveAngle>, my_id: Option<u64>) -> Option<f64> {
+    if enabled && prefer_memory {
+        live_angle_for_hud(sample, my_id)
+    } else {
+        None
+    }
+}
+
 /// 追加一行配对样本到 wind_pairs.csv(运行时 cwd=项目目录)。
 /// kind=SEED 记录每回合 raw;kind=VOICE/MANUAL 记录用户标定的屏幕风速。
 /// 攒够 (raw, 实际风速) 配对后用于破解字段编码。
@@ -295,6 +460,10 @@ struct AppState {
     src_w: i32,
     src_h: i32,
     auto_angle: bool,
+    /// Source preference: memory first (automatic OCR fallback) vs OCR only.
+    prefer_memory_angle: bool,
+    /// A click on OCR requests a one-time ROI picker on the UI thread.
+    ocr_roi_requested: bool,
     is_fixed_angle: bool,
     /// F 键切换:自动风向附加时强制反向(极端大风反向抛等手动修正场景)
     wind_flip: bool,
@@ -598,6 +767,49 @@ fn find_screen_position(crop_img: &core::Mat) -> Option<(i32, i32, i32, i32)> {
     }
 }
 
+/// Last successful mini-map crop, reused on future launches to avoid
+/// interrupting every session with the OS rectangle picker. Clear with
+/// TNT_RESELECT_MINIMAP=1 to deliberately recalibrate.
+fn parse_cached_map_geo(s: &str) -> Option<(i32, i32, i32, i32)> {
+    let values: Vec<i32> = s.trim().split(',')
+        .map(|v| v.trim().parse::<i32>())
+        .collect::<Result<_, _>>().ok()?;
+    if values.len() != 4 {
+        return None;
+    }
+    let (x, y, w, h) = (values[0], values[1], values[2], values[3]);
+    (x >= 0 && y >= 0 && (60..=2000).contains(&w) && (60..=1600).contains(&h)
+        && x.checked_add(w).is_some() && y.checked_add(h).is_some())
+        .then_some((x, y, w, h))
+}
+
+fn minimap_cache_path() -> std::path::PathBuf {
+    std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join(".config").join("tnt-comput").join("minimap_region.txt")
+}
+
+fn cached_minimap_geo() -> Option<(i32, i32, i32, i32)> {
+    std::fs::read_to_string(minimap_cache_path()).ok()
+        .and_then(|s| parse_cached_map_geo(&s))
+}
+
+fn save_minimap_geo(geo: (i32, i32, i32, i32)) {
+    let path = minimap_cache_path();
+    if let Some(parent) = path.parent() {
+        if std::fs::create_dir_all(parent).is_err() { return; }
+    }
+    let (x, y, w, h) = geo;
+    let _ = std::fs::write(path, format!("{x},{y},{w},{h}\n"));
+}
+
+/// A memory-first run must not spend CPU grabbing and recognizing any angle
+/// pixels. The old OCR path runs only when explicitly selected AND calibrated.
+fn should_capture_angle_ocr(prefer_memory: bool, roi_set: bool) -> bool {
+    !prefer_memory && roi_set
+}
+
 #[cfg(target_os = "linux")]
 fn select_crop_interactive(path: &str) -> bool {
     Command::new("sh")
@@ -646,6 +858,93 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
     // ===== 网络实况隧道:libtntsniff.so → adb reverse → 127.0.0.1:19001 =====
     // 尽早绑定:用户还在框选时隧道就能连进来,开局 INIT 不容易错过。
     let net_state: Arc<Mutex<NetHud>> = Arc::new(Mutex::new(NetHud::default()));
+    // 默认开启我方 QGraphicsItem 动态 XY；可 TNT_LIVE_XY=0 关闭。
+    // 失败自动回退网络数据；敌方仍走网络解析，不污染原始抓包。
+    let live_xy_state: Arc<Mutex<Option<LiveXY>>> = Arc::new(Mutex::new(None));
+    let live_xy_enabled = live_xy_enabled_from_env(std::env::var("TNT_LIVE_XY").ok().as_deref());
+    if live_xy_enabled {
+        let state = live_xy_state.clone();
+        thread::spawn(move || {
+            let script = concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/scripts/position/stream_live_xy_readonly.py"
+            );
+            let child = Command::new("python3")
+                .arg("-u")
+                .arg(script)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit())
+                .spawn();
+            match child {
+                Ok(mut child) => {
+                    println!("📍 XY: 已启动默认的我方 QGraphicsItem 走路/飞行实时坐标采样；失败自动回退网络坐标（TNT_LIVE_XY=0 可关闭）");
+                    if let Some(stdout) = child.stdout.take() {
+                        for line in BufReader::new(stdout).lines() {
+                            let Ok(line) = line else { break };
+                            if let Some(update) = parse_live_xy_line(&line) {
+                                if let Ok(mut st) = state.lock() {
+                                    *st = update.map(|pos| LiveXY {
+                                        updated: std::time::Instant::now(),
+                                        pos,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    if let Ok(mut st) = state.lock() {
+                        *st = None;
+                    }
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    eprintln!("⚠️ XY: 只读探针已结束，自动回退网络坐标");
+                }
+                Err(err) => eprintln!("⚠️ XY: 无法启动只读探针: {err}"),
+            }
+        });
+    }
+    // The verified local aiming source is enabled by default, independent of
+    // network/XY/wind. TNT_LIVE_ANGLE=0 provides a hard OCR-only opt-out.
+    let live_angle_state: Arc<Mutex<Option<LiveAngle>>> = Arc::new(Mutex::new(None));
+    let live_angle_enabled = live_angle_enabled_from_env(
+        std::env::var("TNT_LIVE_ANGLE").ok().as_deref()
+    );
+    if live_angle_enabled {
+        let state = live_angle_state.clone();
+        thread::spawn(move || {
+            let script = concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/scripts/position/stream_live_angle_readonly.py"
+            );
+            let child = Command::new("python3")
+                .arg("-u")
+                .arg(script)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit())
+                .spawn();
+            match child {
+                Ok(mut child) => {
+                    println!("🎯 ANGLE: 内存角度默认启用；失效回退表盘。UI 可切 MEM/OCR，TNT_LIVE_ANGLE=0 强制禁用内存读数");
+                    if let Some(stdout) = child.stdout.take() {
+                        for line in BufReader::new(stdout).lines() {
+                            let Ok(line) = line else { break };
+                            if let Some(update) = parse_live_angle_line(&line) {
+                                if let Ok(mut st) = state.lock() {
+                                    *st = update;
+                                }
+                            }
+                        }
+                    }
+                    if let Ok(mut st) = state.lock() {
+                        *st = None;
+                    }
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    eprintln!("⚠️ ANGLE: 只读角度探针结束，已回退表盘识别");
+                }
+                Err(err) => eprintln!("⚠️ ANGLE: 无法启动只读探针: {err}"),
+            }
+        });
+    }
     {
         let ns = net_state.clone();
         thread::spawn(move || {
@@ -751,49 +1050,61 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
         });
     }
 
-    println!("👉 [模式选择] 回车 = 小地图模式(实时刷新); 输入 2 = 大地图模式(框选整张静态地图):");
-    let mut mode_buf = String::new();
-    let _ = std::io::stdin().read_line(&mut mode_buf);
-    let big_map_mode = mode_buf.trim() == "2";
-
-    if big_map_mode {
-        println!("👉 [步骤 1/2] 请框选【整张游戏地图】区域(整屏宽度 = 12/16/18/20/22 按钮)
-    提示: 画面实时刷新;点我方/敌方后直接出力度");
-    } else {
-        println!("👉 [步骤 1/2] 请在屏幕上框选【左上角小地图】区域...");
-    }
+    // No startup mode prompt: mini-map is the common default.
+    // Existing mode-switch button still offers optional big-map calibration.
+    let big_map_mode = std::env::var("TNT_MAP_MODE").ok()
+        .is_some_and(|s| s.trim().eq_ignore_ascii_case("big"));
     let map_crop_path = "/tmp/tnt_selected_map.png";
-    select_crop_interactive(map_crop_path);
+    let force_reselect = std::env::var("TNT_RESELECT_MINIMAP").ok().as_deref() == Some("1");
+    let reused = if !big_map_mode && !force_reselect {
+        cached_minimap_geo().and_then(|geo| {
+            // A failed screenshot must not accidentally reuse an old file.
+            let _ = std::fs::remove_file("/tmp/tnt_cached_minimap.png");
+            capture_rect_to_file(geo, "/tmp/tnt_cached_minimap.png");
+            imgcodecs::imread("/tmp/tnt_cached_minimap.png", imgcodecs::IMREAD_COLOR)
+                .ok().filter(|m| !m.empty() && m.cols() == geo.2 && m.rows() == geo.3)
+                .map(|m| (m, geo))
+        }).or_else(|| {
+            // Upgrade path from previous HUD versions: match the old saved
+            // crop once against a live screenshot, no picker when possible.
+            imgcodecs::imread(map_crop_path, imgcodecs::IMREAD_COLOR)
+                .ok().filter(|m| !m.empty())
+                .and_then(|m| find_screen_position(&m).map(|geo| (m, geo)))
+        })
+    } else { None };
 
-    let initial_img = match imgcodecs::imread(map_crop_path, imgcodecs::IMREAD_COLOR) {
-        Ok(m) if !m.empty() => m,
-        _ => {
-            println!("❌ 抓取【小地图】区域失败或取消！");
+    let (initial_img, map_geo) = if let Some(found) = reused {
+        println!("📍 自动复用小地图区域；如屏幕布局有变，设置 TNT_RESELECT_MINIMAP=1 重新框选");
+        found
+    } else {
+        println!("👉 首次校准：请框选【{}】区域，之后会记住位置，不用每次选",
+                 if big_map_mode { "整张游戏地图" } else { "左上角小地图" });
+        if !select_crop_interactive(map_crop_path) {
+            println!("❌ 没有完成地图区域选择");
             return Ok(());
         }
+        let initial = match imgcodecs::imread(map_crop_path, imgcodecs::IMREAD_COLOR) {
+            Ok(m) if !m.empty() => m,
+            _ => { println!("❌ 地图截图读取失败"); return Ok(()); }
+        };
+        let geo = match find_screen_position(&initial) {
+            Some(geo) => geo,
+            None => {
+                println!("❌ 未能定位地图区域，请重新框选");
+                return Ok(());
+            }
+        };
+        (initial, geo)
     };
+    if !big_map_mode { save_minimap_geo(map_geo); }
     let t_w = initial_img.cols();
     let t_h = initial_img.rows();
-    // 通过模板匹配反推屏幕坐标，回退到 (0,0)
-    let map_geo = find_screen_position(&initial_img).unwrap_or((0, 0, t_w, t_h));
-    println!("📍 小地图屏幕区域: ({},{}) {}x{}", map_geo.0, map_geo.1, map_geo.2, map_geo.3);
+    println!("📍 {}区域: ({},{}) {}x{}", if big_map_mode {"大地图"} else {"小地图"},
+             map_geo.0, map_geo.1, map_geo.2, map_geo.3);
 
-    println!("👉 [步骤 2/2] 请框选【左下角圆盘里的角度数字】——框要紧贴数字本身,别把圆盘边缘/箭头/其他数字框进来...");
-    let power_crop_path = "/tmp/tnt_selected_power.png";
-    select_crop_interactive(power_crop_path);
-
-    let power_img = imgcodecs::imread(power_crop_path, imgcodecs::IMREAD_COLOR)
-        .ok()
-        .filter(|m| !m.empty());
-    let power_geo = power_img
-        .as_ref()
-        .and_then(|img| find_screen_position(img))
-        // 外扩 10px:框紧贴数字时,换值后宽字形(8/9)会贴到截图边被"贴边否决"误伤,
-        // 多抓一圈边距让否决只作用于真被裁的帧
-        .map(|(x, y, w, h)| (x.saturating_sub(10), y.saturating_sub(10), w + 20, h + 20));
-    if let Some(pg) = power_geo {
-        println!("📍 数值区域屏幕坐标: ({},{}) {}x{}", pg.0, pg.1, pg.2, pg.3);
-    }
+    // Angle OCR is OFF by default: no screenshot and no picker at startup.
+    // Selecting OCR inside the HUD requests its ROI only when first needed.
+    let power_geo: Option<(i32, i32, i32, i32)> = None;
 
     let window_name = "TNT Assistant HUD";
     highgui::named_window(window_name, highgui::WINDOW_AUTOSIZE)?;
@@ -822,6 +1133,8 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
         src_w: t_w,
         src_h: t_h,
         auto_angle: true,
+        prefer_memory_angle: live_angle_enabled,
+        ocr_roi_requested: !live_angle_enabled,
         is_fixed_angle: true,
         wind_flip: false,
         wind_net: false,
@@ -883,18 +1196,21 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
     let btn_wind_p1 = core::Rect::new(map_w_display + 245, 355, 45, 30);
 
     let btn_auto_angle = core::Rect::new(map_w_display + 20, 395, 230, 30);
+    // Narrow companion switch inside existing 310px side panel; no map overlap.
+    let btn_angle_source = core::Rect::new(map_w_display + 258, 395, 50, 30);
 
     // 全部按钮矩形:用于"按下和松开都在同一按钮内才生效"的防误触判定
     let all_btns = vec![
         btn_p1, btn_e1, btn_mode_switch, btn_lock_ruler, btn_draw_ruler,
         btn_exit, btn_target, btn_clear, btn_a20, btn_a30, btn_a45, btn_a50, btn_a60, btn_a65, btn_a70,
         btn_a75, btn_ang_m5, btn_ang_minus, btn_ang_plus, btn_ang_p5, btn_auto_angle,
-        btn_wind_m1, btn_wind_m01, btn_wind_p01, btn_wind_p1,
+        btn_angle_source, btn_wind_m1, btn_wind_m01, btn_wind_p01, btn_wind_p1,
         btn_u12, btn_u16, btn_u18, btn_u20, btn_u22,
     ];
 
     let state_cb = app_state.clone();
     let net_state_cb = net_state.clone();
+    let angle_reader_available = live_angle_enabled;
     highgui::set_mouse_callback(
         window_name,
         Some(Box::new(move |event, x, y, _flags| {
@@ -1097,6 +1413,15 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
                             st.auto_angle = false;
                         } else if is_inside(x, y, btn_auto_angle) {
                             st.auto_angle = true;
+                        } else if is_inside(x, y, btn_angle_source) {
+                            // Source switch is independent of manual angle and
+                            // never changes the established XY/wind/network paths.
+                            if angle_reader_available {
+                                st.prefer_memory_angle = !st.prefer_memory_angle;
+                                if !st.prefer_memory_angle {
+                                    st.ocr_roi_requested = true;
+                                }
+                            }
                         } else if is_inside(x, y, btn_wind_m1) {
                             st.wind -= 1.0;
                             st.wind_net = false;
@@ -1168,11 +1493,13 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
     // 地图截图区域放共享变量:运行时切换模式后,后台线程下一轮就用新区域
     let map_geo_shared = Arc::new(std::sync::Mutex::new(map_geo));
     let map_geo_shared_clone = map_geo_shared.clone();
-    let power_geo_clone = power_geo.clone();
+    // The OCR crop is absent until requested explicitly by the user.
+    let power_geo_shared = Arc::new(std::sync::Mutex::new(power_geo));
+    let power_geo_clone = power_geo_shared.clone();
 
     let shared_map = Arc::new(std::sync::Mutex::new(None::<core::Mat>));
     let shared_map_clone = shared_map.clone();
-    let shared_recognized_angle = Arc::new(std::sync::Mutex::new(None::<i32>));
+    let shared_recognized_angle = Arc::new(std::sync::Mutex::new(None::<(i32, std::time::Instant)>));
     let shared_recognized_angle_clone = shared_recognized_angle.clone();
 
     // 回合切换信号:新回合清空角度投票+显示值,防止旧角度给出错误力度
@@ -1181,16 +1508,23 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
     let angle_reset_gen_clone = angle_reset_gen.clone();
 
     let app_state_bg = app_state.clone();
+    let live_angle_capture = live_angle_state.clone();
+    let net_angle_capture = net_state.clone();
 
     thread::spawn(move || {
-        let recognizer =
-            tnt_comput::ui::UiRecognizer::new("src/templates").expect("Failed to init recognizer");
-        // 角度 OCR:表盘法读数本身很准(±1°),单帧直读直用——
-        // 画面没变跳过识别,变了就识别就生效,基本即时。
+        // Do NOT initialize OCR templates or allocate an OCR reader in normal
+        // memory-angle mode. The first explicit OCR switch initializes it.
+        let mut recognizer: Option<tnt_comput::ui::UiRecognizer> = None;
+        // On-demand angle OCR: do not run in default MEM mode.
         let mut last_angle_gen = 0u64;
-        // 地图截图降频:大图抓取贵(~百ms级),每帧都抓会把角度ROI采样率压到个位数fps。
-        // 地图内容变化慢,250ms刷一次完全够,角度框仍然每轮都抓。
+        // The mini-map background can be refreshed less often; its screenshots
+        // do not determine the network XY / memory angle sampling rates.
         let mut last_map_cap = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        // Map background only: less frequent screenshot and PNG parsing.
+        // Player markers and memory angle remain independently refreshed.
+        let map_capture_ms: u128 = std::env::var("TNT_MAP_CAPTURE_MS")
+            .ok().and_then(|v| v.parse::<u128>().ok())
+            .filter(|&ms| (250..=3000).contains(&ms)).unwrap_or(500);
         let mut last_size_warn = std::time::Instant::now();
         let mut last_roi_sig = (0i64, 0i64, 0i64);
         let mut last_misread_dbg = std::time::Instant::now();
@@ -1213,9 +1547,9 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
 
             // 实测(2560x1440):单次小区域截图 ~51ms,而大图的 PNG 编解码要贵得多,
             // 所以"并集成一张大图"反而不如"各自抓小图"快。
-            // 地图 250ms 一帧(内容基本不变,降频把带宽让给角度ROI);
-            // 角度框每轮都抓:区域只有几十像素,截图很快,去掉100ms节流后同步延迟减半。
-            if last_map_cap.elapsed().as_millis() > 250 {
+            // 500ms/default map background; angle screen never captured in
+            // MEM mode, only when OCR has been explicitly chosen.
+            if last_map_cap.elapsed().as_millis() >= map_capture_ms {
                 last_map_cap = std::time::Instant::now();
                 capture_rect_to_file(*map_geo_shared_clone.lock().unwrap(), map_path);
                 if let Ok(m) = imgcodecs::imread(map_path, imgcodecs::IMREAD_COLOR) {
@@ -1227,8 +1561,17 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
                 }
             }
 
-            if let Some(pg) = power_geo_clone {
-                {
+            let prefer_memory = app_state_bg.lock().ok()
+                .is_none_or(|st| st.prefer_memory_angle);
+            let selected_power_geo = power_geo_clone.lock().ok().and_then(|g| *g);
+            let ocr_active = should_capture_angle_ocr(
+                prefer_memory, selected_power_geo.is_some()
+            );
+            if let Some(pg) = selected_power_geo.filter(|_| ocr_active) {
+                if recognizer.is_none() {
+                    recognizer = tnt_comput::ui::UiRecognizer::new("src/templates").ok();
+                }
+                if recognizer.is_some() {
                     capture_rect_to_file(pg, power_path);
                     if let Ok(p) = imgcodecs::imread(power_path, imgcodecs::IMREAD_COLOR) {
                         if !p.empty() {
@@ -1264,7 +1607,7 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
                                 }
                                 last_roi_sig = sig;
                                 // 纯表盘几何法:读虚线方向,不走数字OCR
-                                let val = recognizer.recognize_angle_dial(&p);
+                                let val = recognizer.as_ref().unwrap().recognize_angle_dial(&p);
                                 match val {
                                     Ok(Some(stable)) => {
                                         // 表盘法单帧即准,直读直用
@@ -1274,11 +1617,20 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
                                         }
                                         if let Ok(mut lock) = shared_recognized_angle_clone.lock()
                                         {
-                                            *lock = Some(stable);
+                                            *lock = Some((stable, std::time::Instant::now()));
                                         }
                                         if stable >= 3 && stable <= 90 {
+                                            // Do not overwrite a fresh, opt-in memory angle with
+                                            // an OCR observation from a stale or partial dial.
+                                            let my_id = net_angle_capture.lock().ok().and_then(|n| n.my_id);
+                                            let memory_fresh = live_angle_capture.lock().ok()
+                                                .and_then(|l| live_angle_for_hud(l.as_ref(), my_id))
+                                                .is_some();
                                             if let Ok(mut m_state) = app_state_bg.lock() {
-                                                if m_state.auto_angle {
+                                                // Manually selected OCR must not be suppressed
+                                                // just because memory samples are available.
+                                                if m_state.auto_angle &&
+                                                    (!m_state.prefer_memory_angle || !memory_fresh) {
                                                     m_state.current_angle = stable as f64;
                                                 }
                                             }
@@ -1304,7 +1656,11 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
             if let Ok(mut lock) = cap_time_ms_clone.lock() {
                 *lock = t0.elapsed().as_millis();
             }
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            // MEM mode only needs an occasional mini-map refresh. Avoid
+            // waking 50 times/sec to discover OCR is still disabled.
+            std::thread::sleep(std::time::Duration::from_millis(
+                if ocr_active { 20 } else { 60 }
+            ));
         }
     });
 
@@ -1322,6 +1678,8 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
     let mut last_wind_key: Option<(Option<i32>, bool)> = None;
     /// 上一个我方回合(局,回合,raw,回合开始时的风值),翻篇时结算进配对日志
     let mut prev_my_turn: Option<(u64, u64, i64, f64)> = None;
+    // 每 5 秒汇报一次 XY 端到端状态，诊断「抓到坐标却没真正画出来」。
+    let mut last_xy_diag = std::time::Instant::now() - std::time::Duration::from_secs(6);
 
     let mut first_show = true;
 
@@ -1599,6 +1957,7 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
     // 不可达时更是 600+ 次采样，每帧重算是纯浪费。
     let mut traj_memo: Option<((f64, f64, f64, f64, bool), Option<(f64, f64)>)> = None;
     let mut fps_t0 = std::time::Instant::now();
+    let mut last_angle_diag = std::time::Instant::now() - std::time::Duration::from_secs(6);
     let mut last_toggle_time = std::time::Instant::now() - std::time::Duration::from_secs(1); // 防抖时间戳
 
     loop {
@@ -1671,7 +2030,55 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
         let t_io = loop_t0.elapsed().as_millis();
         let t1 = std::time::Instant::now();
 
-        let power_recognized_val = *shared_recognized_angle.lock().unwrap();
+        let prefer_memory_angle = app_state.lock().unwrap().prefer_memory_angle;
+        // OCR readings are never consulted in MEM mode. No OCR screenshot,
+        // recognition or stale fallback happens unless OCR is explicitly chosen.
+        let power_recognized_val = if prefer_memory_angle {
+            None
+        } else {
+            shared_recognized_angle.lock().unwrap().as_ref()
+                .and_then(|&(value, seen)| {
+                    (seen.elapsed() <= std::time::Duration::from_secs(2)).then_some(value)
+                })
+        };
+        // Source preference is an independent HUD toggle (defaults to MEM).
+        // Identity remains verified locally and checked against network UID.
+        let live_angle_used = if live_angle_enabled && prefer_memory_angle {
+            let my_id = net_state.lock().unwrap().my_id;
+            let live = live_angle_state.lock().unwrap();
+            selected_memory_angle(live_angle_enabled, prefer_memory_angle, live.as_ref(), my_id)
+        } else {
+            None
+        };
+        if live_angle_enabled && last_angle_diag.elapsed() >= std::time::Duration::from_secs(5) {
+            let my_id = net_state.lock().unwrap().my_id;
+            let state = live_angle_state.lock().unwrap();
+            let (status, sample_uid, age_ms, fire_angle) = match state.as_ref() {
+                None => ("no_verified_sample", None, None, None),
+                Some(sample) if my_id.is_some_and(|network_uid| network_uid != sample.uid) =>
+                    ("uid_mismatch", Some(sample.uid), Some(sample.updated.elapsed().as_millis()), Some(sample.fire_angle)),
+                Some(sample) if sample.updated.elapsed() > std::time::Duration::from_secs(2) =>
+                    ("sample_stale", Some(sample.uid), Some(sample.updated.elapsed().as_millis()), Some(sample.fire_angle)),
+                Some(sample) =>
+                    (if my_id.is_some() { "sample_ready" } else { "sample_ready_local" },
+                     Some(sample.uid), Some(sample.updated.elapsed().as_millis()), Some(sample.fire_angle)),
+            };
+            println!(
+                "🎯 ANGLE HUD: {status} my_id={my_id:?} sample_uid={sample_uid:?} age_ms={age_ms:?} fire_angle={fire_angle:?}"
+            );
+            last_angle_diag = std::time::Instant::now();
+        }
+        // Sync immediately after MEM/OCR switching, without waiting for
+        // the image ROI to change again. Manual angles remain untouched.
+        if let Ok(mut state) = app_state.lock() {
+            if state.auto_angle {
+                if let Some(angle) = live_angle_used {
+                    state.current_angle = angle;
+                } else if let Some(ocr_value) = power_recognized_val {
+                    state.current_angle = f64::from(ocr_value);
+                }
+            }
+        }
 
         let t_recog = t1.elapsed().as_millis();
         let t2 = std::time::Instant::now();
@@ -1780,7 +2187,31 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
             let px_per_unit = current_px_per_unit;
 
             // ===== 网络实况:世界坐标 → 小地图 canvas 点 =====
-            let net = net_state.lock().unwrap().clone();
+            // 只修改渲染快照；原始网络坐标与录制数据保持不变。
+            let mut net = net_state.lock().unwrap().clone();
+            let mut xy_seen = 0usize;
+            let mut xy_age_ms: Option<u128> = None;
+            let mut xy_applied = 0usize;
+            if let Ok(live) = live_xy_state.lock() {
+                if let Some(sample) = live.as_ref() {
+                    xy_seen = sample.pos.len();
+                    xy_age_ms = Some(sample.updated.elapsed().as_millis());
+                }
+                xy_applied = overlay_live_xy(&mut net, live.as_ref());
+            }
+            if live_xy_enabled && last_xy_diag.elapsed() >= std::time::Duration::from_secs(5) {
+                let mut coords: Vec<_> = net.pos.iter()
+                    .map(|(&id, &(x, y))| (id, x, y))
+                    .collect();
+                coords.sort_unstable_by_key(|p| p.0);
+                println!(
+                    "📍 XY HUD: mem_roles={} sample_age_ms={:?} applied={} net_roles={} conns={} map={}x{} my_id={:?} manual_self={} manual_enemy={} positions={:?}",
+                    xy_seen, xy_age_ms, xy_applied, net.pos.len(), net.conns,
+                    net.map_w, net.map_h, net.my_id,
+                    st.manual_p1.is_some(), st.manual_e1.is_some(), coords
+                );
+                last_xy_diag = std::time::Instant::now();
+            }
 
             // 客户端解出的世界风 → 我方新回合自动写进 st.wind(符号=箭头×方位×F翻转)
             if net.turn_seq != last_wind_turn {
@@ -2293,10 +2724,14 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
         }
 
         let pval_str = if st.auto_angle {
-            if let Some(val) = power_recognized_val {
-                format!("实机同步: 开启 ({})", val)
+            if let Some(angle) = live_angle_used {
+                format!("内存角: {:.0}°", angle)
+            } else if let Some(val) = power_recognized_val {
+                format!("表盘角: {}°", val)
+            } else if st.prefer_memory_angle {
+                "内存角暂无新读数".to_string()
             } else {
-                "实机同步: 监听中...".to_string()
+                "OCR等待读数/首次需框选".to_string()
             }
         } else {
             "实机同步: 已暂停 (点击恢复)".to_string()
@@ -2307,6 +2742,13 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
             &pval_str,
             st.auto_angle,
         );
+        // Explicit MEM/OCR preference: no background angle OCR in MEM mode.
+        draw_btn(
+            &mut canvas,
+            btn_angle_source,
+            if st.prefer_memory_angle { "MEM" } else { "OCR" },
+            st.prefer_memory_angle,
+        )?;
 
         draw_btn(
             &mut canvas,
@@ -2782,6 +3224,37 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
             }
         }
 
+        // OCR is off by default. Only an explicit click on the OCR source
+        // triggers a one-time crop picker here on the UI thread (never in a
+        // mouse callback). The memory-angle sampling thread is unaffected.
+        let request_ocr_roi = {
+            let mut st = app_state.lock().unwrap();
+            let req = st.ocr_roi_requested;
+            st.ocr_roi_requested = false;
+            req
+        };
+        if request_ocr_roi && power_geo_shared.lock().unwrap().is_none() {
+            println!("👉 OCR 首次启用：请框选左下角角度表盘（仅此时需要）");
+            let crop_path = "/tmp/tnt_selected_power.png";
+            if select_crop_interactive(crop_path) {
+                let candidate = imgcodecs::imread(crop_path, imgcodecs::IMREAD_COLOR)
+                    .ok().filter(|m| !m.empty())
+                    .and_then(|img| find_screen_position(&img))
+                    .map(|(x, y, w, h)| {
+                        (x.saturating_sub(10), y.saturating_sub(10), w + 20, h + 20)
+                    });
+                if let Some(geo) = candidate {
+                    *power_geo_shared.lock().unwrap() = Some(geo);
+                    *shared_recognized_angle.lock().unwrap() = None;
+                    println!("✅ OCR 区域设置完成；只有切到 OCR 才会截图识别");
+                } else {
+                    println!("⚠️ OCR 区域无法定位；可点击 MEM 返回内存角");
+                }
+            } else {
+                println!("⚠️ 未选择 OCR 区域；仍可点击 MEM 使用内存角");
+            }
+        }
+
         // 运行时切换大/小地图模式:交互框选新区域 → 换图源 → 重算缩放和比例尺。
         // 点位属于旧图,全部作废;大地图自动按档位锁尺,小地图重新画尺子。
         if app_state.lock().unwrap().switch_requested {
@@ -2799,6 +3272,7 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
                         let nh = new_img.rows();
                         let geo = find_screen_position(&new_img).unwrap_or((0, 0, nw, nh));
                         *map_geo_shared.lock().unwrap() = geo;
+                        if !to_big { save_minimap_geo(geo); }
                         *shared_map.lock().unwrap() = None; // 丢弃旧区域画面,等新图
                         let new_scale = (map_w_display as f64 / nw as f64).min(2.0);
                         let mut stg = app_state.lock().unwrap();
@@ -2839,6 +3313,142 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_xy_default_on_and_explicit_off() {
+        assert!(live_xy_enabled_from_env(None));
+        assert!(live_xy_enabled_from_env(Some("1")));
+        assert!(live_xy_enabled_from_env(Some("yes")));
+        assert!(!live_xy_enabled_from_env(Some("0")));
+        assert!(!live_xy_enabled_from_env(Some("false")));
+        assert!(!live_xy_enabled_from_env(Some(" OFF ")));
+        assert!(!live_xy_enabled_from_env(Some("No")));
+    }
+
+    #[test]
+    fn memory_angle_defaults_on_and_explicit_off() {
+        assert!(live_angle_enabled_from_env(None));
+        assert!(live_angle_enabled_from_env(Some("1")));
+        assert!(live_angle_enabled_from_env(Some("yes")));
+        assert!(live_angle_enabled_from_env(Some("")));
+        for val in ["0", "false", "OFF", " No "] {
+            assert!(!live_angle_enabled_from_env(Some(val)));
+        }
+    }
+
+    #[test]
+    fn saved_minimap_geo_validation_and_default_ocr_off() {
+        assert_eq!(parse_cached_map_geo("42,97,327,288\n"), Some((42, 97, 327, 288)));
+        assert_eq!(parse_cached_map_geo("46, 101, 359, 338"), Some((46, 101, 359, 338)));
+        assert_eq!(parse_cached_map_geo("0,0,300"), None);
+        assert_eq!(parse_cached_map_geo("-20,97,327,288"), None);
+        assert_eq!(parse_cached_map_geo("20,97,0,288"), None);
+        assert_eq!(parse_cached_map_geo("a,97,327,288"), None);
+        assert!(!should_capture_angle_ocr(true, false));
+        assert!(!should_capture_angle_ocr(true, true));
+        assert!(!should_capture_angle_ocr(false, false));
+        assert!(should_capture_angle_ocr(false, true));
+    }
+
+    #[test]
+    fn angle_source_button_draws_within_existing_sidebar() -> opencv::Result<()> {
+        let map_width = 300;
+        let total_width = map_width + 310;
+        let auto_btn = core::Rect::new(map_width + 20, 395, 230, 30);
+        let source_btn = core::Rect::new(map_width + 258, 395, 50, 30);
+        assert!(auto_btn.x + auto_btn.width < source_btn.x);
+        assert!(source_btn.x + source_btn.width <= total_width);
+        assert_eq!(source_btn.y, auto_btn.y);
+        let mut canvas = core::Mat::new_rows_cols_with_default(
+            580, total_width, core::CV_8UC3, core::Scalar::all(0.0)
+        )?;
+        draw_btn(&mut canvas, auto_btn, "Sync", true)?;
+        draw_btn(&mut canvas, source_btn, "MEM", true)?;
+        let mem_pixel = canvas.at_2d::<core::Vec3b>(source_btn.y + 3, source_btn.x + 3)?;
+        assert!(mem_pixel[0] > 0 || mem_pixel[1] > 0 || mem_pixel[2] > 0);
+        draw_btn(&mut canvas, source_btn, "OCR", false)?;
+        let ocr_pixel = canvas.at_2d::<core::Vec3b>(source_btn.y + 3, source_btn.x + 3)?;
+        assert!(ocr_pixel[0] > 0 || ocr_pixel[1] > 0 || ocr_pixel[2] > 0);
+        Ok(())
+    }
+
+    #[test]
+    fn optional_live_angle_protocol_validates_client_formula_and_source() {
+        let row = parse_live_angle_line("TNTANGLE 3056 74108 110 65 5.0 1")
+            .unwrap().unwrap();
+        assert_eq!(row.uid, 74108);
+        assert_eq!(row.fire_angle, 110);
+        assert_eq!(live_angle_for_hud(Some(&row), Some(74108)), Some(70.0));
+        assert_eq!(selected_memory_angle(true, true, Some(&row), Some(74108)), Some(70.0));
+        assert_eq!(selected_memory_angle(true, false, Some(&row), Some(74108)), None);
+        assert_eq!(selected_memory_angle(false, true, Some(&row), Some(74108)), None);
+        // No network stream: accept the probe's separately verified self UID.
+        assert_eq!(live_angle_for_hud(Some(&row), None), Some(70.0));
+        // A real disagreement between network and local self still rejects.
+        assert_eq!(live_angle_for_hud(Some(&row), Some(12345)), None);
+        assert!(matches!(parse_live_angle_line("TNTANGLE-"), Some(None)));
+        assert!(parse_live_angle_line("TNTANGLE 3056 74108 111 65 5.0 1").is_none());
+        assert!(parse_live_angle_line("TNTANGLE 3056 74108 110 65 NaN 1").is_none());
+        assert!(parse_live_angle_line("TNTANGLE 3056 74108 110 65 5.0 2").is_none());
+        assert!(parse_live_angle_line("TNTANGLE 3056 74108 110 65 5.0 1 extra").is_none());
+        let unflipped = parse_live_angle_line("TNTANGLE 3056 74108 50 48 -2.0 0")
+            .unwrap().unwrap();
+        assert_eq!(live_angle_for_hud(Some(&unflipped), Some(74108)), Some(50.0));
+        let stale = LiveAngle {
+            updated: std::time::Instant::now() - std::time::Duration::from_secs(3),
+            ..row
+        };
+        assert_eq!(live_angle_for_hud(Some(&stale), Some(74108)), None);
+    }
+
+    #[test]
+    fn live_xy_protocol_parses_and_rejects_invalid_rows() {
+        let parsed = parse_live_xy_line("TNTXY 10161 2 55437:2125:614 74108:465:615")
+            .unwrap().unwrap();
+        assert_eq!(parsed.get(&55437), Some(&(2125, 614)));
+        assert_eq!(parsed.get(&74108), Some(&(465, 615)));
+        assert!(matches!(parse_live_xy_line("TNTXY-"), Some(None)));
+        assert!(parse_live_xy_line("TNTXY 10161 2 1:3:4").is_none());
+        assert!(parse_live_xy_line("TNTXY 10161 2 1:3:4 1:5:6").is_none());
+        assert!(parse_live_xy_line("TNTXY 10161 1 1:3:4 junk").is_none());
+        assert!(parse_live_xy_line("TNTXY 10161 1 1:999999:4").is_none());
+    }
+
+    #[test]
+    fn live_xy_only_overlays_my_own_graphics_pos_when_fresh() {
+        let mut net = NetHud {
+            map_w: 3000,
+            map_h: 1500,
+            conns: 1,
+            my_id: Some(74108),
+            ..Default::default()
+        };
+        net.pos.insert(55437, (2125, 1));
+        net.pos.insert(74108, (465, 1));
+        let mut pos = HashMap::new();
+        pos.insert(55437, (2125, 614));
+        pos.insert(74108, (465, 615));
+        pos.insert(111111, (1, 2)); // 未经网络确认的角色不能插入
+        let fresh = LiveXY { updated: std::time::Instant::now(), pos: pos.clone() };
+        assert_eq!(overlay_live_xy(&mut net, Some(&fresh)), 1);
+        assert_eq!(net.pos.get(&55437), Some(&(2125, 1))); // 敌方网络坐标必须不变
+        assert_eq!(net.pos.get(&74108), Some(&(465, 615))); // 仅自己的显示坐标跟走路
+        assert!(!net.pos.contains_key(&111111));
+
+        let stale = LiveXY {
+            updated: std::time::Instant::now() - std::time::Duration::from_secs(5),
+            pos,
+        };
+        net.pos.insert(74108, (465, 70));
+        assert_eq!(overlay_live_xy(&mut net, Some(&stale)), 0);
+        assert_eq!(net.pos.get(&74108), Some(&(465, 70)));
+
+        net.my_id = None;
+        assert_eq!(overlay_live_xy(&mut net, Some(&fresh)), 0);
+        net.my_id = Some(74108);
+        net.conns = 0;
+        assert_eq!(overlay_live_xy(&mut net, Some(&fresh)), 0);
+    }
     use tnt_comput::proto::PlayerInit;
 
     #[test]

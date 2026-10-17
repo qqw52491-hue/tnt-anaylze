@@ -23,3 +23,6 @@ wind_pairs.csv
 
 # Private raw network captures and research events
 /recordings/
+
+# Read-only Qt graphics X/Y probe is part of the HUD runtime (not a build artifact).
+!/scripts/position/*.py
