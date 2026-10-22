@@ -2,6 +2,7 @@
 //!
 //!   net_live pcap <file|->          decode a pcap file or `tcpdump -w -` stdin
 //!   net_live listen [port]          accept sniffer-tunnel records (adb reverse)
+//!   net_live replay <raw.bin>       decode an offline tunnel recording
 //!
 //! Every decoded event is printed as one line.
 
@@ -66,10 +67,11 @@ fn fmt_event(prefix: &str, ev: &GameEvent) -> String {
             shots,
         } => format!("{prefix} FIRE id={id} from=({x},{y}) angle={angle:?} shots={shots}"),
         GameEvent::FireReq {
-            weapon,
+            round,
+            left,
             angle,
             power,
-        } => format!("{prefix} FIREREQ weapon={weapon} angle={angle} power={power:.2}"),
+        } => format!("{prefix} FIREREQ request_round={round} left={left} angle={angle} power={power:.2}"),
         GameEvent::Other { name, ntype, seq } => {
             format!("{prefix} MSG {name} type={ntype:?} seq={seq:?}")
         }
@@ -115,8 +117,11 @@ fn run_pcap(path: &str) -> io::Result<()> {
 }
 
 fn handle_tunnel(stream: std::net::TcpStream) -> io::Result<()> {
-    let mut stream = stream;
     stream.set_nodelay(true).ok();
+    decode_tunnel(stream)
+}
+
+fn decode_tunnel(mut stream: impl Read) -> io::Result<()> {
     let mut parser = tunnel::Parser::default();
     let mut tracker = Tracker::default();
     let mut buf = [0u8; 65536];
@@ -203,8 +208,14 @@ fn main() -> io::Result<()> {
                 .unwrap_or(19001);
             run_listen(port)
         }
+        Some("replay") => {
+            let path = args.get(2).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "missing raw.bin path")
+            })?;
+            decode_tunnel(std::io::BufReader::new(std::fs::File::open(path)?))
+        }
         _ => {
-            eprintln!("usage: net_live pcap <file|-> | net_live listen [port]");
+            eprintln!("usage: net_live pcap <file|-> | net_live listen [port] | net_live replay <raw.bin>");
             Ok(())
         }
     }

@@ -89,7 +89,7 @@ impl Capture {
             .mode(0o600)
             .open(dir.join("events.jsonl"))?;
         let manifest = format!(
-            "{{\"schema\":1,\"created_unix_ms\":{},\"raw_path\":{},\"raw_format\":\"tnt tunnel records v1, 21-byte header\",\"physics_changed\":{},\"physics_model\":{},\"world_units_per_hud_unit\":{},\"fit_ready\":false,\"note\":\"Events are not automatically paired; decoded defaults require raw-field validation; Fire xy semantics and projectile paths unresolved. HUD context is a snapshot, not verified ground truth. Raw packets may contain private game data.\"}}\n",
+            "{{\"schema\":1,\"created_unix_ms\":{},\"raw_path\":{},\"raw_format\":\"tnt tunnel records v1, 21-byte header\",\"tls_plaintext_kinds\":{{\"tx\":11,\"rx\":12}},\"tls_stream_ids\":\"fd bit 31 set: SSL lifetime ID, not OS socket; peer may be unknown with Qt memory BIO\",\"physics_changed\":{},\"physics_model\":{},\"world_units_per_hud_unit\":{},\"fit_ready\":false,\"note\":\"Events are not automatically paired; decoded defaults require raw-field validation; Fire xy semantics and projectile paths unresolved. HUD context is a snapshot, not verified ground truth. Raw packets may contain private game data.\"}}\n",
             epoch_ms(),
             quote(&raw_path.to_string_lossy()),
             crate::physics::is_recorded_model(),
@@ -115,11 +115,15 @@ impl Capture {
         let result = (|| -> io::Result<()> {
             let len = u32::try_from(rec.payload.len())
                 .map_err(|_| io::Error::other("record too large"))?;
-            self.raw.write_all(&[rec.kind])?;
-            self.raw.write_all(&rec.pid.to_le_bytes())?;
-            self.raw.write_all(&rec.fd.to_le_bytes())?;
-            self.raw.write_all(&rec.ms.to_le_bytes())?;
-            self.raw.write_all(&len.to_le_bytes())?;
+            // One header write instead of five small writes. Preserve the exact
+            // tunnel layout and immediate visibility to offline/live readers.
+            let mut header = [0u8; tunnel::HDR_LEN];
+            header[0] = rec.kind;
+            header[1..5].copy_from_slice(&rec.pid.to_le_bytes());
+            header[5..9].copy_from_slice(&rec.fd.to_le_bytes());
+            header[9..17].copy_from_slice(&rec.ms.to_le_bytes());
+            header[17..21].copy_from_slice(&len.to_le_bytes());
+            self.raw.write_all(&header)?;
             self.raw.write_all(&rec.payload)?;
             self.raw.flush()?;
             Ok(())
@@ -172,11 +176,12 @@ impl Capture {
                     .join(",")
             ),
             GameEvent::FireReq {
-                weapon,
+                round,
+                left,
                 angle,
                 power,
             } => format!(
-                "{{\"kind\":\"fire_request\",\"weapon\":{weapon},\"angle\":{angle},\"power\":{},\"field_presence_verified\":false}}",
+                "{{\"kind\":\"fire_request\",\"request_round\":{round},\"left\":{left},\"angle\":{angle},\"power\":{},\"field_presence_verified\":true}}",
                 float(*power)
             ),
             GameEvent::Fire {
@@ -222,13 +227,14 @@ impl Capture {
             ),
         };
         let line = format!(
-            "{{\"schema\":1,\"event_seq\":{},\"received_unix_ms\":{},\"game_ms\":{},\"connection\":{connection},\"pid\":{},\"fd\":{},\"direction\":{},\"raw_record_offset\":{},\"hud_context_unverified\":{{\"battle\":{},\"round\":{},\"turn\":{},\"world_wind10\":{},\"my_id\":{}}},\"fit_ready\":false,\"data\":{data}}}",
+            "{{\"schema\":1,\"event_seq\":{},\"received_unix_ms\":{},\"game_ms\":{},\"connection\":{connection},\"pid\":{},\"fd\":{},\"direction\":{},\"raw_record_kind\":{},\"raw_record_offset\":{},\"hud_context_unverified\":{{\"battle\":{},\"round\":{},\"turn\":{},\"world_wind10\":{},\"my_id\":{}}},\"fit_ready\":false,\"data\":{data}}}",
             self.seq,
             epoch_ms(),
             rec.ms,
             rec.pid,
             rec.fd,
             quote(if c2s { "c2s" } else { "s2c" }),
+            rec.kind,
             optional(raw_offset),
             ctx.battle,
             ctx.round,
@@ -246,14 +252,16 @@ impl Capture {
 #[cfg(test)]
 mod tests {
     use super::*;
+    static TEST_DIR_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     fn root() -> PathBuf {
         std::env::temp_dir().join(format!(
-            "tnt-capture-test-{}-{}",
+            "tnt-capture-test-{}-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            TEST_DIR_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ))
     }
     #[test]
@@ -271,8 +279,8 @@ mod tests {
         let rec = tunnel::Record {
             kind: tunnel::KIND_TX,
             pid: 9,
-            fd: 10,
-            ms: 123,
+            fd: 0x8000_1234,
+            ms: 0x0102_0304_0506_0708,
             payload: vec![1, 2, 3],
         };
         let offset = c.record(&rec);
@@ -283,7 +291,8 @@ mod tests {
             offset,
             true,
             &GameEvent::FireReq {
-                weapon: 1,
+                round: 1,
+                left: false,
                 angle: 45,
                 power: 60.123456789,
             },
@@ -293,7 +302,13 @@ mod tests {
         let bytes = std::fs::read(c.dir.join("raw.bin")).unwrap();
         let replay = tunnel::Parser::default().feed(&bytes);
         assert_eq!(replay.len(), 2);
-        assert_eq!(replay[0].payload, rec.payload);
+        for item in &replay {
+            assert_eq!(item.kind, rec.kind);
+            assert_eq!(item.pid, rec.pid);
+            assert_eq!(item.fd, rec.fd);
+            assert_eq!(item.ms, rec.ms);
+            assert_eq!(item.payload, rec.payload);
+        }
         let text = std::fs::read_to_string(c.dir.join("events.jsonl")).unwrap();
         assert!(text.contains("60.123456789"));
         assert!(text.contains("\"world_wind10\":null"));

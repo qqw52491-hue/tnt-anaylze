@@ -26,3 +26,7 @@ wind_pairs.csv
 
 # Read-only Qt graphics X/Y probe is part of the HUD runtime (not a build artifact).
 !/scripts/position/*.py
+
+# Offline ballistics calibration tools; private inputs remain under target/.
+!/scripts/physics/*.py
+/scripts/physics/__pycache__/

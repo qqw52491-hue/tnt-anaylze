@@ -481,6 +481,8 @@ struct ConnState {
     peer: String,
     c2s: WsDecoder,
     s2c: WsDecoder,
+    tls_c2s: WsDecoder,
+    tls_s2c: WsDecoder,
     dead_noted: bool,
 }
 
@@ -503,6 +505,8 @@ impl Tracker {
                         peer: peer.clone(),
                         c2s: WsDecoder::new(),
                         s2c: WsDecoder::new(),
+                        tls_c2s: WsDecoder::new(),
+                        tls_s2c: WsDecoder::new(),
                         dead_noted: false,
                     },
                 );
@@ -512,7 +516,7 @@ impl Tracker {
                     peer,
                 }]
             }
-            tunnel::KIND_TX | tunnel::KIND_RX => {
+            tunnel::KIND_TX | tunnel::KIND_RX | tunnel::KIND_TLS_TX | tunnel::KIND_TLS_RX => {
                 let mut out = Vec::new();
                 // 中途接入的连接不会有 CONNECT 记录(connect 发生在隧道建立之前),
                 // 就地补建状态——WS 解码器支持从流中间起步。
@@ -523,6 +527,8 @@ impl Tracker {
                             peer: "?".to_string(),
                             c2s: WsDecoder::new(),
                             s2c: WsDecoder::new(),
+                            tls_c2s: WsDecoder::new(),
+                            tls_s2c: WsDecoder::new(),
                             dead_noted: false,
                         },
                     );
@@ -533,8 +539,14 @@ impl Tracker {
                     });
                 }
                 let c = self.conns.get_mut(&key).unwrap();
-                let c2s = rec.kind == tunnel::KIND_TX;
-                let dec = if c2s { &mut c.c2s } else { &mut c.s2c };
+                let c2s = matches!(rec.kind, tunnel::KIND_TX | tunnel::KIND_TLS_TX);
+                // TLS ciphertext must never poison the plaintext WS decoder.
+                let dec = match rec.kind {
+                    tunnel::KIND_TLS_TX => &mut c.tls_c2s,
+                    tunnel::KIND_TLS_RX => &mut c.tls_s2c,
+                    tunnel::KIND_TX => &mut c.c2s,
+                    _ => &mut c.s2c,
+                };
                 if dec.dead {
                     return out;
                 }
@@ -596,6 +608,9 @@ pub mod tunnel {
     pub const KIND_HELLO: u8 = 5;
     pub const KIND_RAND: u8 = 6;
     pub const KIND_LOG: u8 = 7;
+    /// SSL plaintext. fd has bit 31 set and identifies an SSL lifetime, not a socket.
+    pub const KIND_TLS_TX: u8 = 11;
+    pub const KIND_TLS_RX: u8 = 12;
     pub const HDR_LEN: usize = 1 + 4 + 4 + 8 + 4; // = 21
 
     pub struct Record {
@@ -640,5 +655,93 @@ pub mod tunnel {
             }
             out
         }
+    }
+}
+
+#[cfg(test)]
+mod tls_tests {
+    use super::*;
+
+    fn record(kind: u8, fd: u32, payload: &[u8]) -> tunnel::Record {
+        tunnel::Record {
+            kind,
+            pid: 42,
+            fd,
+            ms: 0,
+            payload: payload.to_vec(),
+        }
+    }
+    fn messages(events: Vec<TunnelEvent>) -> Vec<(bool, Vec<u8>)> {
+        events
+            .into_iter()
+            .filter_map(|e| match e {
+                TunnelEvent::Msg { c2s, msg, .. } => Some((c2s, msg.payload)),
+                _ => None,
+            })
+            .collect()
+    }
+    #[test]
+    fn tls_plaintext_survives_ciphertext_and_fragmented_upgrade() {
+        let mut tracker = Tracker::default();
+        // Even if a future sniffer uses the same ID, streams stay separate.
+        tracker.on_record(&record(tunnel::KIND_RX, 123, b"\x17\x03\x03\x00\x04xxxx"));
+        assert!(messages(tracker.on_record(&record(
+            tunnel::KIND_TLS_RX,
+            123,
+            b"HTTP/1.1 101 Switching Protocols\r\n"
+        )))
+        .is_empty());
+        assert_eq!(
+            messages(tracker.on_record(&record(tunnel::KIND_TLS_RX, 123, b"\r\n\x82\x03abc"))),
+            vec![(false, b"abc".to_vec())]
+        );
+        assert_eq!(
+            messages(tracker.on_record(&record(
+                tunnel::KIND_TLS_TX,
+                123,
+                b"\x82\x83\x01\x02\x03\x04```"
+            ))),
+            vec![(true, b"abc".to_vec())]
+        );
+    }
+    #[test]
+    fn ssl_objects_are_independent_and_close_discards_partial_data() {
+        let mut tracker = Tracker::default();
+        let a = 0x80000001;
+        let b = 0x80000002;
+        tracker.on_record(&record(tunnel::KIND_TLS_RX, a, b"\x82\x03a"));
+        assert_eq!(
+            messages(tracker.on_record(&record(tunnel::KIND_TLS_RX, b, b"\x82\x03xyz"))),
+            vec![(false, b"xyz".to_vec())]
+        );
+        assert_eq!(
+            messages(tracker.on_record(&record(tunnel::KIND_TLS_RX, a, b"bc"))),
+            vec![(false, b"abc".to_vec())]
+        );
+        tracker.on_record(&record(tunnel::KIND_TLS_RX, a, b"\x82\x03a"));
+        tracker.on_record(&record(tunnel::KIND_CLOSE, a, b""));
+        assert_eq!(
+            messages(tracker.on_record(&record(tunnel::KIND_TLS_RX, a, b"\x82\x03new"))),
+            vec![(false, b"new".to_vec())]
+        );
+    }
+    #[test]
+    fn tunnel_parser_preserves_tls_kinds_across_partial_headers() {
+        let mut bytes = Vec::new();
+        bytes.push(tunnel::KIND_TLS_RX);
+        bytes.extend_from_slice(&42u32.to_le_bytes());
+        bytes.extend_from_slice(&0x80000001u32.to_le_bytes());
+        bytes.extend_from_slice(&10u64.to_le_bytes());
+        bytes.extend_from_slice(&5u32.to_le_bytes());
+        bytes.extend_from_slice(b"\x82\x03abc");
+        let mut parser = tunnel::Parser::default();
+        assert!(parser.feed(&bytes[..19]).is_empty());
+        let records = parser.feed(&bytes[19..]);
+        assert_eq!(records.len(), 1);
+        let mut tracker = Tracker::default();
+        assert_eq!(
+            messages(tracker.on_record(&records[0])),
+            vec![(false, b"abc".to_vec())]
+        );
     }
 }

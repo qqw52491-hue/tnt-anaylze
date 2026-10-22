@@ -2,7 +2,11 @@
 
 Rust+OpenCV 弹弹堂辅助 HUD。`./start-hud.sh` 一键启动隧道与 HUD。
 不要自动停止正在运行的游戏;重启必须由用户明确授权。
-网络层: 43.248.190.45:8888 WebSocket 二进制帧 = zlib(Protobuf)。解析在 `src/proto.rs`+`src/net.rs`(Tracker/隧道记录格式见注释)。
+网络层: 旧版 43.248.190.45:8888 明文 WebSocket；2026-10-16 新版改用同 IP 的 8889，实测 TLS 1.3。
+WebSocket 二进制帧仍含 zlib；解压后的旧包头为 u32LE 长度+u32LE 名长，
+新版实测为 u32BE 长度+u16BE 名长。两种均已支持。
+抓包源码在 `native/`，Qt SSL 明文 kind=11/12、合成 SSL 流 ID（非 OS fd），见 `native/README.md`。
+解析在 `src/proto.rs`+`src/net.rs`(Tracker/隧道记录格式见注释)。
 
 ## 验证
 
@@ -12,6 +16,12 @@ cargo build --bin live_gui --bin net_live --bin dump_wind_fields
 ```
 
 ## 风速解码(客户端运行时代码已恢复,2026-10)
+
+2026-10-16 新版 BE16 包：Action f4 已直接传有符号 wind10，不再套旧 XOR。
+用户独立报告的 4 个自己回合风速 10.6/7.1/13.2/13.8，与同期 f4
+-106/71/132/138 的绝对值/10 全部匹配（含 speed=70 和 order 变化）。
+这些报告验证大小；新版世界风向符号仍待屏幕箭头独立对照。
+以下 XOR 仅用于旧 LE32 包，历史 32 条冻结样本保持原算法不变。
 
 BattleNotify type-8 的 Action: f1=round, f2=repeated order, f3=speed,
 f4=raw wind。客户端 BattleCommandAction::init 使用有符号 32 位 XOR:
@@ -67,6 +77,10 @@ python3 analyze_wind.py            # 配对 raw↔wind, 列出每回合 key
 
 ## 弹道模型更新
 
-默认采用 recorded-frozen-v1；旧版完整保留在 src/physics/legacy.rs。
-TNT_PHYSICS=legacy 可回退。说明见 PHYSICS_MODELS.md。
+默认采用 recorded-calibrated-v2（2026-10-22 常规轨迹校准）；前一版完整保留在
+src/physics/recorded_frozen.rs，TNT_PHYSICS=frozen-v1 可回退；更早版本保留在
+src/physics/legacy.rs，TNT_PHYSICS=legacy 可回退。说明见 PHYSICS_MODELS.md。
+本次使用 223 条常规尺度轨迹拟合，另 140/20 条按日期分组验证；81 条双尺度轨迹
+只保留研究结果，未加入运行时自动选择。误差按真实首点对齐，不代表实时命中精度。
+离线工具在 examples/export_ballistics.rs 和 scripts/physics/；不自动修改运行时参数。
 新 manifest 记录模型名；运行中的旧 HUD 不热更新，不自动重启游戏。

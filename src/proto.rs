@@ -159,30 +159,43 @@ impl FieldSlice for [Field] {
     }
 }
 
-/// Message framing: `[u32 LE body_len][u32 LE name_len][name][protobuf]`
-/// where body_len counts everything after the first word.
+/// Message framing, body_len counts everything after the first word:
+/// * legacy: `[u32 LE body_len][u32 LE name_len][name][protobuf]`
+/// * 2026-10-16 client: `[u32 BE body_len][u16 BE name_len][name][protobuf]`
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EnvelopeFraming {
+    LegacyLe32,
+    UpdatedBe16,
+}
+
 pub struct Envelope {
     pub name: String,
     pub body: Vec<u8>,
+    pub framing: EnvelopeFraming,
 }
 
 pub fn parse_envelope(buf: &[u8]) -> Option<Envelope> {
-    if buf.len() < 8 {
+    if buf.len() < 6 {
         return None;
     }
-    let body_len = u32::from_le_bytes(buf[0..4].try_into().ok()?) as usize;
-    if body_len + 4 != buf.len() {
+    let declared_le = u32::from_le_bytes(buf[0..4].try_into().ok()?) as usize;
+    let declared_be = u32::from_be_bytes(buf[0..4].try_into().ok()?) as usize;
+    let (start, name_len) = if buf.len() >= 8 && declared_le == buf.len() - 4 {
+        (8usize, u32::from_le_bytes(buf[4..8].try_into().ok()?) as usize)
+    } else if declared_be == buf.len() - 4 {
+        (6usize, u16::from_be_bytes(buf[4..6].try_into().ok()?) as usize)
+    } else {
         return None;
-    }
-    let name_len = u32::from_le_bytes(buf[4..8].try_into().ok()?) as usize;
-    let name_end = 8usize.checked_add(name_len)?;
+    };
+    let name_end = start.checked_add(name_len)?;
     if name_end > buf.len() {
         return None;
     }
-    let name = String::from_utf8(buf[8..name_end].to_vec()).ok()?;
+    let name = String::from_utf8(buf[start..name_end].to_vec()).ok()?;
     Some(Envelope {
         name,
         body: buf[name_end..].to_vec(),
+        framing: if start == 6 { EnvelopeFraming::UpdatedBe16 } else { EnvelopeFraming::LegacyLe32 },
     })
 }
 
@@ -217,8 +230,9 @@ pub enum GameEvent {
         players: Vec<PlayerInit>,
     },
     /// Turn boundary: f1=round, f2=repeated order, f3=speed, f4=raw seed.
-    /// `wind10` is the signed world wind in tenths decoded by
-    /// [`decode_wind10`]; None when any required field is missing.
+    /// `wind10` is signed world wind in tenths: legacy XOR via
+    /// [`decode_wind10`], updated BE16 packets carry it directly in field 4.
+    /// None when the required fields for that encoding are missing.
     WindSeed {
         round: u64,
         order: Vec<u64>,
@@ -248,7 +262,9 @@ pub enum GameEvent {
         shots: u32,
     },
     /// Client -> server fire request (only exists when the user shoots).
-    FireReq { weapon: u64, angle: u64, power: f64 },
+    // The verified client descriptor names f1 "round", f2 "left", f4 "force".
+    // This round counter must not be assumed equal to Action.round.
+    FireReq { round: u64, left: bool, angle: u64, power: f64 },
     /// Anything else we only count, e.g. loading progress / ready / chat.
     Other { name: String, ntype: Option<u64>, seq: Option<u64> },
 }
@@ -302,8 +318,13 @@ pub fn decode_envelope(env: &Envelope) -> Vec<GameEvent> {
                         let speed = w.varint(3);
                         let seed = w.varint(4).map(|raw| raw as i32 as i64);
                         let order = w.varints(2);
-                        let wind10 = match (round, speed, seed, order.is_empty()) {
-                            (Some(round), Some(speed), Some(seed), false) => {
+                        // Updated BE16 actions transmit signed wind10 directly.
+                        // Four independently reported display magnitudes match
+                        // raw=-106/71/132/138 (10.6/7.1/13.2/13.8), including
+                        // a speed/order change; legacy XOR remains unchanged.
+                        let wind10 = match (env.framing, round, speed, seed, order.is_empty()) {
+                            (EnvelopeFraming::UpdatedBe16, _, _, Some(seed), _) => Some(seed as i32),
+                            (EnvelopeFraming::LegacyLe32, Some(round), Some(speed), Some(seed), false) => {
                                 Some(decode_wind10(seed, round, speed, &order))
                             }
                             _ => None,
@@ -394,11 +415,12 @@ pub fn decode_envelope(env: &Envelope) -> Vec<GameEvent> {
             }
         }
         "FireReq" => {
-            out.push(GameEvent::FireReq {
-                weapon: fields.varint(1).unwrap_or(0),
-                angle: fields.varint(3).unwrap_or(0),
-                power: fields.f64(4).unwrap_or(0.0),
-            });
+            if let (Some(round), Some(left), Some(angle), Some(power)) =
+                (fields.varint(1), fields.varint(2), fields.varint(3), fields.f64(4)) {
+                if left <= 1 && power.is_finite() {
+                    out.push(GameEvent::FireReq { round, left: left != 0, angle, power });
+                }
+            }
         }
         _ => {
             out.push(GameEvent::Other {
@@ -416,9 +438,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn fire_request_uses_verified_round_and_left_and_requires_fields() {
+        let mut body = vec![0x08, 0x03, 0x10, 0x00, 0x18, 0x41, 0x21];
+        body.extend_from_slice(&60.123456789_f64.to_le_bytes());
+        let mut env = Envelope {
+            framing: EnvelopeFraming::UpdatedBe16,
+            name: "FireReq".into(),
+            body,
+        };
+        assert!(matches!(decode_envelope(&env).as_slice(),
+            [GameEvent::FireReq { round: 3, left: false, angle: 65, power }]
+            if *power == 60.123456789));
+        env.body.truncate(6); // Required force is missing, not a real zero.
+        assert!(decode_envelope(&env).is_empty());
+        env.body.push(0x21);
+        env.body.extend_from_slice(&f64::NAN.to_le_bytes());
+        assert!(decode_envelope(&env).is_empty());
+    }
+
+    #[test]
     fn move_req_decodes_absolute_x() {
         // {1: 3, 2: 1636} — field2 is the local player's absolute world x.
         let env = Envelope {
+            framing: EnvelopeFraming::LegacyLe32,
             name: "MoveReq".to_string(),
             body: vec![0x08, 0x03, 0x10, 0xe4, 0x0c],
         };
@@ -434,6 +476,7 @@ mod tests {
     fn flight_decodes_server_path() {
         // BattleNotify type=14: {1: id, repeated 4: {x, y}, ...} at field 13.
         let env = Envelope {
+            framing: EnvelopeFraming::LegacyLe32,
             name: "BattleNotify".to_string(),
             body: vec![
                 0x08, 0x43, 0x10, 0x0e, 0x6a, 0x1c, 0x08, 0xfc, 0xc2, 0x04,
@@ -564,6 +607,7 @@ mod tests {
         push_varint(&mut body, w.len() as u64);
         body.extend(w);
         Envelope {
+            framing: EnvelopeFraming::LegacyLe32,
             name: "BattleNotify".to_string(),
             body,
         }
@@ -659,6 +703,67 @@ mod tests {
     fn wind_seed_decodes_above_old_25_5_limit() {
         let env = wind_seed_env(Some(1), &[74108, 73884, 0], Some(100), Some(169), false);
         assert_eq!(decode_wind(&env).4, Some(300));
+    }
+
+    #[test]
+    fn envelope_supports_legacy_and_updated_client_headers() {
+        let env = wind_seed_env(Some(2), &[74108, 0, 73884], Some(100), Some(449), false);
+        for updated in [false, true] {
+            let mut bytes = Vec::new();
+            if updated {
+                bytes.extend_from_slice(&((2 + env.name.len() + env.body.len()) as u32).to_be_bytes());
+                bytes.extend_from_slice(&(env.name.len() as u16).to_be_bytes());
+            } else {
+                bytes.extend_from_slice(&((4 + env.name.len() + env.body.len()) as u32).to_le_bytes());
+                bytes.extend_from_slice(&(env.name.len() as u32).to_le_bytes());
+            }
+            bytes.extend_from_slice(env.name.as_bytes());
+            bytes.extend_from_slice(&env.body);
+            let decoded = parse_envelope(&bytes).expect("valid envelope");
+            assert_eq!(decoded.name, env.name);
+            assert_eq!(decoded.body, env.body);
+            assert_eq!(decode_wind(&decoded).4, if updated { Some(449) } else { Some(71) });
+            for end in 0..bytes.len() {
+                assert!(parse_envelope(&bytes[..end]).is_none(), "accepted truncated header/body");
+            }
+        }
+    }
+
+    #[test]
+    fn updated_wind_matches_four_independent_screen_reports() {
+        // Captured player IDs are replaced with synthetic IDs: the new wind
+        // conversion is independent of order, unlike the legacy XOR.
+        for (round, order, speed, raw, expected) in [
+            (1, vec![101, 202, 0], 100, -106, -106),
+            (2, vec![101, 202, 0], 100, 71, 71),
+            (3, vec![101, 0, 202], 70, 132, 132),
+            (4, vec![101, 202, 0], 100, 138, 138),
+        ] {
+            let mut env = wind_seed_env(Some(round), &order, Some(speed), Some(raw), false);
+            env.framing = EnvelopeFraming::UpdatedBe16;
+            assert_eq!(decode_wind(&env).4, Some(expected));
+        }
+        // Missing raw is unverified, whereas an explicitly transmitted zero is valid.
+        let mut env = wind_seed_env(Some(1), &[1], Some(100), None, false);
+        env.framing = EnvelopeFraming::UpdatedBe16;
+        assert_eq!(decode_wind(&env).4, None);
+        let mut env = wind_seed_env(Some(1), &[1], Some(100), Some(0), false);
+        env.framing = EnvelopeFraming::UpdatedBe16;
+        assert_eq!(decode_wind(&env).4, Some(0));
+    }
+
+    #[test]
+    fn updated_envelope_rejects_invalid_lengths_and_utf8() {
+        let bytes = b"\x00\x00\x00\x03\x00\x01X";
+        assert_eq!(parse_envelope(bytes).unwrap().name, "X");
+        for bad in [
+            b"\x00\x00\x00\x04\x00\x01X".as_slice(),
+            b"\x00\x00\x00\x03\xff\xffX".as_slice(),
+            b"\x00\x00\x00\x03\x00\x01\xff".as_slice(),
+            b"\x00\x00\x00\x03\x00\x01XY".as_slice(),
+        ] {
+            assert!(parse_envelope(bad).is_none());
+        }
     }
 
     #[test]

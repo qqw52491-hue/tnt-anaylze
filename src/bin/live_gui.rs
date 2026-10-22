@@ -514,6 +514,58 @@ fn compute_trajectory(dx_units: f64, dy_units: f64, angle_deg: f64, wind: f64) -
     Some((base_power, final_angle))
 }
 
+// Keep only the latest exact inputs. No rounding: a changed position, wind,
+// angle or mode must immediately produce a fresh result (including None).
+struct LastValue<K, V>(Option<(K, V)>);
+
+impl<K: PartialEq, V> LastValue<K, V> {
+    fn new() -> Self { Self(None) }
+
+    fn get_or_compute(&mut self, key: K, compute: impl FnOnce() -> V) -> &V {
+        if self.0.as_ref().is_none_or(|(previous, _)| previous != &key) {
+            self.0 = Some((key, compute()));
+        }
+        &self.0.as_ref().unwrap().1
+    }
+}
+
+type TrajectoryKey = (f64, f64, f64, f64, bool);
+
+fn cached_trajectory(
+    memo: &mut LastValue<TrajectoryKey, Option<(f64, f64)>>,
+    key: TrajectoryKey,
+) -> Option<(f64, f64)> {
+    *memo.get_or_compute(key, || {
+        let (dx, dy, angle, wind, fixed) = key;
+        if fixed { compute_fixed_trajectory(dx, dy, angle, wind) }
+        else { compute_trajectory(dx, dy, angle, wind) }
+    })
+}
+
+fn same_angle_roi(a: &core::Mat, b: &core::Mat) -> opencv::Result<bool> {
+    if a.rows() != b.rows() || a.cols() != b.cols() || a.typ() != b.typ() {
+        return Ok(false);
+    }
+    Ok(core::norm2(a, b, core::NORM_INF, &core::no_array())? == 0.0)
+}
+
+// A screenshot is immutable after publication. Retain its Arc along with the
+// resized image so pointer identity cannot be reused while this entry is live.
+struct MapDisplayCache(Option<(Arc<core::Mat>, core::Size, core::Mat)>);
+
+impl MapDisplayCache {
+    fn get(&mut self, source: &Arc<core::Mat>, size: core::Size) -> opencv::Result<&core::Mat> {
+        if self.0.as_ref().is_none_or(|(previous, previous_size, _)| {
+            !Arc::ptr_eq(previous, source) || *previous_size != size
+        }) {
+            let mut resized = core::Mat::default();
+            imgproc::resize(source.as_ref(), &mut resized, size, 0.0, 0.0, imgproc::INTER_LINEAR)?;
+            self.0 = Some((Arc::clone(source), size, resized));
+        }
+        Ok(&self.0.as_ref().unwrap().2)
+    }
+}
+
 fn draw_btn(
     canvas: &mut core::Mat,
     rect: core::Rect,
@@ -988,12 +1040,17 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
                     // (游戏端mono_ms, 本地收到时刻)基准对 → lag>0 说明隧道内排队延迟
                     let mut t0: Option<(u64, std::time::Instant)> = None;
                     let mut n_rec = 0u64;
+                    let mut tls_seen = false;
                     loop {
                         let n = match s.read(&mut buf) {
                             Ok(0) | Err(_) => break,
                             Ok(n) => n,
                         };
                         for rec in parser.feed(&buf[..n]) {
+                            if !tls_seen && matches!(rec.kind, tunnel::KIND_TLS_TX | tunnel::KIND_TLS_RX) {
+                                tls_seen = true;
+                                println!("📡 NET: 已收到 SSL 明文，开始解析加密连接内的 WebSocket");
+                            }
                             let raw_offset = trace.as_ref().and_then(|trace| {
                                 trace.lock().ok().and_then(|mut capture| capture.record(&rec))
                             });
@@ -1497,7 +1554,7 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
     let power_geo_shared = Arc::new(std::sync::Mutex::new(power_geo));
     let power_geo_clone = power_geo_shared.clone();
 
-    let shared_map = Arc::new(std::sync::Mutex::new(None::<core::Mat>));
+    let shared_map = Arc::new(std::sync::Mutex::new(None::<Arc<core::Mat>>));
     let shared_map_clone = shared_map.clone();
     let shared_recognized_angle = Arc::new(std::sync::Mutex::new(None::<(i32, std::time::Instant)>));
     let shared_recognized_angle_clone = shared_recognized_angle.clone();
@@ -1526,7 +1583,7 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
             .ok().and_then(|v| v.parse::<u128>().ok())
             .filter(|&ms| (250..=3000).contains(&ms)).unwrap_or(500);
         let mut last_size_warn = std::time::Instant::now();
-        let mut last_roi_sig = (0i64, 0i64, 0i64);
+        let mut last_roi: Option<core::Mat> = None;
         let mut last_misread_dbg = std::time::Instant::now();
         let mut last_none_dbg = std::time::Instant::now();
 
@@ -1555,7 +1612,7 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
                 if let Ok(m) = imgcodecs::imread(map_path, imgcodecs::IMREAD_COLOR) {
                     if !m.empty() {
                         if let Ok(mut lock) = shared_map_clone.lock() {
-                            *lock = Some(m);
+                            *lock = Some(Arc::new(m));
                         }
                     }
                 }
@@ -1595,19 +1652,22 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
                                         &core::Vector::new(),
                                     );
                                 }
-                                // 画面逐像素没变 → 跳过识别直接下一帧
-                                // (转场/静止期省掉OCR开销,提高每秒尝试次数)
-                                let s = core::sum_elems(&p).unwrap_or_default();
-                                let sig = (s[0] as i64, s[1] as i64, s[2] as i64);
-                                if sig == last_roi_sig {
+                                // Compare pixels, not channel sums: a moving dial
+                                // can keep exactly the same total brightness.
+                                if last_roi.as_ref().is_some_and(|previous| {
+                                    same_angle_roi(&p, previous).unwrap_or(false)
+                                }) {
                                     if let Ok(mut lock) = cap_time_ms_clone.lock() {
                                         *lock = t0.elapsed().as_millis();
                                     }
+                                    // This early exit must keep the normal OCR
+                                    // throttle, even while the dial is stationary.
+                                    std::thread::sleep(std::time::Duration::from_millis(20));
                                     continue;
                                 }
-                                last_roi_sig = sig;
                                 // 纯表盘几何法:读虚线方向,不走数字OCR
                                 let val = recognizer.as_ref().unwrap().recognize_angle_dial(&p);
+                                last_roi = Some(p);
                                 match val {
                                     Ok(Some(stable)) => {
                                         // 表盘法单帧即准,直读直用
@@ -1955,7 +2015,9 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
 
     // 弹道缓存：点位/角度/风没变就不重算。定角模式约 70 次全程仿真，
     // 不可达时更是 600+ 次采样，每帧重算是纯浪费。
-    let mut traj_memo: Option<((f64, f64, f64, f64, bool), Option<(f64, f64)>)> = None;
+    let mut traj_memo = LastValue::new();
+    let mut path_memo = LastValue::new();
+    let mut map_memo = MapDisplayCache(None);
     let mut fps_t0 = std::time::Instant::now();
     let mut last_angle_diag = std::time::Instant::now() - std::time::Duration::from_secs(6);
     let mut last_toggle_time = std::time::Instant::now() - std::time::Duration::from_secs(1); // 防抖时间戳
@@ -2024,7 +2086,7 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
 
         let img = {
             let lock = shared_map.lock().unwrap();
-            lock.as_ref().and_then(|m| m.try_clone().ok())
+            lock.clone()
         };
 
         let t_io = loop_t0.elapsed().as_millis();
@@ -2099,14 +2161,8 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
         )?;
 
         if let Some(minimap) = img {
-            let mut map_display = core::Mat::default();
-            imgproc::resize(
-                &minimap,
-                &mut map_display,
-                core::Size::new(map_w_display, (t_h as f64 * scale) as i32),
-                0.0,
-                0.0,
-                imgproc::INTER_LINEAR,
+            let map_display = map_memo.get(
+                &minimap, core::Size::new(map_w_display, (t_h as f64 * scale) as i32)
             )?;
 
             for y in 0..map_display.rows() {
@@ -2337,7 +2393,8 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
             if let Some(p) = net_p1 {
                 draw_ring(&mut canvas, p, false);
             }
-            // 所有非我玩家都画出来:选中的目标亮品红+名字,其余暗色(右键点选切换目标)
+            // 多人局:未选中敌人=高亮黄色、选中目标=亮品红。
+            // 名字加黑色描边，在明亮或杂色地图背景上都能看清。
             let sel_uid = net.target_id.or_else(|| {
                 net.pos
                     .iter()
@@ -2346,26 +2403,33 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
             });
             for (uid, p) in &net_all {
                 let is_sel = sel_uid == Some(*uid);
-                let color = if is_sel {
-                    core::Scalar::new(255.0, 0.0, 255.0, 0.0)
+                let marker_color = if is_sel {
+                    core::Scalar::new(255.0, 0.0, 255.0, 0.0) // BGR: 亮品红
                 } else {
-                    core::Scalar::new(140.0, 80.0, 140.0, 0.0)
+                    core::Scalar::new(0.0, 255.0, 255.0, 0.0) // BGR: 亮黄色
                 };
-                let thick = if is_sel { 2 } else { 1 };
-                let _ = imgproc::circle(&mut canvas, *p, 9, color, thick, imgproc::LINE_AA, 0);
-                let _ = imgproc::circle(&mut canvas, *p, 2, color, -1, imgproc::LINE_AA, 0);
+                let black = core::Scalar::new(0.0, 0.0, 0.0, 0.0);
+                // 深色外环保证标记不会淹没在地图背景里。
+                let _ = imgproc::circle(&mut canvas, *p, 10, black, 4, imgproc::LINE_AA, 0);
+                let _ = imgproc::circle(&mut canvas, *p, 9, marker_color, 3, imgproc::LINE_AA, 0);
+                let _ = imgproc::circle(&mut canvas, *p, 2, marker_color, -1, imgproc::LINE_AA, 0);
                 if let Some(nm) = net.names.get(uid) {
                     let short: String = nm.chars().take(5).collect();
+                    let label_pt = core::Point::new(p.x - 12, p.y - 15);
+                    let label_color = if is_sel {
+                        core::Scalar::new(255.0, 255.0, 255.0, 0.0) // 目标名字亮白
+                    } else {
+                        marker_color
+                    };
                     let _ = imgproc::put_text(
-                        &mut canvas,
-                        &short,
-                        core::Point::new(p.x - 12, p.y - 13),
-                        imgproc::FONT_HERSHEY_SIMPLEX,
-                        0.35,
-                        color,
-                        1,
-                        imgproc::LINE_AA,
-                        false,
+                        &mut canvas, &short, label_pt,
+                        imgproc::FONT_HERSHEY_SIMPLEX, 0.5, black, 5,
+                        imgproc::LINE_AA, false,
+                    );
+                    let _ = imgproc::put_text(
+                        &mut canvas, &short, label_pt,
+                        imgproc::FONT_HERSHEY_SIMPLEX, 0.5, label_color, 2,
+                        imgproc::LINE_AA, false,
                     );
                 }
             }
@@ -2468,18 +2532,7 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
                 let eff_wind = st.wind;
 
                 let key = (dx, dy, st.current_angle, eff_wind, st.is_fixed_angle);
-                let trajectory_res = match traj_memo {
-                    Some((k, v)) if k == key => v,
-                    _ => {
-                        let r = if st.is_fixed_angle {
-                            compute_fixed_trajectory(dx, dy, st.current_angle, eff_wind)
-                        } else {
-                            compute_trajectory(dx, dy, st.current_angle, eff_wind)
-                        };
-                        traj_memo = Some((key, r));
-                        r
-                    }
-                };
+                let trajectory_res = cached_trajectory(&mut traj_memo, key);
 
                 match trajectory_res {
                     Some((force, final_angle)) => {
@@ -2557,8 +2610,10 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
                         // 用户输入的是相对风力（正=顺风），但在画图时，我们要把它转成绝对世界的风向。
                         // 如果向左打，顺风就是向左吹（绝对世界里的负风向）。
                         let sim_wind = if is_reverse { -eff_wind } else { eff_wind };
-                        let path = tnt_comput::physics::simulate_path(draw_angle, force, sim_wind);
-                        for (sim_x, sim_y) in path {
+                        let path = path_memo.get_or_compute((draw_angle, force, sim_wind), || {
+                            tnt_comput::physics::simulate_path(draw_angle, force, sim_wind)
+                        });
+                        for &(sim_x, sim_y) in path.iter() {
                             let img_x = p.x as f64 + sim_x * scale * px_per_unit;
                             let img_y = p.y as f64 - sim_y * scale * px_per_unit_y;
 
@@ -2660,11 +2715,9 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
                 if let (Some(&(px, py)), Some((ex, ey))) = (mine, enemy) {
                     let dx = (ex - px) as f64 / world_per_unit;
                     let dy = (py - ey) as f64 / world_per_unit;
-                    let res = if st.is_fixed_angle {
-                        compute_fixed_trajectory(dx, dy, st.current_angle, st.wind)
-                    } else {
-                        compute_trajectory(dx, dy, st.current_angle, st.wind)
-                    };
+                    let res = cached_trajectory(
+                        &mut traj_memo, (dx, dy, st.current_angle, st.wind, st.is_fixed_angle)
+                    );
                     imgproc::rectangle(
                         &mut canvas,
                         core::Rect::new(map_w_display + 10, 445, 300, 80),
@@ -3313,6 +3366,84 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn map_cache_updates_for_new_screenshot_and_display_size() -> opencv::Result<()> {
+        let first = Arc::new(core::Mat::new_rows_cols_with_default(
+            2, 2, core::CV_8UC3, core::Scalar::all(10.0)
+        )?);
+        let second = Arc::new(core::Mat::new_rows_cols_with_default(
+            2, 2, core::CV_8UC3, core::Scalar::all(20.0)
+        )?);
+        let mut memo = MapDisplayCache(None);
+        let size = core::Size::new(4, 4);
+        let data = memo.get(&first, size)?.data();
+        assert_eq!(memo.get(&Arc::clone(&first), size)?.data(), data);
+        assert_eq!(*memo.get(&second, size)?.at_2d::<core::Vec3b>(0, 0)?,
+                   core::Vec3b::from([20, 20, 20]));
+        assert_eq!(memo.get(&second, core::Size::new(8, 6))?.size()?, core::Size::new(8, 6));
+        assert_eq!(*first.at_2d::<core::Vec3b>(0, 0)?, core::Vec3b::from([10, 10, 10]));
+        Ok(())
+    }
+
+    #[test]
+    fn trajectory_cache_invalidates_every_input_and_retains_unreachable() {
+        let mut memo = LastValue::new();
+        let mut calls = 0;
+        let cases = [
+            (12.0, 2.0, 65.0, 7.1, true),
+            (f64::from_bits(12.0_f64.to_bits() + 1), 2.0, 65.0, 7.1, true),
+            (12.0, 3.0, 65.0, 7.1, true),
+            (12.0, 3.0, 66.0, 7.1, true),
+            (12.0, 3.0, 66.0, -7.1, true),
+            (12.0, 3.0, 66.0, -7.1, false),
+            (-12.0, 3.0, 66.0, -7.1, false),
+        ];
+        for (i, key) in cases.into_iter().enumerate() {
+            for _ in 0..2 {
+                let result = *memo.get_or_compute(key, || {
+                    calls += 1;
+                    None::<(f64, f64)>
+                });
+                assert_eq!(result, None);
+            }
+            assert_eq!(calls, i + 1);
+        }
+        // Returning to an older target must recompute; the cache is bounded.
+        let expected = compute_fixed_trajectory(12.0, 2.0, 65.0, 7.1);
+        assert!(expected.is_some());
+        assert_eq!(cached_trajectory(&mut memo, cases[0]), expected);
+    }
+
+    #[test]
+    fn path_cache_keeps_world_direction_and_exact_parameters() {
+        let mut memo = LastValue::new();
+        let mut calls = 0;
+        for key in [(65.0, 60.0, 7.1), (115.0, 60.0, -7.1),
+                    (115.0, 61.0, -7.1), (115.0, 61.0, 7.1)] {
+            let expected = simulate_path(key.0, key.1, key.2);
+            for _ in 0..2 {
+                assert_eq!(memo.get_or_compute(key, || {
+                    calls += 1;
+                    simulate_path(key.0, key.1, key.2)
+                }), &expected);
+            }
+        }
+        assert_eq!(calls, 4);
+    }
+
+    #[test]
+    fn angle_roi_rejects_moved_pixels_with_identical_channel_sums() -> opencv::Result<()> {
+        let mut a = core::Mat::zeros(2, 2, core::CV_8UC3)?.to_mat()?;
+        let mut b = a.try_clone()?;
+        *a.at_2d_mut::<core::Vec3b>(0, 0)? = core::Vec3b::from([10, 20, 30]);
+        *b.at_2d_mut::<core::Vec3b>(1, 1)? = core::Vec3b::from([10, 20, 30]);
+        assert_eq!(core::sum_elems(&a)?, core::sum_elems(&b)?);
+        assert!(!same_angle_roi(&a, &b)?);
+        assert!(same_angle_roi(&a, &a.try_clone()?)?);
+        assert!(!same_angle_roi(&a, &core::Mat::zeros(1, 4, core::CV_8UC3)?.to_mat()?)?);
+        Ok(())
+    }
 
     #[test]
     fn live_xy_default_on_and_explicit_off() {

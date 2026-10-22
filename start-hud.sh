@@ -30,6 +30,21 @@ info(){ echo "…  $*"; }
 
 echo "===== TNT HUD 启动检查 ====="
 
+# Incremental build checks source/dependency freshness on every launch. Build
+# before touching the device, so a compiler failure cannot leave a started game.
+HUD_PROFILE="${TNT_HUD_PROFILE:-release}"
+case "$HUD_PROFILE" in
+    release) HUD_BIN="$DIR/target/release/live_gui" ;;
+    debug) HUD_BIN="$DIR/target/debug/live_gui" ;;
+    *) bad "TNT_HUD_PROFILE 只能是 release 或 debug"; exit 2 ;;
+esac
+info "检查 HUD 编译更新 ($HUD_PROFILE)..."
+if [ "$HUD_PROFILE" = release ]; then
+    (cd "$DIR" && cargo build --release --bin live_gui) || { bad "编译失败"; exit 1; }
+else
+    (cd "$DIR" && cargo build --bin live_gui) || { bad "编译失败"; exit 1; }
+fi
+
 # ---------- 1. ADB 连通 ----------
 if ! "$ADB" -s "$DEV" shell echo ok >/dev/null 2>&1; then
     info "ADB 未连接,尝试 adb connect..."
@@ -62,6 +77,14 @@ fi
 # ---------- 2.5 wrap 脚本 + .so 同步(带 TNT_RAND=1,激活 RNG 钩子) ----------
 LOCAL_WRAP="/Users/wx/Downloads/tnt-apk-analysis/sniff-wrap.sh"
 LOCAL_SO="/Users/wx/Downloads/tnt-apk-analysis/libtntsniff.so"
+# 本项目维护的新版支持 Qt SSL 明文；源文件变更时先编译再同步。
+if [ -f "$DIR/native/tnt_sniff.c" ]; then
+    LOCAL_SO="$DIR/target/android/libtntsniff.so"
+    if [ ! -f "$LOCAL_SO" ] || [ "$DIR/native/tnt_sniff.c" -nt "$LOCAL_SO" ] || \
+        [ "$DIR/native/tnt_tls.h" -nt "$LOCAL_SO" ] || [ "$DIR/native/build-sniffer.sh" -nt "$LOCAL_SO" ]; then
+        bash "$DIR/native/build-sniffer.sh" || exit 1
+    fi
+fi
 SO_UPDATED=0
 if [ -f "$LOCAL_WRAP" ]; then
     "$ADB" -s "$DEV" push "$LOCAL_WRAP" "$WRAP" >/dev/null 2>&1 \
@@ -94,12 +117,38 @@ fi
 
 # ---------- 3. 游戏进程 + .so 注入 ----------
 game_pid() { "$ADB" -s "$DEV" shell "pidof $PKG" 2>/dev/null | tr -d '\r' | awk '{print $1}'; }
-# rand=1 + fmt=1 + memscan=7 才表示进程里跑的是当前 Qt hook 观察版;旧标记视为旧版,要重启吃新 .so
-so_loaded() { "$ADB" -s "$DEV" shell "logcat -d -s TntSniff" 2>/dev/null | grep -q "loaded pid=$1 rand=1 fmt=1 memscan=7"; }
+# tls=3 修正 Android 局部加载与 classloader namespace；旧版需明确授权重启。
+so_loaded() {
+    if "$ADB" -s "$DEV" shell "logcat -d -s TntSniff" 2>/dev/null | grep -q "loaded pid=$1 rand=1 fmt=1 memscan=7 tls=3"; then
+        return 0
+    fi
+    # logcat 会滚动；若映射仍是当前同一文件且 MD5 与本地新版相同，可只读确认。
+    # 旧 inode 的 (deleted) 映射不算新版，不能因此跳过必要的明确授权重载。
+    if [ -n "${LOCAL_MD5:-}" ] && [ "${LOCAL_MD5:-}" = "${REMOTE_MD5:-}" ]; then
+        "$ADB" -s "$DEV" shell "/system/xbin/bstk/su -c 'cat /proc/$1/maps'" 2>/dev/null \
+            | grep -F '/data/local/tmp/libtntsniff.so' | grep -v '(deleted)' | grep -q .
+        return $?
+    fi
+    return 1
+}
 
 # 明确授权(--restart)才允许的重启路径:force-stop + monkey 拉起并验证注入
 restart_game() {
-    "$ADB" -s "$DEV" shell "am force-stop $PKG; sleep 1; monkey -p $PKG -c android.intent.category.LAUNCHER 1" >/dev/null 2>&1
+    "$ADB" -s "$DEV" shell "am force-stop $PKG" >/dev/null 2>&1
+    sleep 1
+    # 崩溃后的 wrap 子进程可能已被 init 收养，ActivityManager 的 force-stop
+    # 不会清掉它。只在用户明确 --restart 的路径清理该包残留进程。
+    STALE_GAME_PIDS=$("$ADB" -s "$DEV" shell "pidof $PKG" 2>/dev/null | tr -d '\r')
+    if [ -n "$STALE_GAME_PIDS" ]; then
+        info "清理本游戏崩溃后残留的进程: $STALE_GAME_PIDS"
+        "$ADB" -s "$DEV" shell "/system/xbin/bstk/su -c 'kill -9 $STALE_GAME_PIDS'" >/dev/null 2>&1
+        sleep 1
+        if [ -n "$(game_pid)" ]; then
+            bad "游戏残留进程未能退出，已停止启动；请在模拟器中手动退出游戏后重试"
+            exit 1
+        fi
+    fi
+    "$ADB" -s "$DEV" shell "monkey -p $PKG -c android.intent.category.LAUNCHER 1" >/dev/null 2>&1
     sleep 7
     PID=$(game_pid)
     if [ -n "$PID" ] && so_loaded "$PID"; then
@@ -167,10 +216,6 @@ fi
 ok "端口 $PORT 空闲"
 
 # ---------- 6. HUD ----------
-if [ ! -x "$DIR/target/debug/live_gui" ]; then
-    info "live_gui 未编译,先 cargo build..."
-    (cd "$DIR" && cargo build --bin live_gui) || { bad "编译失败"; exit 1; }
-fi
 
 echo ""
 echo "=========================================="
@@ -196,4 +241,4 @@ for f in /tmp/tnt-hud-live.log /tmp/tnt-tunnel-records.bin; do
         info "已归档 $f → $f.$ARCHIVE_SUFFIX"
     fi
 done
-cd "$DIR" && ./target/debug/live_gui 2>&1 | tee /tmp/tnt-hud-live.log
+cd "$DIR" && "$HUD_BIN" 2>&1 | tee /tmp/tnt-hud-live.log

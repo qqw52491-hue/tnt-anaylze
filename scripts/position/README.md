@@ -1,5 +1,7 @@
 # TNT 我方实时 X/Y（默认启用）
 
+2026-10-22 性能检查后，`./start-hud.sh` 会先检查源码更新并默认启动优化编译的 `target/release/live_gui`；需要调试版时用 `TNT_HUD_PROFILE=debug ./start-hud.sh`。下文直接运行 `target/debug/live_gui` 的示例仍可用于调试，但不会自动更新编译。详见根目录 `PERFORMANCE_REVIEW_20261022.md`。
+
 HUD 的 `live_gui` 默认启动只读 Android 内存探针，以 `QGraphicsItem::pos()` 作为我方角色的实时图形坐标，支持走路、坡面和飞行。敌方保留已有网络位置解析，原始网络录制不改写。
 
 **正常启动（默认已启用）：**
