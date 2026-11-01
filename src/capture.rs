@@ -57,6 +57,7 @@ pub struct Capture {
     pub dir: PathBuf,
     raw: File,
     events: File,
+    origin_samples: File,
     offset: u64,
     seq: u64,
     failed: bool,
@@ -88,6 +89,8 @@ impl Capture {
             .create_new(true)
             .mode(0o600)
             .open(dir.join("events.jsonl"))?;
+        let origin_samples = OpenOptions::new().write(true).create_new(true).mode(0o600)
+            .open(dir.join("origin_samples.jsonl"))?;
         let manifest = format!(
             "{{\"schema\":1,\"created_unix_ms\":{},\"raw_path\":{},\"raw_format\":\"tnt tunnel records v1, 21-byte header\",\"tls_plaintext_kinds\":{{\"tx\":11,\"rx\":12}},\"tls_stream_ids\":\"fd bit 31 set: SSL lifetime ID, not OS socket; peer may be unknown with Qt memory BIO\",\"physics_changed\":{},\"physics_model\":{},\"world_units_per_hud_unit\":{},\"fit_ready\":false,\"note\":\"Events are not automatically paired; decoded defaults require raw-field validation; Fire xy semantics and projectile paths unresolved. HUD context is a snapshot, not verified ground truth. Raw packets may contain private game data.\"}}\n",
             epoch_ms(),
@@ -96,15 +99,33 @@ impl Capture {
             quote(crate::physics::model_name()),
             crate::physics::world_units_per_hud_unit()
         );
+        let manifest = manifest.trim_end().trim_end_matches('}').to_owned()
+            + &format!(",\"projectile_profiles\":{{\"normal\":{},\"expanded\":{},\"selector\":\"pre-shot uniform Qt scale 1 or 2; transport paths excluded\"}}",
+                quote(crate::physics::model_name_for_scale(crate::physics::ShotScale::Normal)),
+                quote(crate::physics::model_name_for_scale(crate::physics::ShotScale::Expanded)))
+            + ",\"origin_samples\":{\"file\":\"origin_samples.jsonl\",\"schema\":1,\"format\":\"timestamped probe protocol lines; TNTPOSE has JSON payload; TNTORIGIN/- is source eligibility/clear\",\"independent_truth\":false,\"note\":\"Host sample timestamps allow pre-request matching; not atomic with game firing or proof HUD applied correction. Contains private local pose snapshots.\"}}\n";
         std::fs::write(dir.join("manifest.json"), manifest)?;
         Ok(Self {
             dir,
             raw,
             events,
+            origin_samples,
             offset: 0,
             seq: 0,
             failed: false,
         })
+    }
+    /// Keep the original probe line, including clears and unsupported poses.
+    /// Quote it as data so malformed/truncated source lines cannot inject JSON.
+    pub fn origin_sample(&mut self, line: &str) {
+        if self.failed { return; }
+        if line.len() > 65536 || !(line.starts_with("TNTPOSE ")
+            || line.starts_with("TNTORIGINSTATUS ") || line=="TNTORIGINSTATUS-"
+            || line.starts_with("TNTORIGIN ") || line == "TNTORIGIN-") { return; }
+        let result = writeln!(self.origin_samples,
+            "{{\"schema\":1,\"received_unix_ms\":{},\"probe_line\":{},\"independent_truth\":false}}",
+            epoch_ms(), quote(line)).and_then(|_| self.origin_samples.flush());
+        if let Err(e) = result { self.fail(e); }
     }
     // On a disk error, stop this recording and warn once, rather than pretend it succeeded.
     pub fn record(&mut self, rec: &tunnel::Record) -> Option<u64> {
@@ -316,8 +337,33 @@ mod tests {
         let manifest = std::fs::read_to_string(c.dir.join("manifest.json")).unwrap();
         assert!(manifest.contains(&format!("\"physics_model\":{}", quote(crate::physics::model_name()))));
         assert!(manifest.contains("\"world_units_per_hud_unit\":"));
+        assert!(manifest.contains("\"projectile_profiles\":"));
+        assert!(manifest.contains("pre-shot uniform Qt scale 1 or 2"));
         drop(c);
         drop(c2);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn origin_samples_preserve_timestamps_payload_and_clear_without_touching_raw() {
+        let root = root();
+        let mut c = Capture::open(&root, None).unwrap();
+        c.origin_sample("TNTPOSE {\"sample_start_unix_ms\":123,\"source_eligible\":false,\"rotation\":-13}");
+        c.origin_sample("TNTORIGIN-");
+        c.origin_sample("TNTANGLE 1 2 65 65 0 0");
+        c.origin_sample("TNTPOSE \"quoted\"\nsecond line");
+        c.origin_sample(&format!("TNTPOSE {}", "x".repeat(65536)));
+        let path = c.dir.join("origin_samples.jsonl");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.lines().count(), 3);
+        assert!(text.contains("\\\"sample_start_unix_ms\\\":123"));
+        assert!(text.contains("\"probe_line\":\"TNTORIGIN-\""));
+        assert!(text.contains("\\\"quoted\\\"\\nsecond line"));
+        assert!(text.lines().all(|l| l.contains("\"independent_truth\":false")));
+        assert_eq!(std::fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert!(std::fs::read(c.dir.join("raw.bin")).unwrap().is_empty());
+        let manifest = std::fs::read_to_string(c.dir.join("manifest.json")).unwrap();
+        assert!(manifest.contains("\"origin_samples\":{\"file\":\"origin_samples.jsonl\""));
+        drop(c);
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]

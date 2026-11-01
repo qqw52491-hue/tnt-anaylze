@@ -1,8 +1,11 @@
 """Offline regression tests for the optional, read-only TNT angle stream."""
 import math
+import contextlib
+import io
 import re
 import struct
 import subprocess
+import threading
 import unittest
 from unittest import mock
 
@@ -82,6 +85,49 @@ class TestAngleSamples(unittest.TestCase):
 
 
 class TestStreamProtocol(unittest.TestCase):
+    def test_slow_background_verification_never_blocks_sampling_or_queues_duplicates(self):
+        verifier=stream.BackgroundVerifier()
+        release=threading.Event()
+        started=threading.Event()
+        def work():
+            started.set()
+            release.wait(timeout=2)
+            return 'verified'
+        try:
+            self.assertTrue(verifier.start(work))
+            self.assertTrue(started.wait(timeout=1))
+            self.assertIsNone(verifier.take())
+            self.assertFalse(verifier.start(lambda:'duplicate'))
+        finally:
+            release.set()
+            verifier.thread.join(timeout=1)
+        self.assertEqual(verifier.take(),dict(value='verified'))
+
+    def test_pending_full_check_does_not_extend_twenty_second_cache_trust(self):
+        cache=dict(pid=1,uid=7)
+        completed=dict(value=dict(cache=cache,discovered=dict(status='coordinates_found'),
+                                 verified_at=0.0,duration_ms=1500,recovery_attempted=False))
+        verifier=mock.Mock()
+        verifier.take.side_effect=[completed,None,None,None]
+        clock=[0.0]
+        source=dict(status='angle_value_found',provisional_fire_angle=65,angle_value=65,
+                    qt_rotation_degrees=0.0,flipped_x_cached=False)
+        output=io.StringIO()
+        with mock.patch.object(stream,'BackgroundVerifier',return_value=verifier), \
+             mock.patch.object(stream.sys,'argv',['stream','--max-samples','4']), \
+             mock.patch.object(stream.os,'getppid',return_value=123), \
+             mock.patch.object(stream.time,'monotonic',side_effect=lambda:clock[0]), \
+             mock.patch.object(stream.time,'sleep',side_effect=lambda _:clock.__setitem__(0,clock[0]+7)), \
+             mock.patch.object(stream,'sample',return_value=source) as full, \
+             mock.patch.object(stream,'quick_sample',return_value=source) as quick, \
+             contextlib.redirect_stdout(output),contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(stream.main(),0)
+        lines=output.getvalue().splitlines()
+        self.assertEqual(len([l for l in lines if l.startswith('TNTANGLE ')]),3)
+        self.assertEqual(lines[-1],'TNTANGLE-')
+        self.assertEqual(full.call_count,1)
+        self.assertEqual(quick.call_count,2)
+
     def test_full_check_is_deferred_during_long_hold(self):
         cache = {"verified": True}
         check = stream.should_full_check

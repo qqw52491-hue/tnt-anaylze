@@ -8,6 +8,10 @@ use std::thread;
 
 use tnt_comput::net::{decode_ws_message, tunnel, Tracker, TunnelEvent};
 use tnt_comput::proto::GameEvent;
+#[path = "../hud_window.rs"]
+mod hud_window;
+#[path = "../hud_theme.rs"]
+mod hud_theme;
 
 /// 隧道回传的实时战斗状态。世界坐标系:x 向右,y 向下。
 #[derive(Default, Clone)]
@@ -44,6 +48,274 @@ struct NetHud {
     conns: i32,
     /// 最近一条记录的游戏端→本地投递延迟(排队导致的滞后)
     last_lag_ms: i64,
+}
+
+const MAP_PANE_WIDTH: i32 = 440;
+const MAP_MAX_WIDTH: i32 = 392;
+const MAP_MAX_HEIGHT: i32 = 398;
+const SIDEBAR_WIDTH: i32 = 390;
+const HUD_HEIGHT: i32 = 680;
+const MAX_TARGETS: usize = 8;
+
+fn compact_map_scale(width: i32, height: i32) -> f64 {
+    (MAP_MAX_WIDTH as f64 / width.max(1) as f64)
+        .min(MAP_MAX_HEIGHT as f64 / height.max(1) as f64).min(2.0)
+}
+
+fn map_display_rect(width: i32, height: i32, scale: f64) -> core::Rect {
+    let size = map_display_size(width, height, scale);
+    core::Rect::new(24 + (MAP_MAX_WIDTH - size.width)/2,
+        52 + (MAP_MAX_HEIGHT - size.height)/2, size.width, size.height)
+}
+
+fn source_ruler_bounds(left: i32, right: i32, width: i32, map_left: i32, scale: f64) -> (i32,i32) {
+    let x = (((left - map_left) as f64 / scale).round() as i32).clamp(0,width.saturating_sub(1));
+    let end = (((right - map_left) as f64 / scale).round() as i32).clamp(x+1,width);
+    (x,end)
+}
+
+fn map_display_size(width: i32, height: i32, scale: f64) -> core::Size {
+    core::Size::new((width as f64 * scale).round().max(1.0) as i32,
+                    (height as f64 * scale).round().max(1.0) as i32)
+}
+
+fn opponent_ids(net: &NetHud) -> Vec<u64> {
+    if net.my_id.is_none() { return Vec::new(); }
+    let mut ids: Vec<_> = net.pos.keys().copied().filter(|id| Some(*id) != net.my_id).collect();
+    ids.sort_unstable();
+    ids
+}
+
+fn selected_target_id(net: &NetHud) -> Option<u64> {
+    net.target_id.filter(|id| Some(*id) != net.my_id && net.pos.contains_key(id))
+        .or_else(|| opponent_ids(net).first().copied())
+}
+
+fn target_position(net: &NetHud) -> Option<(i64, i64)> {
+    net.pos.get(&selected_target_id(net)?).copied()
+}
+
+fn target_slot_rect(index: usize) -> Option<core::Rect> {
+    (index < MAX_TARGETS).then(|| core::Rect::new(
+        MAP_PANE_WIDTH + 16 + (index % 2) as i32 * 184,
+        386 + (index / 2) as i32 * 48, 174, 40))
+}
+
+fn target_at_sidebar(net: &NetHud, x: i32, y: i32) -> Option<u64> {
+    target_from_rows(&opponent_ids(net), x, y)
+}
+
+fn target_from_rows(ids: &[u64], x: i32, y: i32) -> Option<u64> {
+    ids.iter().copied().take(MAX_TARGETS).enumerate()
+        .find_map(|(i, uid)| is_inside(x, y, target_slot_rect(i)?).then_some(uid))
+}
+
+fn released_target(net: &NetHud, pressed: u64, x: i32, y: i32) -> Option<u64> {
+    (target_at_sidebar(net, x, y) == Some(pressed)).then_some(pressed)
+}
+
+fn target_at_map(net: &NetHud, x: i32, y: i32, size: core::Size) -> Option<u64> {
+    if net.map_w <= 0 || net.map_h <= 0 { return None; }
+    let mut best = None;
+    let mut best_distance = 30.0_f64.powi(2);
+    for uid in opponent_ids(net) {
+        let &(wx, wy) = net.pos.get(&uid)?;
+        let dx = wx as f64 * size.width as f64 / net.map_w as f64 - x as f64;
+        let dy = wy as f64 * size.height as f64 / net.map_h as f64 - y as f64;
+        let d = dx * dx + dy * dy;
+        if d < best_distance { best = Some(uid); best_distance = d; }
+    }
+    best
+}
+
+fn hud_controls() -> [core::Rect; 32] {
+    let sx = MAP_PANE_WIDTH;
+    [
+        (28,594,118,26), (154,594,118,26), (302,570,110,22),
+        (28,628,150,26), (188,628,224,26), (sx+282,350,92,24), (280,594,132,26),
+        (196,462,38,22), (240,462,38,22), (284,462,38,22), (328,462,38,22), (372,462,38,22),
+        (28,516,42,26), (76,516,42,26), (124,516,42,26), (172,516,42,26),
+        (220,516,42,26), (268,516,42,26), (316,516,42,26), (364,516,42,26),
+        (sx+26,272,32,22), (sx+66,272,32,22), (sx+28,236,150,30), (sx+106,272,32,22), (sx+146,272,32,22),
+        (sx+210,272,34,22), (sx+250,272,34,22), (sx+212,236,150,30), (sx+290,272,34,22), (sx+330,272,34,22),
+        (sx+16,314,296,28), (sx+320,314,54,28),
+    ].map(|(x,y,w,h)| core::Rect::new(x,y,w,h))
+}
+
+fn fit_text(text: &str, width: i32, scale: f64, thickness: i32) -> opencv::Result<String> {
+    hud_theme::fit(text,width,scale,thickness)
+}
+
+fn draw_target_list(canvas: &mut core::Mat, net: &NetHud) -> opencv::Result<()> {
+    use hud_theme as t;
+    let ids=opponent_ids(net);
+    t::text(canvas,&format!("选择对手  {}",ids.len().min(MAX_TARGETS)),MAP_PANE_WIDTH+16,370,250,0.47,t::TEXT)?;
+    let selected=selected_target_id(net);
+    for i in 0..MAX_TARGETS {
+        let r=target_slot_rect(i).unwrap();
+        let uid=ids.get(i).copied();
+        let active=uid.is_some() && uid==selected;
+        t::rounded(canvas,r,9,if active {t::ACCENT} else {t::BORDER})?;
+        t::rounded(canvas,core::Rect::new(r.x+1,r.y+1,r.width-2,r.height-2),8,
+            if active {t::ACCENT_DARK} else {t::SURFACE})?;
+        t::rounded(canvas,core::Rect::new(r.x+10,r.y+10,20,20),5,
+            if active {t::ACCENT} else {t::RAISED})?;
+        t::text(canvas,&(i+1).to_string(),r.x+16,r.y+25,18,0.37,
+            if active {t::BACKGROUND} else {t::MUTED})?;
+        let name=uid.and_then(|id|net.names.get(&id).filter(|s|!s.trim().is_empty()).cloned()
+            .or_else(||Some(format!("ID {id}")))).unwrap_or_else(||"等待对手".into());
+        t::text(canvas,&name,r.x+40,r.y+25,r.width-50,0.42,
+            if active {t::ACCENT} else if uid.is_some() {t::TEXT} else {t::MUTED})?;
+    }
+    Ok(())
+}
+
+fn sidebar_text(canvas: &mut core::Mat, text: &str, y: i32, scale: f64, color: core::Scalar) -> opencv::Result<()> {
+    let text=fit_text(text,SIDEBAR_WIDTH-56,scale,1)?;
+    imgproc::put_text(canvas,&text,core::Point::new(MAP_PANE_WIDTH+28,y),
+        imgproc::FONT_HERSHEY_SIMPLEX,scale,color,1,imgproc::LINE_AA,false)
+}
+
+fn aim_card_rect() -> core::Rect { core::Rect::new(MAP_PANE_WIDTH+16,52,SIDEBAR_WIDTH-32,130) }
+
+fn draw_aim_detail(canvas: &mut core::Mat, detail: &str) -> opencv::Result<()> {
+    let r=aim_card_rect();
+    imgproc::rectangle(canvas,core::Rect::new(r.x,184,r.width,22),hud_theme::color(hud_theme::BACKGROUND),-1,imgproc::LINE_8,0)?;
+    hud_theme::text(canvas,detail,r.x+4,198,r.width-8,0.39,hud_theme::MUTED)
+}
+
+fn draw_aim_pending(canvas: &mut core::Mat, title: &str, detail: &str) -> opencv::Result<()> {
+    use hud_theme as t;
+    let r=aim_card_rect();
+    t::card(canvas,r)?;
+    t::text(canvas,"推荐力度",r.x+18,r.y+25,200,0.42,t::MUTED)?;
+    t::text(canvas,"—",r.x+18,r.y+77,150,1.4,t::MUTED)?;
+    t::text(canvas,title,r.x+18,r.y+105,r.width-36,0.48,t::TEXT)?;
+    draw_aim_detail(canvas,detail)
+}
+
+fn draw_aim_ready(canvas: &mut core::Mat, force: f64, angle: f64, dx: f64, dy: f64, fixed: bool, label: &str) -> opencv::Result<()> {
+    use hud_theme as t;
+    let r=aim_card_rect();
+    t::card(canvas,r)?;
+    t::text(canvas,label,r.x+18,r.y+25,r.width-36,0.42,t::MUTED)?;
+    t::text(canvas,&format!("{force:.1}"),r.x+18,r.y+83,214,1.75,t::POWER)?;
+    t::text(canvas,&format!("{angle:.0}°"),r.x+254,r.y+79,86,0.94,t::TEXT)?;
+    t::text(canvas,&format!("{}  ·  2/3 力度 {:.1}",if fixed {"固定角度"} else {"推荐角度"},force*2.0/3.0),
+        r.x+18,r.y+112,r.width-36,0.43,t::MUTED)?;
+    draw_aim_detail(canvas,&format!("水平距离 {:.2}     高差 {:+.2}",dx.abs(),dy))
+}
+
+fn draw_hud_background(canvas: &mut core::Mat, net: &NetHud) -> opencv::Result<()> {
+    use hud_theme as t;
+    t::text(canvas,"TNT",20,29,80,0.72,t::ACCENT)?;
+    t::text(canvas,"战况地图",86,28,230,0.43,t::MUTED)?;
+    t::text(canvas,"瞄准助手",MAP_PANE_WIDTH+18,30,240,0.6,t::TEXT)?;
+    let online=net.conns>0;
+    t::rounded(canvas,core::Rect::new(MAP_PANE_WIDTH+300,12,74,24),12,
+        if online {t::ACCENT_DARK} else {t::RAISED})?;
+    t::text(canvas,if online {"已连接"} else {"等待连接"},MAP_PANE_WIDTH+310,29,58,0.36,
+        if online {t::ACCENT} else {t::MUTED})?;
+    for r in [core::Rect::new(16,44,408,414),core::Rect::new(16,490,408,62),
+              core::Rect::new(16,562,408,102),core::Rect::new(MAP_PANE_WIDTH+16,210,174,92),
+              core::Rect::new(MAP_PANE_WIDTH+200,210,174,92),core::Rect::new(MAP_PANE_WIDTH+16,590,358,72)] {
+        t::card(canvas,r)?;
+    }
+    t::text(canvas,"角度预设",28,507,240,0.38,t::MUTED)?;
+    t::text(canvas,"地图与标尺",28,582,250,0.42,t::TEXT)?;
+    draw_aim_pending(canvas,"等待对局数据","进入对局后自动同步")
+}
+
+fn draw_hud_controls(canvas: &mut core::Mat, st: &AppState, live_angle: Option<f64>, ocr: Option<i32>, wind_input: &str) -> opencv::Result<()> {
+    use hud_theme as t;
+    let [p1,e1,mode,lock,ruler,next,clear,u12,u16,u18,u20,u22,a20,a30,a45,a50,a60,a65,a70,a75,
+        m5,minus,angle_value,plus,p5,wm1,wm01,wind_value,wp01,wp1,auto,source]=hud_controls();
+    for (r,label,active) in [(p1,"标记我方",st.edit_mode==EditMode::P1),
+        (e1,"标记对手",st.edit_mode==EditMode::E1),(clear,"清除手动标记",false),
+        (mode,if st.big_map {"切换小地图"} else {"切换大地图"},false),
+        (lock,if st.locked_px_per_unit.is_some() {"标尺已锁定"} else {"锁定标尺"},st.locked_px_per_unit.is_some()),
+        (ruler,match st.edit_mode {EditMode::DrawRuler1=>"点击左边界",EditMode::DrawRuler2=>"点击右边界",_=>"框定一屏宽度"},
+            matches!(st.edit_mode,EditMode::DrawRuler1|EditMode::DrawRuler2)),(next,"下一位",false)] {
+        draw_btn(canvas,r,label,active)?;
+    }
+    if st.big_map {
+        t::text(canvas,"地图宽度",28,478,155,0.4,t::MUTED)?;
+        for (r,n) in [(u12,12.0),(u16,16.0),(u18,18.0),(u20,20.0),(u22,22.0)] {
+            draw_btn(canvas,r,&format!("{n:.0}"),(st.map_units-n).abs()<0.1)?;
+        }
+    } else {
+        t::text(canvas,"小地图 · 精确坐标同步",28,478,360,0.39,t::MUTED)?;
+    }
+    for (r,n) in [(a20,20.0),(a30,30.0),(a45,45.0),(a50,50.0),(a60,60.0),(a65,65.0),(a70,70.0),(a75,75.0)] {
+        draw_btn(canvas,r,&format!("{n:.0}°"),(st.current_angle-n).abs()<0.5)?;
+    }
+    t::text(canvas,"角度",angle_value.x,229,74,0.42,t::MUTED)?;
+    t::text(canvas,if st.auto_angle {"自动"} else {"手动"},angle_value.x+111,229,45,0.34,t::ACCENT)?;
+    let value=if !st.auto_angle || live_angle.is_some() || ocr.is_some() {format!("{:.0}°",st.current_angle)} else {"—".into()};
+    t::text(canvas,&value,angle_value.x,263,angle_value.width,0.96,t::TEXT)?;
+    t::text(canvas,if !wind_input.is_empty() {"风速 · 输入中"} else if st.wind_flip {"风速 · 翻转"} else if st.wind_net {"风速 · 自动"} else {"风速 · 手动"},
+        wind_value.x,229,wind_value.width,0.4,t::MUTED)?;
+    let wind=if wind_input.is_empty() {format!("{:+.1}",st.wind)} else {format!("{wind_input}_")};
+    t::text(canvas,&wind,wind_value.x,263,wind_value.width,0.96,t::TEXT)?;
+    for (r,label) in [(m5,"-5"),(minus,"-1"),(plus,"+1"),(p5,"+5"),(wm1,"-1.0"),(wm01,"-0.1"),(wp01,"+0.1"),(wp1,"+1.0")] {
+        draw_btn(canvas,r,label,false)?;
+    }
+    draw_btn(canvas,auto,if !st.auto_angle {"恢复自动同步角度"} else if live_angle.is_some() || ocr.is_some() {"角度自动同步中"} else {"等待读取角度"},st.auto_angle)?;
+    draw_btn(canvas,source,if st.prefer_memory_angle {"MEM"} else {"OCR"},st.prefer_memory_angle)
+}
+
+fn render_hud_preview(path: &str, variant: &str) -> opencv::Result<()> {
+    use hud_theme as t;
+    let mut canvas=core::Mat::new_rows_cols_with_default(HUD_HEIGHT,MAP_PANE_WIDTH+SIDEBAR_WIDTH,core::CV_8UC3,t::color(t::BACKGROUND))?;
+    let mut net=NetHud {my_id:Some(1),target_id:Some(4),map_w:2000,map_h:1000,conns:1,..Default::default()};
+    net.pos.insert(1,(200,650));
+    for (i,name) in ["远山听雨","Opponent Beta","宁静致远7","很长很长的对手名字测试","Player Five","同名玩家","同名玩家","最后一位对手"].iter().enumerate() {
+        let uid=i as u64+2;
+        net.names.insert(uid,(*name).into());net.pos.insert(uid,(750+i as i64*120,500+(i%3) as i64*100));
+    }
+    let st=AppState {edit_mode:EditMode::None,manual_p1:None,manual_e1:None,manual_cam_rect:None,drag_start:None,
+        current_angle:51.0,wind:-7.7,locked_px_per_unit:Some(8.0),map_units:12.0,big_map:false,
+        disp_scale:compact_map_scale(335,387),src_w:335,src_h:387,auto_angle:true,prefer_memory_angle:true,
+        ocr_roi_requested:false,is_fixed_angle:true,wind_flip:false,wind_net:true,switch_requested:false,
+        btn_press:None,target_press:None};
+    draw_hud_background(&mut canvas,&net)?;
+    let map=map_display_rect(st.src_w,st.src_h,st.disp_scale);
+    t::rounded(&mut canvas,map,5,[32.0,29.0,24.0])?;
+    for y in (map.y+20..map.y+map.height-12).step_by(40) {
+        imgproc::line(&mut canvas,core::Point::new(map.x+6,y),core::Point::new(map.x+map.width-6,y),t::color([44.0,40.0,34.0]),1,imgproc::LINE_AA,0)?;
+    }
+    for x in (map.x+20..map.x+map.width-12).step_by(40) {
+        imgproc::line(&mut canvas,core::Point::new(x,map.y+6),core::Point::new(x,map.y+map.height-6),t::color([44.0,40.0,34.0]),1,imgproc::LINE_AA,0)?;
+    }
+    let point=|x:f64,y:f64|core::Point::new(map.x+(x*map.width as f64) as i32,map.y+(y*map.height as f64) as i32);
+    for i in 0..65 {
+        let x=i as f64/64.0;
+        let p=point(0.1+x*0.79,0.68-1.6*x*(1.0-x));
+        if i%2==0 {imgproc::circle(&mut canvas,p,1,t::color(t::ACCENT),-1,imgproc::LINE_AA,0)?;}
+    }
+    for i in 0..8 {
+        let pt=point(0.56+(i%3) as f64*0.09,0.59+(i/3) as f64*0.09);
+        let c=if i==2 {t::ACCENT} else {t::MUTED};
+        imgproc::circle(&mut canvas,pt,6,t::color(c),2,imgproc::LINE_AA,0)?;
+        t::text(&mut canvas,&(i+1).to_string(),pt.x+9,pt.y-6,20,0.36,c)?;
+    }
+    let me=point(0.1,0.68);
+    imgproc::circle(&mut canvas,me,6,t::color(t::TEXT),2,imgproc::LINE_AA,0)?;
+    t::text(&mut canvas,"我方",me.x-12,me.y+23,60,0.36,t::TEXT)?;
+    match variant {
+        "scale"=>draw_aim_pending(&mut canvas,"体型变化中","稳定后自动切换弹道模型")?,
+        "expanded"=>draw_aim_ready(&mut canvas,power_for_angle_for_scale(ShotScale::Expanded,51.0,13.9,-3.8,-7.7).unwrap(),51.0,13.9,-3.8,true,"推荐力度 · 放大炮弹")?,
+        "waiting"=>draw_aim_pending(&mut canvas,"读数更新中","稍后自动恢复建议")?,
+        "recent"=>draw_aim_ready(&mut canvas,54.4,51.0,13.9,-3.8,true,"上次建议 · 读数更新中")?,
+        _=>draw_aim_ready(&mut canvas,54.4,51.0,13.9,-3.8,true,"推荐力度")?,
+    }
+    draw_hud_controls(&mut canvas,&st,Some(51.0),None,"")?;
+    draw_target_list(&mut canvas,&net)?;
+    sidebar_text(&mut canvas,"按住 Shift 说出风速",615,0.39,t::color(t::MUTED))?;
+    sidebar_text(&mut canvas,"在线 · 第 5 回合 · 我方回合",644,0.39,t::color(t::ACCENT))?;
+    t::text(&mut canvas,"地图和名单均可点选",20,677,330,0.34,t::MUTED)?;
+    imgcodecs::imwrite(path,&canvas,&core::Vector::new())?;
+    Ok(())
 }
 
 /// 只读 Android 进程中 BattleRole 的逻辑坐标，仅作为网络坐标的短期覆盖层。
@@ -128,6 +400,170 @@ struct LiveAngle {
     updated: std::time::Instant,
     uid: u64,
     fire_angle: u16,
+}
+
+#[derive(Clone)]
+struct LiveOrigin {
+    updated: std::time::Instant,
+    age_ms: u64,
+    uid: u64,
+    fire_angle: u16,
+    player: (f64, f64),
+    origin: (f64, f64),
+    scale: ShotScale,
+}
+
+#[derive(Clone)]
+struct OriginHint {
+    updated: std::time::Instant,
+    uid: u64,
+    code: String,
+    scale: Option<ShotScale>,
+}
+
+fn parse_origin_hint(line: &str) -> Option<OriginHint> {
+    let mut p=line.split_whitespace();
+    if p.next()? != "TNTORIGINSTATUS" { return None; }
+    let pid=p.next()?.parse::<u32>().ok()?;
+    let uid=p.next()?.parse::<u64>().ok()?;
+    let sampled=p.next()?.parse::<u64>().ok()?;
+    let code=p.next()?;
+    let scale=p.next()?.parse::<f64>().ok()?;
+    let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_millis() as u64;
+    if pid==0 || uid==0 || p.next().is_some() || now.checked_sub(sampled)? > 600
+        || !scale.is_finite() || !(0.01..=10.0).contains(&scale)
+        || !["ready","scale","angle","moving","read"].contains(&code) { return None; }
+    Some(OriginHint {updated:std::time::Instant::now().checked_sub(std::time::Duration::from_millis(now-sampled))?,uid,code:code.into(),scale:ShotScale::from_factor(scale)})
+}
+
+fn apply_origin_hint(sample: &mut Option<LiveOrigin>, hint: &OriginHint) {
+    // A ready status precedes its pose. Keep the previous timestamp untouched
+    // when the source is continuous; do not create an empty frame every poll.
+    if hint.code!="ready" || sample.as_ref().is_some_and(|s|s.uid!=hint.uid || Some(s.scale)!=hint.scale) {
+        *sample=None;
+    }
+}
+
+fn origin_pending_message(sample: Option<&LiveOrigin>, hint: Option<&OriginHint>, net: &NetHud, angle: f64) -> (&'static str,&'static str) {
+    if let Some(hint)=hint.filter(|h|Some(h.uid)==net.my_id && h.updated.elapsed().as_millis()<=600) {
+        match hint.code.as_str() {
+            "scale" => return ("体型变化中","稳定后自动切换弹道模型"),
+            "angle" => return ("角度同步中","正在读取实际发射角度"),
+            "moving" => return ("人物状态变化中","位置稳定后恢复建议"),
+            _ => (),
+        }
+    }
+    let Some(s)=sample else { return ("读数更新中","稍后自动恢复建议"); };
+    if s.updated.elapsed().as_millis()+u128::from(s.age_ms)>600 { return ("读数更新中","稍后自动恢复建议"); }
+    if Some(s.uid)!=net.my_id { return ("等待读取对局身份","进入对局后自动同步"); }
+    if (f64::from(s.fire_angle.min(180-s.fire_angle))-angle).abs()>0.01 { return ("角度同步中","正在读取实际发射角度"); }
+    ("人物位置同步中","正在对齐实时位置")
+}
+
+fn parse_live_origin_line(line: &str) -> Option<Option<LiveOrigin>> {
+    if line.trim() == "TNTORIGIN-" { return Some(None); }
+    let mut p = line.split_whitespace();
+    if p.next()? != "TNTORIGIN" { return None; }
+    let pid = p.next()?.parse::<u32>().ok()?;
+    let uid = p.next()?.parse::<u64>().ok()?;
+    let sampled_ms = p.next()?.parse::<u64>().ok()?;
+    let fire_angle = p.next()?.parse::<u16>().ok()?;
+    match p.next()? { "0" | "1" => (), _ => return None }; // protocol metadata, never an aiming gate
+    let px = p.next()?.parse::<f64>().ok()?;
+    let py = p.next()?.parse::<f64>().ok()?;
+    let x = p.next()?.parse::<f64>().ok()?;
+    let y = p.next()?.parse::<f64>().ok()?;
+    let scale=match p.next() {
+        Some(value)=>ShotScale::from_factor(value.parse::<f64>().ok()?)?,
+        None=>ShotScale::Normal,
+    };
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_millis() as u64;
+    let age_ms = now.checked_sub(sampled_ms)?;
+    if p.next().is_some() || pid == 0 || uid == 0 || fire_angle > 180 || age_ms > 600
+        || ![px, py, x, y].iter().all(|v| v.is_finite() && v.abs() <= 100000.0)
+        || (x - px).hypot(y - py) > 40.0*scale.factor() {
+        return None;
+    }
+    Some(Some(LiveOrigin { updated: std::time::Instant::now(), age_ms, uid,
+        fire_angle, player: (px, py), origin: (x, y),scale }))
+}
+
+// A correction is useful only for the same local pose and current firing angle.
+// Body facing is metadata, not a condition on where a projectile may be aimed.
+fn live_origin_for_hud(sample: Option<&LiveOrigin>, net: &NetHud, angle: f64) -> Option<(f64, f64)> {
+    let s = sample?;
+    if net.map_w <= 0 || net.map_h <= 0 || net.my_id != Some(s.uid)
+        || s.updated.elapsed().as_millis() + u128::from(s.age_ms) > 600
+        || !angle.is_finite() || (f64::from(s.fire_angle.min(180 - s.fire_angle)) - angle).abs() > 0.01 {
+        return None;
+    }
+    let &(px, py) = net.pos.get(&s.uid)?;
+    if (s.player.0 - px as f64).abs() > 1.0 || (s.player.1 - py as f64).abs() > 1.0 {
+        return None;
+    }
+    Some(s.origin)
+}
+
+#[derive(Debug, PartialEq)]
+enum AimOrigin {
+    Muzzle((f64, f64)),
+    Player,
+    Verifying,
+}
+
+#[derive(Clone, PartialEq)]
+struct AimInputs {
+    battle: u64,
+    mine: u64,
+    target: u64,
+    player: (i64,i64),
+    enemy: (i64,i64),
+    angle: f64,
+    wind: f64,
+    units: (f64,f64),
+    source: (i32,i32),
+    fixed: bool,
+    scale: ShotScale,
+    world_angle: Option<u16>,
+}
+
+fn aim_inputs(net: &NetHud, angle: f64, wind: f64, units: (f64,f64), source: (i32,i32), fixed: bool) -> Option<AimInputs> {
+    let mine=net.my_id?;
+    let target=selected_target_id(net)?;
+    Some(AimInputs {battle:net.battle_id,mine,target,player:*net.pos.get(&mine)?,enemy:*net.pos.get(&target)?,
+        angle,wind,units,source,fixed,scale:ShotScale::Normal,world_angle:None})
+}
+
+struct RecentAim {
+    inputs: AimInputs,
+    sampled: std::time::Instant,
+    force: f64,
+    angle: f64,
+    dx: f64,
+    dy: f64,
+}
+impl RecentAim {
+    fn can_reference(&self, inputs: Option<&AimInputs>, hint: Option<&OriginHint>) -> bool {
+        inputs==Some(&self.inputs) && self.sampled.elapsed().as_millis()<=1200
+            && hint.is_some_and(|h|h.uid==self.inputs.mine && h.code=="ready" && h.updated.elapsed().as_millis()<=1200)
+    }
+}
+
+fn resolve_aim_origin(sample: Option<&LiveOrigin>, net: &NetHud, angle: f64, required: bool) -> AimOrigin {
+    match live_origin_for_hud(sample, net, angle) {
+        Some(xy) => AimOrigin::Muzzle(xy),
+        None if required => AimOrigin::Verifying,
+        None => AimOrigin::Player,
+    }
+}
+
+fn update_shot_scale(latched: &mut Option<(u64,u64,ShotScale)>, net: &NetHud, sample: Option<&LiveOrigin>, hint: Option<&OriginHint>) -> ShotScale {
+    let Some(uid)=net.my_id else {*latched=None;return ShotScale::Normal;};
+    if latched.is_some_and(|(battle,mine,_)|battle!=net.battle_id || mine!=uid) {*latched=None;}
+    let observed=sample.filter(|s|s.uid==uid && s.updated.elapsed().as_millis()+u128::from(s.age_ms)<=600).map(|s|s.scale)
+        .or_else(||hint.filter(|h|h.uid==uid && h.code=="ready" && h.updated.elapsed().as_millis()<=600).and_then(|h|h.scale));
+    if let Some(scale)=observed {*latched=Some((net.battle_id,uid,scale));}
+    latched.map(|(_,_,s)|s).unwrap_or(ShotScale::Normal)
 }
 
 /// Strict, bounded one-line protocol from stream_live_angle_readonly.py.
@@ -261,21 +697,7 @@ fn wind_dir_hint(net: &NetHud) -> Option<i32> {
     }
     let my = net.my_id?;
     let (mx, _) = *net.pos.get(&my)?;
-    let (ex, _) = net
-        .target_id
-        .and_then(|t| net.pos.get(&t))
-        .or_else(|| {
-            // 未选目标:取 id 最小的敌人,与"目标"按钮轮换第一个一致
-            // (HashMap 遍历顺序不定,必须显式排序)
-            let mut ids: Vec<u64> = net
-                .pos
-                .keys()
-                .copied()
-                .filter(|id| *id != my && !net.not_mine.contains(id))
-                .collect();
-            ids.sort_unstable();
-            ids.first().and_then(|id| net.pos.get(id))
-        })?;
+    let (ex, _) = target_position(net)?;
     let aim = (ex - mx).signum() as i32;
     if aim == 0 {
         return None;
@@ -469,15 +891,38 @@ struct AppState {
     wind_flip: bool,
     /// 当前风速来自网络密钥自动解码(显示 [N] 标记)
     wind_net: bool,
-    exit_requested: bool,
     switch_requested: bool,
     /// 按钮防误触:记录按下位置,松开时确认仍在同一按钮内才生效
     btn_press: Option<(i32, i32)>,
+    target_press: Option<(u64, u64)>,
 }
 
 use tnt_comput::physics::*;
 
-fn compute_fixed_trajectory(dx_units: f64, dy_units: f64, angle_deg: f64, wind: f64) -> Option<(f64, f64)> {
+// Calculate from continuous world coordinates before mini-map rounding. Keep
+// the selected ruler (including manual scale) and the existing target choice.
+fn network_aim_offsets(
+    net: &NetHud,
+    manual_points: bool,
+    source: core::Size,
+    units: (f64, f64),
+    origin: Option<(f64, f64)>,
+) -> Option<(f64, f64)> {
+    if manual_points || net.map_w <= 0 || net.map_h <= 0
+        || source.width <= 0 || source.height <= 0
+        || ![units.0, units.1].iter().all(|v| v.is_finite() && *v > 0.0) {
+        return None;
+    }
+    let &(px, py) = net.pos.get(&net.my_id?)?;
+    let (px, py) = origin.unwrap_or((px as f64, py as f64));
+    let (ex, ey) = target_position(net)?;
+    Some((
+        (ex as f64 - px) * source.width as f64 / net.map_w as f64 / units.0,
+        (py - ey as f64) * source.height as f64 / net.map_h as f64 / units.1,
+    ))
+}
+
+fn compute_fixed_trajectory(dx_units: f64, dy_units: f64, angle_deg: f64, wind: f64, scale: ShotScale) -> Option<(f64, f64)> {
     let mut eff_angle = angle_deg;
     if eff_angle > 90.0 {
         eff_angle = 180.0 - eff_angle;
@@ -487,11 +932,11 @@ fn compute_fixed_trajectory(dx_units: f64, dy_units: f64, angle_deg: f64, wind: 
     let dist = dx_units.abs();
 
     // 调用全新的底层物理引擎，同时传入高低差 dy_units
-    let final_power = power_for_angle(eff_angle, dist, dy_units, wind_power)?;
+    let final_power = power_for_angle_for_scale(scale, eff_angle, dist, dy_units, wind_power)?;
     Some((final_power, angle_deg))
 }
 
-fn compute_trajectory(dx_units: f64, dy_units: f64, angle_deg: f64, wind: f64) -> Option<(f64, f64)> {
+fn compute_trajectory(dx_units: f64, dy_units: f64, angle_deg: f64, wind: f64, scale: ShotScale) -> Option<(f64, f64)> {
     let mut eff_angle = angle_deg;
     if eff_angle > 90.0 {
         eff_angle = 180.0 - eff_angle;
@@ -502,8 +947,8 @@ fn compute_trajectory(dx_units: f64, dy_units: f64, angle_deg: f64, wind: f64) -
     let dist = dx_units.abs();
 
     // 使用新的 power_for_angle 和 calc_angle 传递 dy_units
-    let base_power = power_for_angle(eff_angle, dist, dy_units, 0.0)?;
-    let mut final_angle = calc_angle(dist, dy_units, base_power, wind_power, eff_angle);
+    let base_power = power_for_angle_for_scale(scale, eff_angle, dist, dy_units, 0.0)?;
+    let mut final_angle = calc_angle_for_scale(scale, dist, dy_units, base_power, wind_power, eff_angle);
 
     final_angle = final_angle.clamp(15.0, 89.0);
 
@@ -529,16 +974,44 @@ impl<K: PartialEq, V> LastValue<K, V> {
     }
 }
 
-type TrajectoryKey = (f64, f64, f64, f64, bool);
+fn target_relative_to_world_wind(net: &NetHud, wind: f64, fallback_dx: f64) -> f64 {
+    // UI wind is relative to player→target. A muzzle can lie beyond a nearby
+    // target, so its dx must not silently reverse the actual wind direction.
+    let dx=net.my_id.and_then(|uid|net.pos.get(&uid)).zip(target_position(net))
+        .map(|(&(px,_),(ex,_))|(ex-px) as f64).filter(|dx|*dx!=0.0).unwrap_or(fallback_dx);
+    if dx<0.0 {-wind} else {wind}
+}
+
+fn compute_world_trajectory(dx: f64, dy: f64, world_angle: u16, world_wind: f64, fixed: bool, scale: ShotScale) -> Option<(f64,f64)> {
+    let angle=f64::from(world_angle);
+    let launch_left=angle>90.0;
+    let forward_dx=if launch_left {-dx} else {dx};
+    if fixed || forward_dx<=0.0 || !(15.0..=89.0).contains(&angle.min(180.0-angle)) {
+        return power_for_world_angle_for_scale(scale,angle,dx,dy,world_wind).map(|p|(p,angle));
+    }
+    let elevation=angle.min(180.0-angle);
+    let relative_wind=if launch_left {-world_wind} else {world_wind};
+    let (power,adjusted)=compute_trajectory(forward_dx,dy,elevation,relative_wind,scale)?;
+    Some((power,if launch_left {180.0-adjusted} else {adjusted}))
+}
+
+fn trajectory_draw_angle(angle: f64, dx: f64, actual_world_angle: bool) -> f64 {
+    if actual_world_angle {angle}
+    else if (dx<0.0 && angle<=90.0) || (dx>=0.0 && angle>90.0) {180.0-angle}
+    else {angle}
+}
+
+type TrajectoryKey = (f64, f64, f64, f64, bool, ShotScale, Option<u16>);
 
 fn cached_trajectory(
     memo: &mut LastValue<TrajectoryKey, Option<(f64, f64)>>,
     key: TrajectoryKey,
 ) -> Option<(f64, f64)> {
     *memo.get_or_compute(key, || {
-        let (dx, dy, angle, wind, fixed) = key;
-        if fixed { compute_fixed_trajectory(dx, dy, angle, wind) }
-        else { compute_trajectory(dx, dy, angle, wind) }
+        let (dx, dy, angle, wind, fixed, scale, world_angle) = key;
+        if let Some(world_angle)=world_angle {return compute_world_trajectory(dx,dy,world_angle,wind,fixed,scale);}
+        if fixed { compute_fixed_trajectory(dx, dy, angle, wind, scale) }
+        else { compute_trajectory(dx, dy, angle, wind, scale) }
     })
 }
 
@@ -566,50 +1039,8 @@ impl MapDisplayCache {
     }
 }
 
-fn draw_btn(
-    canvas: &mut core::Mat,
-    rect: core::Rect,
-    label: &str,
-    is_active: bool,
-) -> opencv::Result<()> {
-    let color = if is_active {
-        core::Scalar::new(0.0, 200.0, 255.0, 0.0)
-    } else {
-        core::Scalar::new(80.0, 80.0, 80.0, 0.0)
-    };
-    let text_color = if is_active {
-        core::Scalar::new(0.0, 0.0, 0.0, 0.0)
-    } else {
-        core::Scalar::new(255.0, 255.0, 255.0, 0.0)
-    };
-
-    imgproc::rectangle(canvas, rect, color, -1, imgproc::LINE_8, 0)?;
-    imgproc::rectangle(
-        canvas,
-        rect,
-        core::Scalar::new(200.0, 200.0, 200.0, 0.0),
-        1,
-        imgproc::LINE_8,
-        0,
-    )?;
-
-    let mut baseline = 0;
-    let size = imgproc::get_text_size(label, imgproc::FONT_HERSHEY_SIMPLEX, 0.5, 1, &mut baseline)?;
-    let text_x = rect.x + (rect.width - size.width) / 2;
-    let text_y = rect.y + (rect.height + size.height) / 2;
-
-    imgproc::put_text(
-        canvas,
-        label,
-        core::Point::new(text_x, text_y),
-        imgproc::FONT_HERSHEY_SIMPLEX,
-        0.5,
-        text_color,
-        1,
-        imgproc::LINE_AA,
-        false,
-    )?;
-    Ok(())
+fn draw_btn(canvas: &mut core::Mat, rect: core::Rect, label: &str, is_active: bool) -> opencv::Result<()> {
+    hud_theme::button(canvas,rect,label,is_active)
 }
 
 fn is_inside(x: i32, y: i32, rect: core::Rect) -> bool {
@@ -903,6 +1334,15 @@ fn capture_rect_to_file(geo: (i32, i32, i32, i32), path: &str) {
 }
 
 fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
+    let args: Vec<_> = std::env::args().collect();
+    #[cfg(target_os = "macos")]
+    if args.get(1).map(String::as_str) == Some("--check-window-close") {
+        return hud_window::check_native_close();
+    }
+    if args.get(1).map(String::as_str) == Some("--preview-layout") {
+        let path = args.get(2).ok_or_else(|| opencv::Error::new(core::StsBadArg,"preview PNG path required"))?;
+        return render_hud_preview(path,args.get(3).map(String::as_str).unwrap_or("ready"));
+    }
     eprintln!("[PHYSICS] model={} world_units_per_hud_unit={}", model_name(), world_units_per_hud_unit());
     #[cfg(target_os = "macos")]
     println!("=== 🍎 Mac OS 环境检测成功，已自动切换原生 screencapture 截图引擎 ===");
@@ -910,6 +1350,18 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
     // ===== 网络实况隧道:libtntsniff.so → adb reverse → 127.0.0.1:19001 =====
     // 尽早绑定:用户还在框选时隧道就能连进来,开局 INIT 不容易错过。
     let net_state: Arc<Mutex<NetHud>> = Arc::new(Mutex::new(NetHud::default()));
+    // One private session joins network records and pre-shot local pose samples.
+    let recording_root = std::env::var_os("TNT_RECORD_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("recordings"));
+    let raw_override = std::env::var_os("TNT_TRACE_PATH").map(std::path::PathBuf::from);
+    let trace = match tnt_comput::capture::Capture::open(&recording_root, raw_override.as_deref()) {
+        Ok(capture) => {
+            println!("📡 NET: 本次数据目录 {}（含炮口姿态记录）", capture.dir.display());
+            Some(Arc::new(Mutex::new(capture)))
+        }
+        Err(e) => { eprintln!("⚠️ 无法开启数据录制（不会覆盖旧文件）: {e}"); None }
+    };
     // 默认开启我方 QGraphicsItem 动态 XY；可 TNT_LIVE_XY=0 关闭。
     // 失败自动回退网络数据；敌方仍走网络解析，不污染原始抓包。
     let live_xy_state: Arc<Mutex<Option<LiveXY>>> = Arc::new(Mutex::new(None));
@@ -957,19 +1409,29 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
     // The verified local aiming source is enabled by default, independent of
     // network/XY/wind. TNT_LIVE_ANGLE=0 provides a hard OCR-only opt-out.
     let live_angle_state: Arc<Mutex<Option<LiveAngle>>> = Arc::new(Mutex::new(None));
+    let live_origin_state: Arc<Mutex<Option<LiveOrigin>>> = Arc::new(Mutex::new(None));
+    let origin_hint_state: Arc<Mutex<Option<OriginHint>>> = Arc::new(Mutex::new(None));
+    let live_origin_enabled = live_xy_enabled_from_env(std::env::var("TNT_FIRE_ORIGIN").ok().as_deref());
     let live_angle_enabled = live_angle_enabled_from_env(
         std::env::var("TNT_LIVE_ANGLE").ok().as_deref()
     );
     if live_angle_enabled {
         let state = live_angle_state.clone();
+        let origin_state = live_origin_state.clone();
+        let hint_state = origin_hint_state.clone();
+        let pose_trace = trace.clone();
         thread::spawn(move || {
             let script = concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/scripts/position/stream_live_angle_readonly.py"
             );
-            let child = Command::new("python3")
-                .arg("-u")
-                .arg(script)
+            let mut command = Command::new("python3");
+            command.arg("-u").arg(script);
+            if live_origin_enabled {
+                command.arg("--fire-origin");
+                if pose_trace.is_some() { command.arg("--record-origin"); }
+            }
+            let child = command
                 .stdout(Stdio::piped())
                 .stderr(Stdio::inherit())
                 .spawn();
@@ -979,16 +1441,33 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
                     if let Some(stdout) = child.stdout.take() {
                         for line in BufReader::new(stdout).lines() {
                             let Ok(line) = line else { break };
+                            if line.starts_with("TNTPOSE ") || line.starts_with("TNTORIGIN") {
+                                if let Some(trace) = &pose_trace {
+                                    if let Ok(mut capture) = trace.lock() { capture.origin_sample(&line); }
+                                }
+                            }
                             if let Some(update) = parse_live_angle_line(&line) {
                                 if let Ok(mut st) = state.lock() {
                                     *st = update;
                                 }
+                            }
+                            if let Some(update) = parse_live_origin_line(&line) {
+                                if let Ok(mut st) = origin_state.lock() { *st = update; }
+                            }
+                            if let Some(hint)=parse_origin_hint(&line) {
+                                if let Ok(mut st)=origin_state.lock() { apply_origin_hint(&mut st,&hint); }
+                                if let Ok(mut st)=hint_state.lock() { *st=Some(hint); }
+                            }
+                            if line=="TNTORIGINSTATUS-" {
+                                if let Ok(mut st)=hint_state.lock() { *st=None; }
                             }
                         }
                     }
                     if let Ok(mut st) = state.lock() {
                         *st = None;
                     }
+                    if let Ok(mut st) = origin_state.lock() { *st = None; }
+                    if let Ok(mut st) = hint_state.lock() { *st = None; }
                     let _ = child.kill();
                     let _ = child.wait();
                     eprintln!("⚠️ ANGLE: 只读角度探针结束，已回退表盘识别");
@@ -999,6 +1478,7 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
     }
     {
         let ns = net_state.clone();
+        let trace = trace.clone();
         thread::spawn(move || {
             let my_name =
                 std::env::var("TNT_MY_NAME").unwrap_or_else(|_| "1111rust".to_string());
@@ -1009,17 +1489,6 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
             let Ok(listener) = TcpListener::bind(("127.0.0.1", port)) else {
                 println!("⚠️ NET: 端口 {port} 被占用(可能在跑 net_live),网络定位不可用");
                 return;
-            };
-            let recording_root = std::env::var_os("TNT_RECORD_DIR")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("recordings"));
-            let raw_override = std::env::var_os("TNT_TRACE_PATH").map(std::path::PathBuf::from);
-            let trace = match tnt_comput::capture::Capture::open(&recording_root, raw_override.as_deref()) {
-                Ok(capture) => {
-                    println!("📡 NET: 本次数据目录 {}", capture.dir.display());
-                    Some(Arc::new(Mutex::new(capture)))
-                }
-                Err(e) => { eprintln!("⚠️ 无法开启数据录制（不会覆盖旧文件）: {e}"); None }
             };
             let mut connection_seq = 0u64;
             println!("📡 NET: 监听 127.0.0.1:{port} — adb reverse tcp:{port} tcp:{port}");
@@ -1166,14 +1635,8 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
     let window_name = "TNT Assistant HUD";
     highgui::named_window(window_name, highgui::WINDOW_AUTOSIZE)?;
 
-    // 显示缩放:大地图缩到 ~452px 宽(和小地图显示尺寸一致),小地图沿用放大规则
-    let scale = if big_map_mode {
-        (452.0 / t_w as f64).min(2.0)
-    } else if t_w > 600 {
-        1.0
-    } else {
-        2.0
-    };
+    // Preserve source aspect ratio within a bounded map pane.
+    let scale = compact_map_scale(t_w, t_h);
 
     let app_state = Arc::new(Mutex::new(AppState {
         edit_mode: EditMode::None,
@@ -1195,71 +1658,29 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
         is_fixed_angle: true,
         wind_flip: false,
         wind_net: false,
-        exit_requested: false,
         switch_requested: false,
         btn_press: None,
+        target_press: None,
     }));
 
-    let map_w_display = (t_w as f64 * scale) as i32;
+    let map_w_display = MAP_PANE_WIDTH;
 
     // 大地图模式:整屏宽默认 12 距,启动即自动锁尺(12/16/18/20/22 按钮可切换)
     if big_map_mode {
         app_state.lock().unwrap().locked_px_per_unit = Some(t_w as f64 / 12.0);
     }
 
-    let btn_p1 = core::Rect::new(map_w_display + 20, 30, 110, 40);
-    let btn_e1 = core::Rect::new(map_w_display + 140, 30, 110, 40);
-    // 大/小地图模式切换(点击后弹交互框选新区域)
-    let btn_mode_switch = core::Rect::new(map_w_display + 260, 30, 110, 40);
-
-    let btn_lock_ruler = core::Rect::new(map_w_display + 20, 80, 230, 40);
-    let btn_draw_ruler = core::Rect::new(map_w_display + 20, 130, 230, 35);
-
-    let btn_exit = core::Rect::new(map_w_display + 150, 5, 100, 30);
-    // 多人局目标轮换:点击在敌人列表里循环选中(等效于右键点标记)
-    let btn_target = core::Rect::new(map_w_display + 260, 5, 110, 30);
-
-    let btn_clear = core::Rect::new(map_w_display + 20, 210, 230, 25);
-
-    // 大地图模式:整屏距离档位(小地图模式下仅占位,点击无效)
-    let btn_u12 = core::Rect::new(map_w_display + 20, 175, 52, 30);
-    let btn_u16 = core::Rect::new(map_w_display + 77, 175, 52, 30);
-    let btn_u18 = core::Rect::new(map_w_display + 134, 175, 52, 30);
-    let btn_u20 = core::Rect::new(map_w_display + 191, 175, 52, 30);
-    let btn_u22 = core::Rect::new(map_w_display + 248, 175, 52, 30);
-
-    // Preset Angle Buttons
-    let btn_a20 = core::Rect::new(map_w_display + 20, 240, 50, 30);
-    let btn_a30 = core::Rect::new(map_w_display + 80, 240, 50, 30);
-    let btn_a45 = core::Rect::new(map_w_display + 140, 240, 50, 30);
-    let btn_a50 = core::Rect::new(map_w_display + 200, 240, 50, 30);
-
-    let btn_a60 = core::Rect::new(map_w_display + 20, 275, 50, 30);
-    let btn_a65 = core::Rect::new(map_w_display + 80, 275, 50, 30);
-    let btn_a70 = core::Rect::new(map_w_display + 140, 275, 50, 30);
-    let btn_a75 = core::Rect::new(map_w_display + 200, 275, 50, 30);
-
-    // Fine-tune buttons
-    let btn_ang_m5 = core::Rect::new(map_w_display + 20, 315, 40, 35);
-    let btn_ang_minus = core::Rect::new(map_w_display + 65, 315, 35, 35);
-    let rect_ang_text = core::Rect::new(map_w_display + 105, 315, 60, 35);
-    let btn_ang_plus = core::Rect::new(map_w_display + 170, 315, 35, 35);
-    let btn_ang_p5 = core::Rect::new(map_w_display + 210, 315, 40, 35);
-
-    let btn_wind_m1 = core::Rect::new(map_w_display + 20, 355, 45, 30);
-    let btn_wind_m01 = core::Rect::new(map_w_display + 75, 355, 45, 30);
-    let rect_wind_text = core::Rect::new(map_w_display + 125, 355, 60, 30);
-    let btn_wind_p01 = core::Rect::new(map_w_display + 190, 355, 45, 30);
-    let btn_wind_p1 = core::Rect::new(map_w_display + 245, 355, 45, 30);
-
-    let btn_auto_angle = core::Rect::new(map_w_display + 20, 395, 230, 30);
-    // Narrow companion switch inside existing 310px side panel; no map overlap.
-    let btn_angle_source = core::Rect::new(map_w_display + 258, 395, 50, 30);
+    let [btn_p1, btn_e1, btn_mode_switch, btn_lock_ruler, btn_draw_ruler,
+        btn_target, btn_clear, btn_u12, btn_u16, btn_u18, btn_u20, btn_u22,
+        btn_a20, btn_a30, btn_a45, btn_a50, btn_a60, btn_a65, btn_a70, btn_a75,
+        btn_ang_m5, btn_ang_minus, _rect_ang_text, btn_ang_plus, btn_ang_p5,
+        btn_wind_m1, btn_wind_m01, _rect_wind_text, btn_wind_p01, btn_wind_p1,
+        btn_auto_angle, btn_angle_source] = hud_controls();
 
     // 全部按钮矩形:用于"按下和松开都在同一按钮内才生效"的防误触判定
     let all_btns = vec![
         btn_p1, btn_e1, btn_mode_switch, btn_lock_ruler, btn_draw_ruler,
-        btn_exit, btn_target, btn_clear, btn_a20, btn_a30, btn_a45, btn_a50, btn_a60, btn_a65, btn_a70,
+        btn_target, btn_clear, btn_a20, btn_a30, btn_a45, btn_a50, btn_a60, btn_a65, btn_a70,
         btn_a75, btn_ang_m5, btn_ang_minus, btn_ang_plus, btn_ang_p5, btn_auto_angle,
         btn_angle_source, btn_wind_m1, btn_wind_m01, btn_wind_p01, btn_wind_p1,
         btn_u12, btn_u16, btn_u18, btn_u20, btn_u22,
@@ -1267,6 +1688,8 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
 
     let state_cb = app_state.clone();
     let net_state_cb = net_state.clone();
+    let target_rows: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+    let target_rows_cb = target_rows.clone();
     let angle_reader_available = live_angle_enabled;
     highgui::set_mouse_callback(
         window_name,
@@ -1276,10 +1699,23 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
                 .map(|n| n.battle_id > 0 && !n.pos.is_empty())
                 .unwrap_or(false);
             let mut st = state_cb.lock().unwrap();
-            let map_h_display = (st.src_h as f64 * st.disp_scale) as i32;
-            let on_map = x >= 0 && x < map_w_display && y >= 0 && y < map_h_display;
+            let map_rect = map_display_rect(st.src_w, st.src_h, st.disp_scale);
+            let map_size = map_rect.size();
+            let on_map = map_rect.contains(core::Point::new(x,y));
 
             if event == highgui::EVENT_LBUTTONDOWN {
+                st.target_press = None;
+                st.btn_press = None;
+                if let Ok(n) = net_state_cb.lock() {
+                    if let Ok(rows) = target_rows_cb.lock() {
+                        if let Some(uid) = target_from_rows(&rows, x, y) {
+                            if n.pos.contains_key(&uid) && Some(uid) != n.my_id {
+                                st.target_press = Some((n.battle_id, uid));
+                                return;
+                            }
+                        }
+                    }
+                }
                 // 点在按钮上:只记录位置,等松开时确认仍在同一按钮内再触发
                 if all_btns.iter().any(|b| is_inside(x, y, *b)) {
                     st.btn_press = Some((x, y));
@@ -1305,10 +1741,7 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
                             if let Some(start) = st.drag_start {
                                 let min_x = start.x.min(pt.x);
                                 let max_x = start.x.max(pt.x);
-                                let src_x = ((min_x as f64 / st.disp_scale).round() as i32)
-                                    .clamp(0, st.src_w.saturating_sub(1));
-                                let src_right = ((max_x as f64 / st.disp_scale).round() as i32)
-                                    .clamp(src_x + 1, st.src_w);
+                                let (src_x,src_right) = source_ruler_bounds(min_x,max_x,st.src_w,map_rect.x,st.disp_scale);
                                 st.manual_cam_rect =
                                     Some(core::Rect::new(src_x, 0, src_right - src_x, st.src_h));
                             }
@@ -1318,6 +1751,14 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
                             st.locked_px_per_unit = Some(0.0);
                         }
                         EditMode::None => {
+                            if net_active {
+                                if let Ok(mut n) = net_state_cb.lock() {
+                                    if let Some(uid) = target_at_map(&n, x-map_rect.x, y-map_rect.y, map_size) {
+                                        n.target_id = Some(uid);
+                                        st.manual_e1 = None;
+                                    }
+                                }
+                            }
                             // In a network battle, plain clicks must not silently override
                             // automatic coordinates. Use the explicit My/Enemy buttons first.
                             if allow_plain_manual_mark(net_active) {
@@ -1339,23 +1780,7 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
                     if net_active {
                         if let Ok(mut n) = net_state_cb.lock() {
                             if n.map_w > 0 && n.map_h > 0 {
-                                let mw = (st.src_w as f64 * st.disp_scale) as f64;
-                                let mh = (st.src_h as f64 * st.disp_scale) as f64;
-                                let mut best: Option<(u64, f64)> = None;
-                                for (k, &(wx, wy)) in n.pos.iter() {
-                                    if Some(*k) == n.my_id {
-                                        continue;
-                                    }
-                                    let sx = wx as f64 * mw / n.map_w as f64;
-                                    let sy = wy as f64 * mh / n.map_h as f64;
-                                    let d = ((sx - x as f64).powi(2)
-                                        + (sy - y as f64).powi(2))
-                                    .sqrt();
-                                    if d < 30.0 && best.map_or(true, |(_, bd)| d < bd) {
-                                        best = Some((*k, d));
-                                    }
-                                }
-                                if let Some((uid, _)) = best {
+                                if let Some(uid) = target_at_map(&n, x-map_rect.x, y-map_rect.y, map_size) {
                                     n.target_id = Some(uid);
                                     st.manual_e1 = None;
                                     picked = true;
@@ -1372,6 +1797,16 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
                     }
                 }
             } else if event == highgui::EVENT_LBUTTONUP {
+                if let Some((battle, uid)) = st.target_press.take() {
+                    if let Ok(mut n) = net_state_cb.lock() {
+                        if let Some(uid) = released_target(&n, uid, x, y).filter(|_| n.battle_id == battle) {
+                            n.target_id = Some(uid);
+                            st.manual_e1 = None;
+                            st.edit_mode = EditMode::None;
+                        }
+                    }
+                    return;
+                }
                 // 按钮生效:按下和松开都在同一个按钮内,才算真点
                 if let Some((px, py)) = st.btn_press.take() {
                     if all_btns
@@ -1393,15 +1828,9 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
                         } else if is_inside(x, y, btn_target) {
                             // 目标轮换:按 id 排序稳定循环,当前目标的下一个成为新目标
                             if let Ok(mut n) = net_state_cb.lock() {
-                                let mut ids: Vec<u64> = n
-                                    .pos
-                                    .keys()
-                                    .copied()
-                                    .filter(|k| Some(*k) != n.my_id)
-                                    .collect();
-                                ids.sort_unstable();
+                                let ids = opponent_ids(&n);
                                 if !ids.is_empty() {
-                                    n.target_id = match n.target_id {
+                                    n.target_id = match selected_target_id(&n) {
                                         Some(t) => {
                                             let i = ids.iter().position(|&k| k == t);
                                             Some(ids[(i.map_or(0, |i| i + 1)) % ids.len()])
@@ -1518,8 +1947,6 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
                             // 运行时切换大/小地图:标记 switch_requested,
                             // 由 UI 线程弹交互框选(回调里不能阻塞,会死锁)
                             st.switch_requested = true;
-                        } else if is_inside(x, y, btn_exit) {
-                            st.exit_requested = true;
                         }
                     }
                 }
@@ -1529,10 +1956,7 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
                         let min_x = start.x.min(x);
                         let max_x = start.x.max(x);
                         // 预览只看左右边界,纵向铺满整幅源图
-                        let src_x = ((min_x as f64 / st.disp_scale).round() as i32)
-                            .clamp(0, st.src_w.saturating_sub(1));
-                        let src_right = ((max_x as f64 / st.disp_scale).round() as i32)
-                            .clamp(src_x + 1, st.src_w);
+                        let (src_x,src_right) = source_ruler_bounds(min_x,max_x,st.src_w,map_rect.x,st.disp_scale);
                         st.manual_cam_rect =
                             Some(core::Rect::new(src_x, 0, src_right - src_x, st.src_h));
                     }
@@ -1745,15 +2169,15 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
 
     // 立即显示初始化画面，防止 Mac 窗口引擎死锁
     let mut init_canvas = core::Mat::new_rows_cols_with_default(
-        400,
-        800,
+        HUD_HEIGHT,
+        MAP_PANE_WIDTH+SIDEBAR_WIDTH,
         core::CV_8UC3,
         core::Scalar::new(30.0, 30.0, 30.0, 0.0),
     )?;
     imgproc::put_text(
         &mut init_canvas,
-        "Initializing Background Capture...",
-        core::Point::new(50, 200),
+        "正在连接游戏…",
+        core::Point::new(50, HUD_HEIGHT/2),
         imgproc::FONT_HERSHEY_SIMPLEX,
         1.0,
         core::Scalar::new(0.0, 255.0, 0.0, 0.0),
@@ -1762,6 +2186,7 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
         false,
     )?;
     highgui::imshow(window_name, &init_canvas)?;
+    let window_lifecycle = hud_window::HudWindow::attach(window_name);
     highgui::set_window_property(window_name, highgui::WND_PROP_TOPMOST, 1.0)?;
     highgui::wait_key(100)?;
 
@@ -2018,11 +2443,14 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
     let mut traj_memo = LastValue::new();
     let mut path_memo = LastValue::new();
     let mut map_memo = MapDisplayCache(None);
+    let mut recent_aim: Option<RecentAim> = None;
+    let mut latched_scale: Option<(u64,u64,ShotScale)> = None;
     let mut fps_t0 = std::time::Instant::now();
     let mut last_angle_diag = std::time::Instant::now() - std::time::Duration::from_secs(6);
     let mut last_toggle_time = std::time::Instant::now() - std::time::Duration::from_secs(1); // 防抖时间戳
 
     loop {
+        if window_lifecycle.is_closed() { break; }
         let loop_t0 = std::time::Instant::now();
 
         // 语音消息: 录音状态/识别文本→风速
@@ -2105,12 +2533,13 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
         };
         // Source preference is an independent HUD toggle (defaults to MEM).
         // Identity remains verified locally and checked against network UID.
-        let live_angle_used = if live_angle_enabled && prefer_memory_angle {
+        let (live_angle_used,live_fire_angle_used) = if live_angle_enabled && prefer_memory_angle {
             let my_id = net_state.lock().unwrap().my_id;
             let live = live_angle_state.lock().unwrap();
-            selected_memory_angle(live_angle_enabled, prefer_memory_angle, live.as_ref(), my_id)
+            let angle=selected_memory_angle(live_angle_enabled, prefer_memory_angle, live.as_ref(), my_id);
+            (angle,angle.and_then(|_|live.as_ref().map(|s|s.fire_angle)))
         } else {
-            None
+            (None,None)
         };
         if live_angle_enabled && last_angle_diag.elapsed() >= std::time::Duration::from_secs(5) {
             let my_id = net_state.lock().unwrap().my_id;
@@ -2145,33 +2574,42 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
         let t_recog = t1.elapsed().as_millis();
         let t2 = std::time::Instant::now();
 
-        let canvas_w = map_w_display + 310;
+        let canvas_w = map_w_display + SIDEBAR_WIDTH;
         let st = *app_state.lock().unwrap();
         // 模式切换后这些会变,每帧从状态里取(遮蔽外层的启动值)
         let t_w = st.src_w;
         let t_h = st.src_h;
         let scale = st.disp_scale;
-        let map_h_display = (t_h as f64 * scale) as i32;
-        let canvas_h_target = map_h_display.max(580);
+        let map_rect = map_display_rect(t_w, t_h, scale);
+        let map_size = map_rect.size();
+        let map_h_display = map_size.height;
+        let canvas_h_target = HUD_HEIGHT;
         let mut canvas = core::Mat::new_rows_cols_with_default(
             canvas_h_target,
             canvas_w,
             core::CV_8UC3,
-            core::Scalar::new(30.0, 30.0, 30.0, 0.0),
+            hud_theme::color(hud_theme::BACKGROUND),
         )?;
 
+        let frame_net = net_state.lock().unwrap().clone();
+        let frame_scale={
+            let origin=live_origin_state.lock().ok();
+            let hint=origin_hint_state.lock().ok();
+            update_shot_scale(&mut latched_scale,&frame_net,origin.as_ref().and_then(|x|x.as_ref()),hint.as_ref().and_then(|x|x.as_ref()))
+        };
+        draw_hud_background(&mut canvas,&frame_net)?;
         if let Some(minimap) = img {
             let map_display = map_memo.get(
-                &minimap, core::Size::new(map_w_display, (t_h as f64 * scale) as i32)
+                &minimap, map_size
             )?;
 
             for y in 0..map_display.rows() {
                 if let (Ok(src_row), Ok(dst_row)) = (
                     map_display.at_row::<core::Vec3b>(y),
-                    canvas.at_row_mut::<core::Vec3b>(y),
+                    canvas.at_row_mut::<core::Vec3b>(y+map_rect.y),
                 ) {
                     let len = src_row.len();
-                    dst_row[0..len].copy_from_slice(src_row);
+                    dst_row[map_rect.x as usize..map_rect.x as usize+len].copy_from_slice(src_row);
                 }
             }
 
@@ -2182,7 +2620,7 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
                 .unwrap_or(core::Rect::new(0, 0, t_w, t_h));
 
             let to_scr = |p: core::Point| {
-                core::Point::new((p.x as f64 * scale) as i32, (p.y as f64 * scale) as i32)
+                core::Point::new(map_rect.x+(p.x as f64 * scale) as i32, map_rect.y+(p.y as f64 * scale) as i32)
             };
 
             // 绘制摄像机框（黄框=手动标尺/识别框）
@@ -2244,7 +2682,7 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
 
             // ===== 网络实况:世界坐标 → 小地图 canvas 点 =====
             // 只修改渲染快照；原始网络坐标与录制数据保持不变。
-            let mut net = net_state.lock().unwrap().clone();
+            let mut net = frame_net.clone();
             let mut xy_seen = 0usize;
             let mut xy_age_ms: Option<u128> = None;
             let mut xy_applied = 0usize;
@@ -2347,30 +2785,17 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
             let mut net_all: Vec<(u64, core::Point)> = Vec::new();
             if net.map_w > 0 && net.map_h > 0 {
                 let to_map = |x: i64, y: i64| core::Point::new(
-                    (x as f64 * map_w_display as f64 / net.map_w as f64).round() as i32,
-                    (y as f64 * map_h_display as f64 / net.map_h as f64).round() as i32,
+                    map_rect.x+(x as f64 * map_size.width as f64 / net.map_w as f64).round() as i32,
+                    map_rect.y+(y as f64 * map_h_display as f64 / net.map_h as f64).round() as i32,
                 );
                 net_p1 = net
                     .my_id
                     .and_then(|id| net.pos.get(&id))
                     .map(|&(x, y)| to_map(x, y));
-                net_all = net
-                    .pos
-                    .iter()
-                    .filter(|(k, _)| Some(**k) != net.my_id)
-                    .map(|(k, &(x, y))| (*k, to_map(x, y)))
-                    .collect();
-                // 目标:点选的优先,否则第一个非我玩家
-                net_e1 = net
-                    .target_id
-                    .and_then(|t| net.pos.get(&t))
-                    .or_else(|| {
-                        net.pos
-                            .iter()
-                            .find(|(k, _)| Some(**k) != net.my_id)
-                            .map(|(_, p)| p)
-                    })
-                    .map(|&(x, y)| to_map(x, y));
+                net_all = opponent_ids(&net).into_iter().filter_map(|uid| {
+                    net.pos.get(&uid).map(|&(x, y)| (uid, to_map(x, y)))
+                }).collect();
+                net_e1 = target_position(&net).map(|(x, y)| to_map(x, y));
             } else {
                 net_p1 = None;
                 net_e1 = None;
@@ -2395,43 +2820,23 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
             }
             // 多人局:未选中敌人=高亮黄色、选中目标=亮品红。
             // 名字加黑色描边，在明亮或杂色地图背景上都能看清。
-            let sel_uid = net.target_id.or_else(|| {
-                net.pos
-                    .iter()
-                    .find(|(k, _)| Some(**k) != net.my_id)
-                    .map(|(k, _)| *k)
-            });
-            for (uid, p) in &net_all {
+            let sel_uid = selected_target_id(&net);
+            for (index, (uid, p)) in net_all.iter().enumerate() {
                 let is_sel = sel_uid == Some(*uid);
-                let marker_color = if is_sel {
-                    core::Scalar::new(255.0, 0.0, 255.0, 0.0) // BGR: 亮品红
-                } else {
-                    core::Scalar::new(0.0, 255.0, 255.0, 0.0) // BGR: 亮黄色
-                };
+                let marker_color = hud_theme::color(if is_sel {hud_theme::ACCENT} else {hud_theme::MUTED});
                 let black = core::Scalar::new(0.0, 0.0, 0.0, 0.0);
                 // 深色外环保证标记不会淹没在地图背景里。
                 let _ = imgproc::circle(&mut canvas, *p, 10, black, 4, imgproc::LINE_AA, 0);
                 let _ = imgproc::circle(&mut canvas, *p, 9, marker_color, 3, imgproc::LINE_AA, 0);
                 let _ = imgproc::circle(&mut canvas, *p, 2, marker_color, -1, imgproc::LINE_AA, 0);
-                if let Some(nm) = net.names.get(uid) {
-                    let short: String = nm.chars().take(5).collect();
-                    let label_pt = core::Point::new(p.x - 12, p.y - 15);
-                    let label_color = if is_sel {
-                        core::Scalar::new(255.0, 255.0, 255.0, 0.0) // 目标名字亮白
-                    } else {
-                        marker_color
-                    };
-                    let _ = imgproc::put_text(
-                        &mut canvas, &short, label_pt,
-                        imgproc::FONT_HERSHEY_SIMPLEX, 0.5, black, 5,
-                        imgproc::LINE_AA, false,
-                    );
-                    let _ = imgproc::put_text(
-                        &mut canvas, &short, label_pt,
-                        imgproc::FONT_HERSHEY_SIMPLEX, 0.5, label_color, 2,
-                        imgproc::LINE_AA, false,
-                    );
-                }
+                let label = format!("{}", index + 1);
+                let label_pt = core::Point::new((p.x + 10).clamp(map_rect.x+3, (map_rect.x+map_size.width-26).max(map_rect.x+3)),
+                    (p.y - 12).clamp(map_rect.y+15, (map_rect.y+map_size.height-4).max(map_rect.y+15)));
+                let _ = imgproc::put_text(&mut canvas, &label, label_pt,
+                    imgproc::FONT_HERSHEY_SIMPLEX, 0.48, black, 4, imgproc::LINE_AA, false);
+                let _ = imgproc::put_text(&mut canvas, &label, label_pt,
+                    imgproc::FONT_HERSHEY_SIMPLEX, 0.48, marker_color, 1, imgproc::LINE_AA, false);
+
             }
 
             let draw_pt =
@@ -2472,156 +2877,107 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
                 let label = if st.manual_p1.is_some() { "我方 [手动]" } else { "我方 (My)" };
                 draw_pt(&mut canvas, p, label, false, st.manual_p1.is_some());
             }
-            if let Some(e) = e1 {
-                let label = if st.manual_e1.is_some() {
-                    "敌方 [手动]".to_string()
-                } else {
-                    let nm = sel_uid
-                        .and_then(|u| net.names.get(&u))
-                        .map(|s| s.as_str())
-                        .unwrap_or("Enemy");
-                    format!("敌方 ({})", nm)
-                };
-                draw_pt(&mut canvas, e, &label, true, st.manual_e1.is_some());
+            if let Some(e) = st.manual_e1 {
+                draw_pt(&mut canvas, e, "敌方 [手动]", true, true);
             }
 
-            let mut y_offset = 480;
             let mut draw_result = |p: core::Point, e: core::Point| {
-                // Ensure ruler is locked
                 if st.locked_px_per_unit.is_none() {
-                    imgproc::rectangle(
-                        &mut canvas,
-                        core::Rect::new(map_w_display + 10, y_offset - 35, 250, 80),
-                        core::Scalar::new(0.0, 0.0, 50.0, 0.0),
-                        -1,
-                        imgproc::LINE_8,
-                        0,
-                    )
-                    .unwrap();
-                    imgproc::rectangle(
-                        &mut canvas,
-                        core::Rect::new(map_w_display + 10, y_offset - 35, 250, 80),
-                        core::Scalar::new(0.0, 0.0, 255.0, 0.0),
-                        2,
-                        imgproc::LINE_8,
-                        0,
-                    )
-                    .unwrap();
-                    let _ = imgproc::put_text(
-                        &mut canvas,
-                        "请先锁定距离尺!",
-                        core::Point::new(map_w_display + 20, y_offset + 10),
-                        imgproc::FONT_HERSHEY_SIMPLEX,
-                        0.8,
-                        core::Scalar::new(0.0, 0.0, 255.0, 0.0),
-                        2,
-                        imgproc::LINE_AA,
-                        false,
-                    );
+                    let _=draw_aim_pending(&mut canvas,"请先锁定标尺","可在左下方锁定或重新框定");
                     return;
                 }
 
-                // Convert pixel diff to original minimap scale, then apply px_per_unit
-                let orig_dx = (e.x - p.x) as f64 / scale;
-                let dx = orig_dx / px_per_unit;
-
-                let orig_dy = -(e.y - p.y) as f64 / scale;
-                let dy = orig_dy / px_per_unit_y;
+                // Network points keep world-coordinate precision. Hand-picked
+                // points still use their actual mini-map position and ruler.
+                let manual_points = st.manual_p1.is_some() || st.manual_e1.is_some();
+                let use_live_origin = live_origin_enabled && is_recorded_model() && !manual_points
+                    && prefer_memory_angle && st.auto_angle;
+                let mut inputs=aim_inputs(&net,st.current_angle,st.wind,(px_per_unit,px_per_unit_y),(t_w,t_h),st.is_fixed_angle);
+                let world_angle=if !manual_points && prefer_memory_angle && st.auto_angle {live_fire_angle_used} else {None};
+                if let Some(i)=inputs.as_mut() {i.scale=frame_scale;i.world_angle=world_angle;}
+                let mut source_sampled=None;
+                let mut pending=("正在读取炮口","本次采样未确认，稍后自动重试");
+                let origin_choice = if use_live_origin {
+                    let sample = live_origin_state.lock().ok();
+                    let live = if live_angle_used.is_some() { sample.as_ref().and_then(|s| s.as_ref()) } else { None };
+                    source_sampled=live.and_then(|s|s.updated.checked_sub(std::time::Duration::from_millis(s.age_ms)));
+                    let hint=origin_hint_state.lock().ok();
+                    pending=if live.is_some_and(|s|Some(s.fire_angle)!=world_angle) {
+                        ("角度同步中","正在读取实际发射角度")
+                    } else {origin_pending_message(live,hint.as_ref().and_then(|s|s.as_ref()),&net,st.current_angle)};
+                    resolve_aim_origin(live.filter(|s|s.scale==frame_scale && world_angle==Some(s.fire_angle)), &net, st.current_angle, true)
+                } else { AimOrigin::Player };
+                let origin = match origin_choice {
+                    AimOrigin::Muzzle(xy) => Some(xy),
+                    AimOrigin::Player => None,
+                    AimOrigin::Verifying => {
+                        if pending.0=="读数更新中" {
+                            let hint=origin_hint_state.lock().ok();
+                            if let Some(last)=recent_aim.as_ref().filter(|last|last.can_reference(inputs.as_ref(),hint.as_ref().and_then(|h|h.as_ref()))) {
+                                let _=draw_aim_ready(&mut canvas,last.force,last.angle,last.dx,last.dy,st.is_fixed_angle,
+                                    if last.inputs.scale==ShotScale::Expanded {"上次放大建议 · 更新中"} else {"上次建议 · 读数更新中"});
+                                return;
+                            }
+                        }
+                        let _=draw_aim_pending(&mut canvas,pending.0,pending.1);
+                        return;
+                    }
+                };
+                let (dx, dy) = network_aim_offsets(
+                    &net, manual_points,
+                    core::Size::new(t_w, t_h), (px_per_unit, px_per_unit_y),
+                    origin,
+                ).unwrap_or_else(|| (
+                    (e.x - p.x) as f64 / scale / px_per_unit,
+                    -(e.y - p.y) as f64 / scale / px_per_unit_y,
+                ));
 
                 // 相对风(正=顺风),纯手动输入(按钮/语音)
-                let eff_wind = st.wind;
+                let eff_wind = if world_angle.is_some() {target_relative_to_world_wind(&net,st.wind,dx)} else {st.wind};
 
-                let key = (dx, dy, st.current_angle, eff_wind, st.is_fixed_angle);
+                let key = (dx, dy, st.current_angle, eff_wind, st.is_fixed_angle,frame_scale,world_angle);
                 let trajectory_res = cached_trajectory(&mut traj_memo, key);
 
                 match trajectory_res {
                     Some((force, final_angle)) => {
-                        // Draw a beautiful background box for the force recommendation
-                        imgproc::rectangle(
-                            &mut canvas,
-                            core::Rect::new(map_w_display + 10, y_offset - 35, 300, 80),
-                            core::Scalar::new(0.0, 50.0, 0.0, 0.0),
-                            -1,
-                            imgproc::LINE_8,
-                            0,
-                        )
-                        .unwrap();
-                        imgproc::rectangle(
-                            &mut canvas,
-                            core::Rect::new(map_w_display + 10, y_offset - 35, 300, 80),
-                            core::Scalar::new(0.0, 255.0, 0.0, 0.0),
-                            2,
-                            imgproc::LINE_8,
-                            0,
-                        )
-                        .unwrap();
-
-                        let mode_str = if st.is_fixed_angle {
-                            "[定角打法]"
-                        } else {
-                            "[变角打法]"
+                        let label=match (origin.is_some(),frame_scale) {
+                            (true,ShotScale::Normal)=>"推荐力度 · 普通炮弹",
+                            (true,ShotScale::Expanded)=>"推荐力度 · 放大炮弹",
+                            (false,ShotScale::Normal)=>"参考力度 · 普通炮弹",
+                            (false,ShotScale::Expanded)=>"参考力度 · 放大炮弹",
                         };
-                        let title = format!(
-                            "{}  风力: {:.1}  X距: {:.1}  Y高: {:.1}",
-                            mode_str,
-                            eff_wind,
-                            dx.abs(),
-                            dy
-                        );
-                        let _ = imgproc::put_text(
-                            &mut canvas,
-                            &title,
-                            core::Point::new(map_w_display + 15, y_offset - 10),
-                            imgproc::FONT_HERSHEY_SIMPLEX,
-                            0.45,
-                            core::Scalar::new(200.0, 200.0, 200.0, 0.0),
-                            1,
-                            imgproc::LINE_AA,
-                            false,
-                        );
-
-                        let res_txt = if st.is_fixed_angle {
-                            format!("锁定: {:.0}° 力度: {:.1} 2/3: {:.1}", final_angle, force, force * 2.0 / 3.0)
-                        } else {
-                            format!("推荐: {:.0}° 力度: {:.1} 2/3: {:.1}", final_angle, force, force * 2.0 / 3.0)
-                        };
-                        let _ = imgproc::put_text(
-                            &mut canvas,
-                            &res_txt,
-                            core::Point::new(map_w_display + 15, y_offset + 15),
-                            imgproc::FONT_HERSHEY_SIMPLEX,
-                            0.55,
-                            core::Scalar::new(0.0, 255.0, 0.0, 0.0),
-                            2,
-                            imgproc::LINE_AA,
-                            false,
-                        );
+                        let display_angle=if world_angle.is_some() {final_angle.min(180.0-final_angle)} else {final_angle};
+                        let _=draw_aim_ready(&mut canvas,force,display_angle,dx,dy,st.is_fixed_angle,label);
+                        if origin.is_some() {
+                            if let (Some(inputs),Some(sampled))=(inputs,source_sampled) {
+                                recent_aim=Some(RecentAim {inputs,sampled,force,angle:display_angle,dx,dy});
+                            }
+                        }
 
                         // Draw trajectory dots on the minimap
-                        let mut draw_angle = final_angle;
-                        let is_reverse = e.x < p.x;
-                        if is_reverse && draw_angle <= 90.0 {
-                            draw_angle = 180.0 - draw_angle;
-                        } else if !is_reverse && draw_angle > 90.0 {
-                            draw_angle = 180.0 - draw_angle;
-                        }
+                        let is_reverse = dx < 0.0;
+                        let draw_angle = trajectory_draw_angle(final_angle,dx,world_angle.is_some());
 
                         // 物理引擎原生支持真实的物理世界坐标系（角度>90代表向左，风向带符号）
                         // 用户输入的是相对风力（正=顺风），但在画图时，我们要把它转成绝对世界的风向。
                         // 如果向左打，顺风就是向左吹（绝对世界里的负风向）。
-                        let sim_wind = if is_reverse { -eff_wind } else { eff_wind };
-                        let path = path_memo.get_or_compute((draw_angle, force, sim_wind), || {
-                            tnt_comput::physics::simulate_path(draw_angle, force, sim_wind)
+                        let sim_wind = if world_angle.is_some() {eff_wind} else if is_reverse { -eff_wind } else { eff_wind };
+                        let path = path_memo.get_or_compute((draw_angle, force, sim_wind,frame_scale), || {
+                            tnt_comput::physics::simulate_path_for_scale(frame_scale,draw_angle,force,sim_wind)
                         });
+                        let draw_start = origin.map(|(x, y)| (
+                            map_rect.x as f64 + x * map_size.width as f64 / net.map_w as f64,
+                            map_rect.y as f64 + y * map_h_display as f64 / net.map_h as f64,
+                        )).unwrap_or((p.x as f64, p.y as f64));
                         for &(sim_x, sim_y) in path.iter() {
-                            let img_x = p.x as f64 + sim_x * scale * px_per_unit;
-                            let img_y = p.y as f64 - sim_y * scale * px_per_unit_y;
+                            let img_x = draw_start.0 + sim_x * scale * px_per_unit;
+                            let img_y = draw_start.1 - sim_y * scale * px_per_unit_y;
 
                             // Stop if out of bounds of the minimap
-                            if img_x < 0.0 || img_x > map_w_display as f64 || img_y > map_h_display as f64 {
+                            if img_x < map_rect.x as f64 || img_x > (map_rect.x+map_size.width) as f64 || img_y > (map_rect.y+map_h_display) as f64 {
                                 break;
                             }
-                            if img_y >= 0.0 {
+                            if img_y >= map_rect.y as f64 {
                                 let _ = imgproc::circle(
                                     &mut canvas,
                                     core::Point::new(img_x as i32, img_y as i32),
@@ -2635,46 +2991,9 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
                         }
                     }
                     None => {
-                        // Draw Unreachable box
-                        imgproc::rectangle(
-                            &mut canvas,
-                            core::Rect::new(map_w_display + 10, y_offset - 35, 300, 80),
-                            core::Scalar::new(0.0, 0.0, 50.0, 0.0),
-                            -1,
-                            imgproc::LINE_8,
-                            0,
-                        )
-                        .unwrap();
-                        let _ = imgproc::put_text(
-                            &mut canvas,
-                            "❌ 目标不可达 (Unreachable)",
-                            core::Point::new(map_w_display + 20, y_offset + 5),
-                            imgproc::FONT_HERSHEY_SIMPLEX,
-                            0.7,
-                            core::Scalar::new(0.0, 0.0, 255.0, 0.0),
-                            2,
-                            imgproc::LINE_AA,
-                            false,
-                        );
+                        let _=draw_aim_pending(&mut canvas,"当前角度无法到达","调整角度或目标后重试");
                     }
                 }
-
-                if let Some(pval) = power_recognized_val {
-                    let power_txt = format!("右下角实时读数: {}", pval);
-                    let _ = imgproc::put_text(
-                        &mut canvas,
-                        &power_txt,
-                        core::Point::new(map_w_display + 15, y_offset + 38),
-                        imgproc::FONT_HERSHEY_SIMPLEX,
-                        0.55,
-                        core::Scalar::new(0.0, 255.0, 255.0, 0.0),
-                        2,
-                        imgproc::LINE_AA,
-                        false,
-                    );
-                }
-
-                y_offset += 100;
 
                 let pt_p = core::Point::new(p.x, p.y);
                 let pt_e = core::Point::new(e.x, e.y);
@@ -2707,383 +3026,44 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
                 // 中途加入的对局:错过了 INIT,拿不到地图尺寸,无法在小地图标点。
                 // 但世界坐标差值是完整数据——直接出距离和力度,不画地图。
                 let mine = net.my_id.and_then(|id| net.pos.get(&id));
-                let enemy = net
-                    .pos
-                    .iter()
-                    .find(|(k, _)| Some(**k) != net.my_id)
-                    .map(|(_, v)| *v);
+                let enemy = target_position(&net);
                 if let (Some(&(px, py)), Some((ex, ey))) = (mine, enemy) {
                     let dx = (ex - px) as f64 / world_per_unit;
                     let dy = (py - ey) as f64 / world_per_unit;
                     let res = cached_trajectory(
-                        &mut traj_memo, (dx, dy, st.current_angle, st.wind, st.is_fixed_angle)
+                        &mut traj_memo, (dx, dy, st.current_angle, if st.auto_angle && prefer_memory_angle && live_fire_angle_used.is_some() {target_relative_to_world_wind(&net,st.wind,dx)} else {st.wind}, st.is_fixed_angle,frame_scale,if st.auto_angle && prefer_memory_angle {live_fire_angle_used} else {None})
                     );
-                    imgproc::rectangle(
-                        &mut canvas,
-                        core::Rect::new(map_w_display + 10, 445, 300, 80),
-                        core::Scalar::new(0.0, 40.0, 0.0, 0.0),
-                        -1,
-                        imgproc::LINE_8,
-                        0,
-                    )?;
-                    imgproc::rectangle(
-                        &mut canvas,
-                        core::Rect::new(map_w_display + 10, 445, 300, 80),
-                        core::Scalar::new(0.0, 255.0, 0.0, 0.0),
-                        2,
-                        imgproc::LINE_8,
-                        0,
-                    )?;
-                    let _ = imgproc::put_text(
-                        &mut canvas,
-                        &format!("X距: {:.1}  Y高: {:.1}  风: {:.1}", dx.abs(), dy, st.wind),
-                        core::Point::new(map_w_display + 15, 465),
-                        imgproc::FONT_HERSHEY_SIMPLEX,
-                        0.5,
-                        core::Scalar::new(200.0, 200.0, 200.0, 0.0),
-                        1,
-                        imgproc::LINE_AA,
-                        false,
-                    );
-                    let txt = match res {
-                        Some((force, ang)) => format!("力度: {:.1}  ({} {:.0}°)", force, if st.is_fixed_angle {"锁定"} else {"推荐"}, ang),
-                        None => "❌ 目标不可达".to_string(),
-                    };
-                    let _ = imgproc::put_text(
-                        &mut canvas,
-                        &txt,
-                        core::Point::new(map_w_display + 15, 495),
-                        imgproc::FONT_HERSHEY_SIMPLEX,
-                        0.55,
-                        core::Scalar::new(0.0, 255.0, 0.0, 0.0),
-                        2,
-                        imgproc::LINE_AA,
-                        false,
-                    );
+                    match res {
+                        Some((force,angle)) => draw_aim_ready(&mut canvas,force,if st.auto_angle && prefer_memory_angle && live_fire_angle_used.is_some() {angle.min(180.0-angle)} else {angle},dx,dy,st.is_fixed_angle,"参考力度")?,
+                        None => draw_aim_pending(&mut canvas,"当前角度无法到达","地图尺寸暂未同步")?,
+                    }
                 }
             }
         } else if img.is_none() {
-            imgproc::put_text(
-                &mut canvas,
-                "Waiting for Capture...",
-                core::Point::new(50, 50),
-                imgproc::FONT_HERSHEY_SIMPLEX,
-                0.8,
-                core::Scalar::new(0.0, 0.0, 255.0, 0.0),
-                2,
-                imgproc::LINE_AA,
-                false,
-            )?;
+            hud_theme::text(&mut canvas,"等待读取地图",62,220,310,0.6,hud_theme::MUTED)?;
         }
 
-        let pval_str = if st.auto_angle {
-            if let Some(angle) = live_angle_used {
-                format!("内存角: {:.0}°", angle)
-            } else if let Some(val) = power_recognized_val {
-                format!("表盘角: {}°", val)
-            } else if st.prefer_memory_angle {
-                "内存角暂无新读数".to_string()
-            } else {
-                "OCR等待读数/首次需框选".to_string()
-            }
-        } else {
-            "实机同步: 已暂停 (点击恢复)".to_string()
-        };
-        let _ = draw_btn(
-            &mut canvas,
-            btn_auto_angle,
-            &pval_str,
-            st.auto_angle,
-        );
-        // Explicit MEM/OCR preference: no background angle OCR in MEM mode.
-        draw_btn(
-            &mut canvas,
-            btn_angle_source,
-            if st.prefer_memory_angle { "MEM" } else { "OCR" },
-            st.prefer_memory_angle,
-        )?;
-
-        draw_btn(
-            &mut canvas,
-            btn_p1,
-            "我方 (My)",
-            st.edit_mode == EditMode::P1,
-        )?;
-        draw_btn(
-            &mut canvas,
-            btn_e1,
-            "敌方 (Enemy)",
-            st.edit_mode == EditMode::E1,
-        )?;
-        draw_btn(
-            &mut canvas,
-            btn_mode_switch,
-            if st.big_map { "MINI MAP" } else { "BIG MAP" },
-            false,
-        )?;
-
-        let lock_label = if st.locked_px_per_unit.is_some() {
-            "[已锁定] 解锁尺子"
-        } else {
-            "[未锁定] 锁定距离尺"
-        };
-        draw_btn(
-            &mut canvas,
-            btn_lock_ruler,
-            lock_label,
-            st.locked_px_per_unit.is_some(),
-        )?;
-
-        let ruler_lbl = if st.edit_mode == EditMode::DrawRuler1 {
-            "[步骤1] 点击左边线"
-        } else if st.edit_mode == EditMode::DrawRuler2 {
-            "[步骤2] 点击右边线"
-        } else {
-            "C: 框定 1屏幕宽"
-        };
-        draw_btn(
-            &mut canvas,
-            btn_draw_ruler,
-            ruler_lbl,
-            st.edit_mode == EditMode::DrawRuler1 || st.edit_mode == EditMode::DrawRuler2,
-        )?;
-        draw_btn(&mut canvas, btn_clear, "清空手动标记", false)?;
-
-        // 大地图整屏距离档位(小地图模式下灰显不响应)
-        draw_btn(
-            &mut canvas,
-            btn_u12,
-            "12",
-            st.big_map && (st.map_units - 12.0).abs() < 0.1,
-        )?;
-        draw_btn(
-            &mut canvas,
-            btn_u16,
-            "16",
-            st.big_map && (st.map_units - 16.0).abs() < 0.1,
-        )?;
-        draw_btn(
-            &mut canvas,
-            btn_u18,
-            "18",
-            st.big_map && (st.map_units - 18.0).abs() < 0.1,
-        )?;
-        draw_btn(
-            &mut canvas,
-            btn_u20,
-            "20",
-            st.big_map && (st.map_units - 20.0).abs() < 0.1,
-        )?;
-        draw_btn(
-            &mut canvas,
-            btn_u22,
-            "22",
-            st.big_map && (st.map_units - 22.0).abs() < 0.1,
-        )?;
-        // Draw preset angle buttons
-        draw_btn(
-            &mut canvas,
-            btn_a20,
-            "20°",
-            (st.current_angle - 20.0).abs() < 0.5,
-        )?;
-        draw_btn(
-            &mut canvas,
-            btn_a30,
-            "30°",
-            (st.current_angle - 30.0).abs() < 0.5,
-        )?;
-        draw_btn(
-            &mut canvas,
-            btn_a45,
-            "45°",
-            (st.current_angle - 45.0).abs() < 0.5,
-        )?;
-        draw_btn(
-            &mut canvas,
-            btn_a50,
-            "50°",
-            (st.current_angle - 50.0).abs() < 0.5,
-        )?;
-        draw_btn(
-            &mut canvas,
-            btn_a60,
-            "60°",
-            (st.current_angle - 60.0).abs() < 0.5,
-        )?;
-        draw_btn(
-            &mut canvas,
-            btn_a65,
-            "65°",
-            (st.current_angle - 65.0).abs() < 0.5,
-        )?;
-        draw_btn(
-            &mut canvas,
-            btn_a70,
-            "70°",
-            (st.current_angle - 70.0).abs() < 0.5,
-        )?;
-        draw_btn(
-            &mut canvas,
-            btn_a75,
-            "75°",
-            (st.current_angle - 75.0).abs() < 0.5,
-        )?;
-
-        draw_btn(&mut canvas, btn_ang_m5, "-5", false)?;
-        draw_btn(&mut canvas, btn_ang_minus, "-1", false)?;
-        draw_btn(
-            &mut canvas,
-            rect_ang_text,
-            &format!("{:.0}°", st.current_angle),
-            true,
-        )?;
-        draw_btn(&mut canvas, btn_ang_plus, "+1", false)?;
-        draw_btn(&mut canvas, btn_ang_p5, "+5", false)?;
-
-        draw_btn(&mut canvas, btn_wind_m1, "-1.0", false)?;
-        draw_btn(&mut canvas, btn_wind_m01, "-0.1", false)?;
-
-        let wind_str = if !wind_input_buf.is_empty() {
-            format!("缓冲: {}_", wind_input_buf)
-        } else {
-            let net_tag = if st.wind_net { "N" } else { "" };
-            let flip_tag = if st.wind_flip { " [翻转]" } else { "" };
-            format!("风: {:.1}{} {}", st.wind, net_tag, flip_tag)
-        };
-        let _ = imgproc::put_text(
-            &mut canvas,
-            &wind_str,
-            core::Point::new(rect_wind_text.x - 10, rect_wind_text.y + 20),
-            imgproc::FONT_HERSHEY_SIMPLEX,
-            0.45,
-            core::Scalar::new(0.0, 255.0, 255.0, 0.0),
-            1,
-            imgproc::LINE_AA,
-            false,
-        );
-        draw_btn(&mut canvas, btn_wind_p01, "+0.1", false)?;
-        draw_btn(&mut canvas, btn_wind_p1, "+1.0", false)?;
-
-        let hint_txt = "网络自动; 手动先点我方/敌方 Shift=语音";
-        let _ = imgproc::put_text(
-            &mut canvas,
-            hint_txt,
-            core::Point::new(map_w_display + 5, 420),
-            imgproc::FONT_HERSHEY_SIMPLEX,
-            0.38,
-            core::Scalar::new(180.0, 255.0, 180.0, 0.0),
-            1,
-            imgproc::LINE_AA,
-            false,
-        );
-
-        imgproc::rectangle(
-            &mut canvas,
-            btn_exit,
-            core::Scalar::new(0.0, 0.0, 220.0, 0.0),
-            -1,
-            imgproc::LINE_8,
-            0,
-        )?;
-        imgproc::put_text(
-            &mut canvas,
-            "X EXIT",
-            core::Point::new(btn_exit.x + 15, btn_exit.y + 20),
-            imgproc::FONT_HERSHEY_SIMPLEX,
-            0.6,
-            core::Scalar::new(255.0, 255.0, 255.0, 0.0),
-            2,
-            imgproc::LINE_AA,
-            false,
-        )?;
-
-        // 目标轮换钮:标签直接显示当前目标名(网络局才可用)
-        {
-            let net = net_state.lock().unwrap().clone();
-            let sel_uid = net.target_id.or_else(|| {
-                net.pos
-                    .iter()
-                    .find(|(k, _)| Some(**k) != net.my_id)
-                    .map(|(k, _)| *k)
-            });
-            let tgt_label = sel_uid
-                .and_then(|u| net.names.get(&u))
-                .map(|n| {
-                    let s: String = n.chars().take(4).collect();
-                    format!("▶{}", s)
-                })
-                .unwrap_or_else(|| "▶--".to_string());
-            // 醒目:敌人标记同色的品红底 + 亮字,一眼锁定当前目标
-            let has_tgt = sel_uid.is_some();
-            imgproc::rectangle(
-                &mut canvas,
-                btn_target,
-                if has_tgt {
-                    core::Scalar::new(220.0, 0.0, 220.0, 0.0)
-                } else {
-                    core::Scalar::new(80.0, 80.0, 80.0, 0.0)
-                },
-                -1,
-                imgproc::LINE_8,
-                0,
-            )?;
-            imgproc::rectangle(
-                &mut canvas,
-                btn_target,
-                core::Scalar::new(255.0, 180.0, 255.0, 0.0),
-                2,
-                imgproc::LINE_8,
-                0,
-            )?;
-            imgproc::put_text(
-                &mut canvas,
-                &tgt_label,
-                core::Point::new(btn_target.x + 8, btn_target.y + 21),
-                imgproc::FONT_HERSHEY_SIMPLEX,
-                0.55,
-                core::Scalar::new(255.0, 255.0, 255.0, 0.0),
-                2,
-                imgproc::LINE_AA,
-                false,
-            )?;
-        }
+        draw_hud_controls(&mut canvas, &st, live_angle_used, power_recognized_val, &wind_input_buf)?;
 
         let t_ui = t2.elapsed().as_millis();
         let bg_cap_ms = *cap_time_ms.lock().unwrap();
         let fps = 1000.0 / fps_t0.elapsed().as_millis().max(1) as f64;
         fps_t0 = std::time::Instant::now();
         
-        let perf_txt = format!("FPS:{:.0} | IO:{} Rec:{} UI:{} BG:{}", fps, t_io, t_recog, t_ui, bg_cap_ms);
-        let _ = imgproc::put_text(
-            &mut canvas,
-            &perf_txt,
-            core::Point::new(map_w_display + 5, 435),
-            imgproc::FONT_HERSHEY_SIMPLEX,
-            0.55,
-            core::Scalar::new(255.0, 100.0, 100.0, 0.0),
-            2,
-            imgproc::LINE_AA,
-            false,
-        );
-
-        if !voice_status.is_empty() {
-            let _ = imgproc::put_text(
-                &mut canvas,
-                &voice_status,
-                core::Point::new(map_w_display + 5, 455),
-                imgproc::FONT_HERSHEY_SIMPLEX,
-                0.45,
-                core::Scalar::new(0.0, 255.0, 200.0, 0.0),
-                1,
-                imgproc::LINE_AA,
-                false,
-            );
+        let perf_txt = format!("FPS {:.0}", fps);
+        imgproc::put_text(&mut canvas, &perf_txt, core::Point::new(352, HUD_HEIGHT - 4),
+            imgproc::FONT_HERSHEY_SIMPLEX, 0.38, core::Scalar::all(130.0), 1, imgproc::LINE_AA, false)?;
+        sidebar_text(&mut canvas, if voice_status.is_empty() {"按住 Shift 说出风速"} else {&voice_status}, 615, 0.39, hud_theme::color(hud_theme::MUTED))?;
+        let _ = (t_io, t_recog, t_ui, bg_cap_ms);
+        {
+            let net = &frame_net;
+            draw_target_list(&mut canvas, &net)?;
+            if let Ok(mut rows) = target_rows.lock() { *rows = opponent_ids(&net); }
         }
 
         // 网络实况行:隧道连着或有对局数据才显示
         {
-            let net = net_state.lock().unwrap();
+            let net = &frame_net;
             if net.battle_id > 0 || net.conns > 0 {
                 let link = if net.conns > 0 { "NET" } else { "NET(断)" };
                 let turn_s = match net.active {
@@ -3107,48 +3087,27 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
                     .auto_wind10
                     .map(|m| format!(" 风{:.1}", (m as i64).abs() as f64 / 10.0))
                     .unwrap_or_default();
-                let mut info = format!(
-                    "{link} 回合{} {turn_s} 风向{wind_dir}{rel}{auto_s} raw:{} lag:{}ms",
-                    net.round, net.wind_seed, net.last_lag_ms
-                );
-                // 采集信息:实时识别角度(和屏幕数字直接对照)
-                if let Some(val) = power_recognized_val {
-                    info += &format!(" 读{}°", val);
-                }
-                if let Some((id, Some(ang))) = net.last_fire {
-                    let who = if Some(id) == net.my_id { "我" } else { "敌" };
-                    info += &format!(" 上炮{who}:{:.0}°", ang);
-                }
-                if let Some((a, pw)) = net.last_fire_req {
-                    info += &format!(" REQ:{:.0}°/{:.1}", a, pw);
-                }
-                let info_y = (canvas_h_target - 12).max(470);
-                let _ = imgproc::put_text(
-                    &mut canvas,
-                    &info,
-                    core::Point::new(map_w_display + 5, info_y),
-                    imgproc::FONT_HERSHEY_SIMPLEX,
-                    0.4,
-                    core::Scalar::new(120.0, 220.0, 255.0, 0.0),
-                    1,
-                    imgproc::LINE_AA,
-                    false,
-                );
+                let info = format!("{link} 回合{} {turn_s} 风向{wind_dir}{rel}{auto_s}", net.round);
+                sidebar_text(&mut canvas, &info, 644, 0.39,
+                    core::Scalar::new(120.0, 220.0, 255.0, 0.0))?;
             }
         }
 
+        // Check before imshow: imshow is allowed to recreate a missing window.
+        if window_lifecycle.is_closed() { break; }
         highgui::imshow(window_name, &canvas)?;
         if first_show {
             highgui::set_window_property(window_name, highgui::WND_PROP_TOPMOST, 1.0)?;
             first_show = false;
         }
 
-        let key = highgui::wait_key(15)?;
+        let key = match highgui::wait_key(15) {
+            Ok(key) => key,
+            Err(_) if window_lifecycle.is_closed() => break,
+            Err(e) => return Err(e),
+        };
         let debounce_ok = last_toggle_time.elapsed() > std::time::Duration::from_millis(300);
-        let is_visible =
-            highgui::get_window_property(window_name, highgui::WND_PROP_VISIBLE).unwrap_or(1.0);
-        let exit_req = app_state.lock().unwrap().exit_requested;
-        if key == 27 || key == 'q' as i32 || is_visible < 1.0 || exit_req {
+        if key == 27 || key == 'q' as i32 || window_lifecycle.is_closed() {
             break;
         } else if key == 13 || key == 10 || key == 3 {
             // Enter: Set Wind (macOS 小键盘回车发的是 \x03=3)
@@ -3327,7 +3286,7 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
                         *map_geo_shared.lock().unwrap() = geo;
                         if !to_big { save_minimap_geo(geo); }
                         *shared_map.lock().unwrap() = None; // 丢弃旧区域画面,等新图
-                        let new_scale = (map_w_display as f64 / nw as f64).min(2.0);
+                        let new_scale = compact_map_scale(nw, nh);
                         let mut stg = app_state.lock().unwrap();
                         stg.big_map = to_big;
                         stg.src_w = nw;
@@ -3359,13 +3318,320 @@ fn main() -> opencv::Result<()> { // Recognizer moved to bg thread
     is_running.store(false, std::sync::atomic::Ordering::Relaxed);
     for mut c in voice_children {
         let _ = c.kill();
+        let _ = c.wait();
     }
-    std::process::exit(0);
+    let _ = highgui::destroy_window(window_name);
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compact_layout_bounds_and_aspect_survive_map_switches() {
+        for (w,h) in [(335,387),(1920,1080),(120,2000),(2000,120),(233,274)] {
+            let scale = compact_map_scale(w,h);
+            let size = map_display_size(w,h,scale);
+            assert!(size.width <= MAP_MAX_WIDTH && size.height <= MAP_MAX_HEIGHT);
+            let map=map_display_rect(w,h,scale);
+            assert!(map.x>=24 && map.x+map.width<=MAP_PANE_WIDTH-24);
+            assert!(map.y>=52 && map.y+map.height<=52+MAP_MAX_HEIGHT);
+            assert!((size.width as f64 - w as f64 * scale).abs() <= 0.5);
+            assert!((size.height as f64 - h as f64 * scale).abs() <= 0.5);
+        }
+        let mut rectangles = hud_controls().to_vec();
+        rectangles.extend((0..MAX_TARGETS).map(|i| target_slot_rect(i).unwrap()));
+        for r in &rectangles {
+            assert!(r.x >= 0 && r.x + r.width <= MAP_PANE_WIDTH + SIDEBAR_WIDTH);
+            assert!(r.y >= 0 && r.y + r.height < HUD_HEIGHT);
+        }
+        for (i,a) in rectangles.iter().enumerate() {
+            for b in rectangles.iter().skip(i+1) {
+                assert!(a.x+a.width <= b.x || b.x+b.width <= a.x || a.y+a.height <= b.y || b.y+b.height <= a.y);
+            }
+        }
+    }
+
+    #[test]
+    fn centered_map_keeps_clicks_and_ruler_in_source_coordinates() {
+        let mut net=NetHud {my_id:Some(1),map_w:2000,map_h:1000,..Default::default()};
+        net.pos.insert(1,(200,500));net.pos.insert(2,(1600,600));
+        for (w,h) in [(670,774),(1920,1080),(300,1800)] {
+            let scale=compact_map_scale(w,h);
+            let map=map_display_rect(w,h,scale);
+            let x=map.x+(0.8*map.width as f64).round() as i32;
+            let y=map.y+(0.6*map.height as f64).round() as i32;
+            assert_eq!(target_at_map(&net,x-map.x,y-map.y,map.size()),Some(2));
+            let left=map.x+(w as f64*0.25*scale).round() as i32;
+            let right=map.x+(w as f64*0.75*scale).round() as i32;
+            let (a,b)=source_ruler_bounds(left,right,w,map.x,scale);
+            let tolerance=(0.5/scale).ceil() as i32+1;
+            assert!((a-w/4).abs()<=tolerance && (b-3*w/4).abs()<=tolerance);
+            let units=(w as f64/2000.0*80.0,h as f64/1000.0*80.0);
+            let offsets=network_aim_offsets(&net,false,core::Size::new(w,h),units,None).unwrap();
+            assert!((offsets.0-17.5).abs()<1e-10 && (offsets.1+1.25).abs()<1e-10);
+        }
+    }
+
+    #[test]
+    fn transient_scale_has_specific_message() {
+        let net=NetHud {my_id:Some(1),..Default::default()};
+        let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+        let hint=parse_origin_hint(&format!("TNTORIGINSTATUS 123 1 {now} scale 2.0")).unwrap();
+        assert_eq!(origin_pending_message(None,Some(&hint),&net,51.0).0,"体型变化中");
+        let other=OriginHint {uid:2,..hint.clone()};
+        assert_eq!(origin_pending_message(None,Some(&other),&net,51.0).0,"读数更新中");
+        let stale=OriginHint {updated:std::time::Instant::now()-std::time::Duration::from_secs(2),..hint};
+        assert_eq!(origin_pending_message(None,Some(&stale),&net,51.0).0,"读数更新中");
+        assert!(parse_origin_hint(&format!("TNTORIGINSTATUS 123 1 {} scale 2.0",now-1000)).is_none());
+        assert!(parse_origin_hint(&format!("TNTORIGINSTATUS 123 1 {now} scale NaN")).is_none());
+    }
+
+    #[test]
+    fn recent_advice_is_bounded_and_never_follows_changed_inputs_or_invalid_pose() {
+        let mut net=NetHud {my_id:Some(1),battle_id:3,..Default::default()};
+        net.pos.insert(1,(200,400));net.pos.insert(2,(1200,500));
+        let input=aim_inputs(&net,51.0,7.7,(8.0,8.0),(500,300),true).unwrap();
+        let now=std::time::Instant::now();
+        let mut last=RecentAim {inputs:input.clone(),sampled:now-std::time::Duration::from_millis(900),
+            force:54.4,angle:51.0,dx:12.5,dy:-1.25};
+        let hint=OriginHint {updated:now-std::time::Duration::from_millis(900),uid:1,code:"ready".into(),scale:Some(ShotScale::Normal)};
+        assert!(last.can_reference(Some(&input),Some(&hint)));
+        assert!(!last.can_reference(Some(&input),None));
+        assert!(!last.can_reference(Some(&AimInputs {world_angle:Some(129),..input.clone()}),Some(&hint)));
+        assert!(!last.can_reference(Some(&AimInputs {scale:ShotScale::Expanded,..input.clone()}),Some(&hint)));
+        assert!(!last.can_reference(Some(&AimInputs {wind:7.8,..input.clone()}),Some(&hint)));
+        assert!(!last.can_reference(Some(&AimInputs {target:3,..input.clone()}),Some(&hint)));
+        assert!(!last.can_reference(Some(&AimInputs {battle:4,..input.clone()}),Some(&hint)));
+        assert!(!last.can_reference(Some(&AimInputs {units:(9.0,8.0),..input.clone()}),Some(&hint)));
+        for code in ["scale","angle","moving","read"] {
+            assert!(!last.can_reference(Some(&input),Some(&OriginHint {code:code.into(),..hint.clone()})));
+        }
+        last.sampled=now-std::time::Duration::from_millis(1300);
+        assert!(!last.can_reference(Some(&input),Some(&hint)));
+    }
+
+    #[test]
+    fn target_list_uses_stable_identity_and_cancels_roster_changes_and_drags() {
+        let mut net = NetHud { my_id: Some(99), map_w: 2000, map_h: 1000, ..Default::default() };
+        for id in [99,8,3,2,9,7,4,6,5,10] { net.pos.insert(id,(id as i64 * 100, 300)); }
+        net.names.insert(2,"同名玩家".into());
+        net.names.insert(3,"同名玩家".into());
+        assert_eq!(opponent_ids(&net),vec![2,3,4,5,6,7,8,9,10]);
+        let r = target_slot_rect(1).unwrap();
+        assert_eq!(target_at_sidebar(&net,r.x+10,r.y+10),Some(3));
+        assert_eq!(released_target(&net,3,r.x+10,r.y+10),Some(3));
+        assert_eq!(released_target(&net,3,r.x-40,r.y+10),None);
+        assert_eq!(target_slot_rect(8),None);
+        let displayed = opponent_ids(&net);
+        net.pos.remove(&2);
+        assert_eq!(target_from_rows(&displayed,r.x+10,r.y+10),Some(3));
+        assert_eq!(released_target(&net,3,r.x+10,r.y+10),None);
+        net.pos.remove(&3);
+        assert_ne!(selected_target_id(&net),Some(3));
+    }
+
+    #[test]
+    fn sidebar_and_map_selection_feed_the_same_position_and_wind() {
+        let mut net = NetHud { my_id: Some(1), map_w: 2000, map_h: 1000,
+            auto_wind10: Some(50), ..Default::default() };
+        net.pos.insert(1,(1000,500));
+        net.pos.insert(2,(200,500));
+        net.pos.insert(3,(1800,500));
+        // A known other player must stay selectable after firing.
+        net.not_mine.insert(2);
+        assert_eq!(selected_target_id(&net),Some(2));
+        assert_eq!(wind_dir_hint(&net),Some(-1));
+        let size=core::Size::new(400,200);
+        let picked=target_at_map(&net,360,100,size).unwrap();
+        assert_eq!(picked,3);
+        net.target_id=Some(picked);
+        assert_eq!(target_position(&net),Some((1800,500)));
+        assert_eq!(wind_dir_hint(&net),Some(1));
+        assert_eq!(network_aim_offsets(&net,false,size,(16.0,16.0),None),Some((10.0,0.0)));
+        assert_eq!(target_at_map(&net,200,100,size),None);
+        net.target_id=Some(999);
+        assert_eq!(selected_target_id(&net),Some(2));
+    }
+
+    #[test]
+    fn long_target_names_fit_without_drawing_into_neighbours() -> opencv::Result<()> {
+        let text=fit_text("重复名字很长很长\n🙂 opponent with long name",166,0.5,1)?;
+        let mut baseline=0;
+        assert!(imgproc::get_text_size(&text,imgproc::FONT_HERSHEY_SIMPLEX,0.5,1,&mut baseline)?.width <=166);
+        assert!(!text.contains('\n'));
+        let mut net=NetHud { my_id:Some(1),..Default::default() };
+        net.pos.insert(1,(10,10));
+        for uid in 2..=9 { net.pos.insert(uid,(20,20)); net.names.insert(uid,"很长的对手名字".into()); }
+        let mut canvas=core::Mat::new_rows_cols_with_default(HUD_HEIGHT,MAP_PANE_WIDTH+SIDEBAR_WIDTH,
+            core::CV_8UC3,core::Scalar::all(0.0))?;
+        draw_target_list(&mut canvas,&net)?;
+        assert_eq!(*canvas.at_2d::<core::Vec3b>(406,MAP_PANE_WIDTH-1)?,core::Vec3b::all(0));
+        Ok(())
+    }
+
+    #[test]
+    fn live_origin_protocol_and_pose_guards() {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+        let line = format!("TNTORIGIN 123 1 {now} 120 1 2070 501 2046 486");
+        let row = parse_live_origin_line(&line).unwrap().unwrap();
+        let mut net = NetHud { map_w: 3000, map_h: 2000, my_id: Some(1), ..Default::default() };
+        net.pos.insert(1, (2070, 501));
+        net.pos.insert(2, (1000, 500));
+        assert_eq!(live_origin_for_hud(Some(&row), &net, 60.0), Some((2046.0, 486.0)));
+        assert_eq!(live_origin_for_hud(Some(&row), &net, 61.0), None);
+        net.my_id = Some(2);
+        assert_eq!(live_origin_for_hud(Some(&row), &net, 60.0), None);
+        net.my_id = Some(1);
+        net.pos.insert(1, (2072, 501));
+        assert_eq!(live_origin_for_hud(Some(&row), &net, 60.0), None);
+        net.pos.insert(1, (2070, 501));
+        net.pos.insert(2, (2500, 500));
+        assert_eq!(live_origin_for_hud(Some(&row), &net, 60.0), Some((2046.0,486.0)));
+        net.pos.insert(2, (1000, 500));
+        let stale = LiveOrigin { age_ms: 601, ..row.clone() };
+        assert_eq!(live_origin_for_hud(Some(&stale), &net, 60.0), None);
+        // Loss/expiry must not silently switch an automatic recommendation
+        // from the muzzle back to the player's different coordinates.
+        assert_eq!(resolve_aim_origin(Some(&row), &net, 60.0, true), AimOrigin::Muzzle((2046.0,486.0)));
+        assert_eq!(resolve_aim_origin(Some(&stale), &net, 60.0, true), AimOrigin::Verifying);
+        assert_eq!(resolve_aim_origin(None, &net, 60.0, true), AimOrigin::Verifying);
+        assert_eq!(resolve_aim_origin(None, &net, 60.0, false), AimOrigin::Player);
+        for invalid in [line.replace(" 486", " NaN"), line.replace(" 2046 ", " 9999 "),
+                        line.replace(" 120 1 ", " 181 1 "), format!("{line} extra"),
+                        line.replace(&now.to_string(), &(now - 1000).to_string())] {
+            assert!(parse_live_origin_line(&invalid).is_none());
+        }
+        assert!(matches!(parse_live_origin_line("TNTORIGIN-"), Some(None)));
+    }
+
+    #[test]
+    fn backshots_use_actual_angle_without_body_facing_gate_or_forced_mirror() {
+        let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+        for (angle,body_left,target_x) in [(60,1,2500),(120,0,1000)] {
+            let row=parse_live_origin_line(&format!("TNTORIGIN 123 1 {now} {angle} {body_left} 2070 501 2046 486")).unwrap().unwrap();
+            let mut net=NetHud {my_id:Some(1),map_w:3000,map_h:2000,..Default::default()};
+            net.pos.insert(1,(2070,501));net.pos.insert(2,(target_x,500));
+            assert_eq!(resolve_aim_origin(Some(&row),&net,60.0,true),AimOrigin::Muzzle((2046.0,486.0)));
+            for scale in [ShotScale::Normal,ShotScale::Expanded] {
+                let dx=if angle<90 {10.0} else {-10.0};
+                let (force,world_angle)=compute_world_trajectory(dx,-2.0,angle,if dx<0.0 {-7.7} else {7.7},true,scale).unwrap();
+                assert_eq!(world_angle,f64::from(angle));
+                let expected=power_for_angle_for_scale(scale,60.0,10.0,-2.0,7.7).unwrap();
+                assert!((force-expected).abs()<1e-9);
+            }
+        }
+        // A wind-returning shot must keep its real initial direction on the map.
+        assert_eq!(trajectory_draw_angle(80.0,-10.0,true),80.0);
+        assert_eq!(trajectory_draw_angle(100.0,10.0,true),100.0);
+        // Explicit manual elevations retain the existing target-relative convention.
+        assert_eq!(trajectory_draw_angle(60.0,-10.0,false),120.0);
+        let mut net=NetHud {my_id:Some(1),..Default::default()};
+        net.pos.insert(1,(100,500));net.pos.insert(2,(110,500));
+        // Target is right of the player but left of a right-side muzzle.
+        assert_eq!(target_relative_to_world_wind(&net,7.7,-0.1),7.7);
+        net.pos.insert(2,(90,500));
+        assert_eq!(target_relative_to_world_wind(&net,7.7,0.1),-7.7);
+    }
+
+    #[test]
+    fn continuous_ready_status_keeps_timestamp_but_invalid_state_clears_origin() {
+        let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+        let row=parse_live_origin_line(&format!("TNTORIGIN 123 1 {now} 120 1 2070 501 2046 486")).unwrap().unwrap();
+        let ready=parse_origin_hint(&format!("TNTORIGINSTATUS 123 1 {now} ready 1.0")).unwrap();
+        let mut sample=Some(row.clone());
+        apply_origin_hint(&mut sample,&ready);
+        assert_eq!(sample.as_ref().unwrap().updated,row.updated);
+        assert_eq!(sample.as_ref().unwrap().age_ms,row.age_ms);
+        apply_origin_hint(&mut sample,&OriginHint {code:"moving".into(),..ready.clone()});
+        assert!(sample.is_none());
+        sample=Some(row.clone());
+        apply_origin_hint(&mut sample,&OriginHint {scale:Some(ShotScale::Expanded),..ready.clone()});
+        assert!(sample.is_none());
+        sample=Some(row);
+        apply_origin_hint(&mut sample,&OriginHint {uid:2,..ready});
+        assert!(sample.is_none());
+    }
+
+    #[test]
+    fn expanded_scale_switches_before_shot_and_survives_only_same_battle_gaps() {
+        let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+        let expanded=parse_live_origin_line(&format!("TNTORIGIN 123 1 {now} 120 1 2070 501 2022 471 2.0")).unwrap().unwrap();
+        assert_eq!(expanded.scale,ShotScale::Expanded);
+        assert!(parse_live_origin_line(&format!("TNTORIGIN 123 1 {now} 120 1 2070 501 2022 471 1.0")).is_none());
+        assert!(parse_live_origin_line(&format!("TNTORIGIN 123 1 {now} 120 1 2070 501 2046 486 1.5")).is_none());
+        let mut net=NetHud {my_id:Some(1),battle_id:3,map_w:3000,map_h:2000,..Default::default()};
+        net.pos.insert(1,(2070,501));net.pos.insert(2,(1000,500));
+        assert_eq!(live_origin_for_hud(Some(&expanded),&net,60.0),Some((2022.0,471.0)));
+        let mut latch=None;
+        assert_eq!(update_shot_scale(&mut latch,&net,Some(&expanded),None),ShotScale::Expanded);
+        assert_eq!(update_shot_scale(&mut latch,&net,None,None),ShotScale::Expanded);
+        let normal=LiveOrigin {scale:ShotScale::Normal,origin:(2046.0,486.0),..expanded.clone()};
+        assert_eq!(update_shot_scale(&mut latch,&net,Some(&normal),None),ShotScale::Normal);
+        let ready=parse_origin_hint(&format!("TNTORIGINSTATUS 123 1 {now} ready 2.0")).unwrap();
+        assert_eq!(update_shot_scale(&mut latch,&net,None,Some(&ready)),ShotScale::Expanded);
+        net.battle_id=4;
+        assert_eq!(update_shot_scale(&mut latch,&net,None,None),ShotScale::Normal);
+        let stale=LiveOrigin {age_ms:601,..expanded.clone()};
+        assert_eq!(update_shot_scale(&mut latch,&net,Some(&stale),None),ShotScale::Normal);
+        net.my_id=Some(2);
+        assert_eq!(update_shot_scale(&mut latch,&net,Some(&expanded),Some(&ready)),ShotScale::Normal);
+        net.my_id=None;
+        assert_eq!(update_shot_scale(&mut latch,&net,None,None),ShotScale::Normal);
+        assert!(latch.is_none());
+    }
+
+    #[test]
+    fn network_aim_uses_corrected_origin_and_respects_manual_points() {
+        let mut net = NetHud { map_w: 3000, map_h: 2000, my_id: Some(1), ..Default::default() };
+        net.pos.insert(1, (2070, 501));
+        net.pos.insert(2, (1000, 500));
+        let offset = network_aim_offsets(&net, false, core::Size::new(300, 200), (8.0, 8.0), Some((2046.0, 486.0))).unwrap();
+        assert!((offset.0 - (-1046.0 / 80.0)).abs() < 1e-12);
+        assert!((offset.1 - (-14.0 / 80.0)).abs() < 1e-12);
+        assert_eq!(network_aim_offsets(&net, true, core::Size::new(300, 200), (8.0, 8.0), Some((2046.0, 486.0))), None);
+    }
+
+    #[test]
+    fn network_aim_keeps_distinct_world_points_in_the_same_display_pixel() {
+        let mut net = NetHud { map_w: 3000, map_h: 2000, my_id: Some(1), ..Default::default() };
+        net.pos.insert(1, (1000, 800));
+        net.pos.insert(2, (1001, 799));
+        // Both positions round to (150,120) on a 450x300 display.
+        assert_eq!((1000.0_f64 * 0.15).round(), (1001.0_f64 * 0.15).round());
+        assert_eq!((800.0_f64 * 0.15).round(), (799.0_f64 * 0.15).round());
+        assert_eq!(network_aim_offsets(&net, false, core::Size::new(300, 200), (8.0, 8.0), None),
+                   Some((0.0125, 0.0125)));
+    }
+
+    #[test]
+    fn network_aim_preserves_aspect_ruler_target_and_direction() {
+        let mut net = NetHud { map_w: 3000, map_h: 1000, my_id: Some(1), target_id: Some(3), ..Default::default() };
+        net.pos.insert(1, (1000, 600));
+        net.pos.insert(2, (1800, 200));
+        net.pos.insert(3, (200, 800));
+        let source = core::Size::new(300, 250);
+        assert_eq!(network_aim_offsets(&net, false, source, (8.0, 20.0), None), Some((-10.0, -2.5)));
+        assert_eq!(network_aim_offsets(&net, false, source, (16.0, 40.0), None), Some((-5.0, -1.25)));
+        net.target_id = Some(2);
+        assert_eq!(network_aim_offsets(&net, false, source, (8.0, 20.0), None), Some((10.0, 5.0)));
+    }
+
+    #[test]
+    fn network_aim_leaves_manual_points_and_missing_context_to_existing_path() {
+        let mut net = NetHud { map_w: 3000, map_h: 1000, my_id: Some(1), ..Default::default() };
+        net.pos.insert(1, (1000, 600));
+        net.pos.insert(2, (1800, 200));
+        let source = core::Size::new(300, 250);
+        assert_eq!(network_aim_offsets(&net, true, source, (8.0, 20.0), None), None);
+        assert_eq!(network_aim_offsets(&net, false, source, (f64::NAN, 20.0), None), None);
+        net.my_id = None;
+        assert_eq!(network_aim_offsets(&net, false, source, (8.0, 20.0), None), None);
+        net.my_id = Some(1);
+        net.map_w = 0;
+        assert_eq!(network_aim_offsets(&net, false, source, (8.0, 20.0), None), None);
+    }
 
     #[test]
     fn map_cache_updates_for_new_screenshot_and_display_size() -> opencv::Result<()> {
@@ -3391,13 +3657,15 @@ mod tests {
         let mut memo = LastValue::new();
         let mut calls = 0;
         let cases = [
-            (12.0, 2.0, 65.0, 7.1, true),
-            (f64::from_bits(12.0_f64.to_bits() + 1), 2.0, 65.0, 7.1, true),
-            (12.0, 3.0, 65.0, 7.1, true),
-            (12.0, 3.0, 66.0, 7.1, true),
-            (12.0, 3.0, 66.0, -7.1, true),
-            (12.0, 3.0, 66.0, -7.1, false),
-            (-12.0, 3.0, 66.0, -7.1, false),
+            (12.0, 2.0, 65.0, 7.1, true,ShotScale::Normal,None),
+            (f64::from_bits(12.0_f64.to_bits() + 1), 2.0, 65.0, 7.1, true,ShotScale::Normal,None),
+            (12.0, 3.0, 65.0, 7.1, true,ShotScale::Normal,None),
+            (12.0, 3.0, 66.0, 7.1, true,ShotScale::Normal,None),
+            (12.0, 3.0, 66.0, -7.1, true,ShotScale::Normal,None),
+            (12.0, 3.0, 66.0, -7.1, false,ShotScale::Normal,None),
+            (-12.0, 3.0, 66.0, -7.1, false,ShotScale::Normal,None),
+            (-12.0, 3.0, 66.0, -7.1, false,ShotScale::Expanded,None),
+            (-12.0, 3.0, 66.0, -7.1, false,ShotScale::Expanded,Some(114)),
         ];
         for (i, key) in cases.into_iter().enumerate() {
             for _ in 0..2 {
@@ -3410,7 +3678,7 @@ mod tests {
             assert_eq!(calls, i + 1);
         }
         // Returning to an older target must recompute; the cache is bounded.
-        let expected = compute_fixed_trajectory(12.0, 2.0, 65.0, 7.1);
+        let expected = compute_fixed_trajectory(12.0, 2.0, 65.0, 7.1,ShotScale::Normal);
         assert!(expected.is_some());
         assert_eq!(cached_trajectory(&mut memo, cases[0]), expected);
     }
@@ -3419,17 +3687,18 @@ mod tests {
     fn path_cache_keeps_world_direction_and_exact_parameters() {
         let mut memo = LastValue::new();
         let mut calls = 0;
-        for key in [(65.0, 60.0, 7.1), (115.0, 60.0, -7.1),
-                    (115.0, 61.0, -7.1), (115.0, 61.0, 7.1)] {
-            let expected = simulate_path(key.0, key.1, key.2);
+        for key in [(65.0,60.0,7.1,ShotScale::Normal), (115.0,60.0,-7.1,ShotScale::Normal),
+                    (115.0,61.0,-7.1,ShotScale::Normal), (115.0,61.0,7.1,ShotScale::Normal),
+                    (115.0,61.0,7.1,ShotScale::Expanded)] {
+            let expected = simulate_path_for_scale(key.3,key.0,key.1,key.2);
             for _ in 0..2 {
                 assert_eq!(memo.get_or_compute(key, || {
                     calls += 1;
-                    simulate_path(key.0, key.1, key.2)
+                    simulate_path_for_scale(key.3,key.0,key.1,key.2)
                 }), &expected);
             }
         }
-        assert_eq!(calls, 4);
+        assert_eq!(calls, 5);
     }
 
     #[test]
@@ -3483,10 +3752,9 @@ mod tests {
 
     #[test]
     fn angle_source_button_draws_within_existing_sidebar() -> opencv::Result<()> {
-        let map_width = 300;
-        let total_width = map_width + 310;
-        let auto_btn = core::Rect::new(map_width + 20, 395, 230, 30);
-        let source_btn = core::Rect::new(map_width + 258, 395, 50, 30);
+        let total_width = MAP_PANE_WIDTH + SIDEBAR_WIDTH;
+        let auto_btn = hud_controls()[30];
+        let source_btn = hud_controls()[31];
         assert!(auto_btn.x + auto_btn.width < source_btn.x);
         assert!(source_btn.x + source_btn.width <= total_width);
         assert_eq!(source_btn.y, auto_btn.y);
